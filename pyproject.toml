@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-livekit"
+version = "0.1.0"
+description = "LiveKit WebRTC voice gateway plugin for hermes-agent"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Franci Penov" }]
+license = { text = "MIT" }
+dependencies = [
+  "hermes-agent",
+  # Exact pins (mirrors hermes-agent's 2026-05-12 supply-chain hardening
+  # policy): PyPI cannot ship a new livekit/livekit-api into a user's
+  # install without an intentional bump here. Update the pins AND verify
+  # release notes / Socket advisories before changing.
+  #   livekit==1.1.7      released 2026-04-27, no yanks (skipped 1.1.8
+  #                       from 2026-05-13 — too fresh).
+  #   livekit-api==1.1.0  released 2025-12-02, six months stable
+  #                       (skipped 1.0.8 — yanked: wrong dependencies).
+  "livekit==1.1.7",
+  "livekit-api==1.1.0",
+]
+
+[project.entry-points."hermes_agent.plugins"]
+# Point to the package, not the function — the hermes-agent plugin loader
+# does ep.load() and then getattr(module, "register"), so the target must
+# resolve to the module itself.
+livekit = "hermes_livekit"
+
+[tool.setuptools.packages.find]
+include = ["hermes_livekit*"]
