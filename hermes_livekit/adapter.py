@@ -44,6 +44,18 @@ except ImportError:
     LiveKitAPI = None  # type: ignore[assignment,misc]
     ListParticipantsRequest = None  # type: ignore[assignment,misc]
 
+# Pillow is used to JPEG-encode sampled video frames before handing them to
+# hermes's vision pipeline. The plugin still loads (and voice still works)
+# if Pillow is missing; only frame capture is disabled.
+try:
+    from io import BytesIO
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    Image = None  # type: ignore[assignment,misc]
+    BytesIO = None  # type: ignore[assignment,misc]
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -53,6 +65,30 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hermes-agent core modules inherit INFO from hermes's logging config. As a
+# pip-installed third-party package we don't, so without an explicit setLevel
+# our adapter's INFO-level operational logs ("Audio track subscribed",
+# "captured frame...", "Utterance from ...") get filtered out at WARNING and
+# never reach gateway.log.
+#
+# Default to INFO to match the rest of hermes. Override via
+# ``HERMES_LIVEKIT_LOG_LEVEL=DEBUG`` (or WARNING / ERROR / a numeric value)
+# in the env when you need a different verbosity without touching code.
+def _resolve_log_level() -> int:
+    raw = os.getenv("HERMES_LIVEKIT_LOG_LEVEL", "").strip()
+    if not raw:
+        return logging.INFO
+    # numeric? (e.g. HERMES_LIVEKIT_LOG_LEVEL=20)
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    level = logging.getLevelName(raw.upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+logger.setLevel(_resolve_log_level())
 
 # Voice detection
 SILENCE_THRESHOLD_SECONDS = 1.5   # seconds of silence → end of utterance
@@ -151,6 +187,19 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
+
+        # Per-participant video streams (subscribed but NOT eagerly iterated —
+        # frames are only sampled when a client sends client:capture-frame on
+        # the hermes-control data-channel topic).
+        self._video_streams: Dict[str, "rtc.VideoStream"] = {}
+
+        # Frames captured-but-not-yet-dispatched. Drained into the next
+        # MessageEvent built by _process_voice_input or _handle_client_message.
+        # Each entry is a (path, mime_type) tuple. Paths are temp files written
+        # under <tempdir>/hermes_livekit/; cleanup happens on disconnect (the
+        # agent loop reads the file after handle_message returns, so we can't
+        # unlink at dispatch time).
+        self._pending_captures: list[tuple[str, str]] = []
 
         self._presence_poll_interval: float = self._resolve_presence_poll_interval()
 
@@ -311,6 +360,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room.on("track_unsubscribed", self._on_track_unsubscribed)
             self._room.on("participant_disconnected", self._on_participant_disconnected)
             self._room.on("disconnected", self._on_disconnected)
+            # Inbound data-channel: clients send control messages (capture-frame,
+            # typed text, runtime control hooks) on the hermes-control topic.
+            self._room.on("data_received", self._on_data_received)
 
             # Create access token
             import json as _json
@@ -392,6 +444,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 pass
         self._audio_streams.clear()
 
+        # Close video streams (sampling-on-trigger, no background task).
+        for stream in self._video_streams.values():
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        self._video_streams.clear()
+
         if self._room:
             self._graceful_leave = True
             try:
@@ -405,6 +465,17 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers.clear()
         self._last_audio_time.clear()
         self._speaking_participants.clear()
+
+        # Unlink any frame files that were captured but never dispatched
+        # (no MessageEvent ever drained them). Dispatched-but-not-yet-read
+        # files live on — the agent loop may still be processing.
+        for path, _mime in self._pending_captures:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._pending_captures.clear()
+
         logger.info("[%s] Disconnected", self.name)
 
     # -- LiveKit event handlers ---------------------------------------------
@@ -415,21 +486,41 @@ class LiveKitAdapter(BasePlatformAdapter):
         publication: "rtc.RemoteTrackPublication",
         participant: "rtc.RemoteParticipant",
     ):
-        """Start capturing audio when a participant's audio track is subscribed."""
-        if track.kind != rtc.TrackKind.KIND_AUDIO:
+        """Start capturing media when a participant's track is subscribed.
+
+        Audio tracks are buffered continuously for VAD/STT. Video tracks are
+        stored but NOT iterated eagerly — frames are pulled on demand when a
+        client sends a ``client:capture-frame`` message on the
+        ``hermes-control`` data-channel topic.
+        """
+        identity = participant.identity
+
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.info("[%s] Audio track subscribed: %s", self.name, identity)
+            self._audio_buffers[identity] = bytearray()
+            self._last_audio_time[identity] = time.monotonic()
+            stream = rtc.AudioStream(track)
+            task = asyncio.create_task(self._audio_receive_loop(stream, identity))
+            self._audio_streams[identity] = task
             return
 
-        identity = participant.identity
-        logger.info("[%s] Audio track subscribed: %s", self.name, identity)
-
-        # Initialize buffer for this participant
-        self._audio_buffers[identity] = bytearray()
-        self._last_audio_time[identity] = time.monotonic()
-
-        # Start receiving audio frames
-        stream = rtc.AudioStream(track)
-        task = asyncio.create_task(self._audio_receive_loop(stream, identity))
-        self._audio_streams[identity] = task
+        if track.kind == rtc.TrackKind.KIND_VIDEO:
+            if not PIL_AVAILABLE:
+                logger.warning(
+                    "[%s] Video track from %s ignored — Pillow not installed",
+                    self.name, identity,
+                )
+                return
+            # Replace any prior stream for this participant (e.g. camera toggled).
+            old = self._video_streams.pop(identity, None)
+            if old is not None:
+                try:
+                    asyncio.create_task(old.aclose())
+                except Exception:
+                    pass
+            self._video_streams[identity] = rtc.VideoStream(track)
+            logger.info("[%s] Video track subscribed: %s (sampling-on-trigger)", self.name, identity)
+            return
 
     def _on_track_unsubscribed(
         self,
@@ -437,10 +528,23 @@ class LiveKitAdapter(BasePlatformAdapter):
         publication: "rtc.RemoteTrackPublication",
         participant: "rtc.RemoteParticipant",
     ):
-        """Clean up when a participant's audio track is unsubscribed."""
+        """Clean up when a participant's track is unsubscribed."""
         identity = participant.identity
-        logger.debug("[%s] Audio track unsubscribed: %s", self.name, identity)
-        self._cleanup_participant(identity)
+
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            logger.debug("[%s] Audio track unsubscribed: %s", self.name, identity)
+            self._cleanup_participant(identity)
+            return
+
+        if track.kind == rtc.TrackKind.KIND_VIDEO:
+            logger.debug("[%s] Video track unsubscribed: %s", self.name, identity)
+            stream = self._video_streams.pop(identity, None)
+            if stream is not None:
+                try:
+                    asyncio.create_task(stream.aclose())
+                except Exception:
+                    pass
+            return
 
     def _on_participant_disconnected(self, participant: "rtc.RemoteParticipant"):
         """Clean up when a participant leaves the room.
@@ -769,6 +873,10 @@ class LiveKitAdapter(BasePlatformAdapter):
                 {"transcript": transcript, "final": True, "identity": identity},
             )
 
+            # Drain any captured frames into this message so the agent's
+            # vision pipeline sees them alongside the transcript.
+            media_urls, media_types = self._drain_pending_captures()
+
             # Build message event
             source = self.build_source(
                 chat_id=self._room_name,
@@ -783,7 +891,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                 message_type=MessageType.VOICE,
                 source=source,
                 message_id=uuid.uuid4().hex[:12],
-                media_urls=[],
+                media_urls=media_urls,
+                media_types=media_types,
                 timestamp=datetime.now(tz=timezone.utc),
             )
 
@@ -792,6 +901,214 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self.handle_message(event)
         except Exception as e:
             logger.error("[%s] Error processing voice from %s: %s", self.name, identity, e)
+
+    # -- Inbound data channel + frame capture -------------------------------
+
+    # Topic clients send control messages on. Outbound topics (hermes-chat,
+    # untopic-ed agent:* lifecycle events) are unchanged.
+    DATA_CHANNEL_CONTROL_TOPIC = "hermes-control"
+
+    def _on_data_received(self, packet) -> None:
+        """Route inbound data-channel packets.
+
+        Called synchronously by the SDK's event thread; heavy work is
+        kicked off as asyncio tasks. JSON payloads on the
+        ``hermes-control`` topic are dispatched by their ``type`` field;
+        anything else is ignored (silently — keeps the protocol open for
+        unrelated apps sharing the same data channel without spamming logs).
+        """
+        topic = getattr(packet, "topic", None) or ""
+        if topic != self.DATA_CHANNEL_CONTROL_TOPIC:
+            return
+
+        participant = getattr(packet, "participant", None)
+        participant_identity = (
+            getattr(participant, "identity", "") if participant is not None else ""
+        )
+
+        try:
+            import json as _json
+            msg = _json.loads(packet.data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            logger.warning(
+                "[%s] %s: undecodable payload from %s: %s",
+                self.name, self.DATA_CHANNEL_CONTROL_TOPIC,
+                participant_identity or "?", exc,
+            )
+            return
+
+        msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
+        if not msg_type:
+            logger.debug("[%s] %s: payload missing 'type'", self.name, self.DATA_CHANNEL_CONTROL_TOPIC)
+            return
+
+        # Dispatch table. Keep additions here so adding new client:* types
+        # (e.g. client:tool-register, client:tool-result for future remote
+        # tooling) is a single line.
+        handlers = {
+            "client:capture-frame": lambda: self._capture_next_frame(participant_identity),
+            "client:message": lambda: self._handle_client_message(msg, participant_identity),
+            "client:control": lambda: self._handle_client_control(msg, participant_identity),
+        }
+        handler = handlers.get(msg_type)
+        if handler is None:
+            logger.debug("[%s] unknown control type %r from %s", self.name, msg_type, participant_identity or "?")
+            return
+
+        try:
+            asyncio.create_task(handler())
+        except RuntimeError:
+            # No running loop (callback fired during teardown). Drop quietly.
+            pass
+
+    async def _capture_next_frame(self, identity: str) -> None:
+        """Sample the very next video frame from ``identity`` and queue it.
+
+        Only one frame per call — option C semantics (no continuous
+        decoding). If the participant has no video track subscribed yet,
+        emit ``agent:frame-capture-failed`` so the client knows.
+        """
+        if not PIL_AVAILABLE:
+            await self._publish_agent_event(
+                "agent:frame-capture-failed",
+                {"reason": "pillow-not-installed"},
+            )
+            return
+
+        stream = self._video_streams.get(identity)
+        if stream is None:
+            logger.info("[%s] capture-frame from %s but no video track subscribed", self.name, identity)
+            await self._publish_agent_event(
+                "agent:frame-capture-failed",
+                {"reason": "no-video-track", "identity": identity},
+            )
+            return
+
+        try:
+            # AudioStream/VideoStream are async iterators that yield as new
+            # frames arrive. We take one and break.
+            frame_event = await asyncio.wait_for(stream.__anext__(), timeout=2.0)
+        except (asyncio.TimeoutError, StopAsyncIteration) as exc:
+            logger.warning("[%s] capture-frame from %s timed out: %s", self.name, identity, exc)
+            await self._publish_agent_event(
+                "agent:frame-capture-failed",
+                {"reason": "timeout", "identity": identity},
+            )
+            return
+
+        frame = frame_event.frame
+        try:
+            # Convert to RGBA so Pillow can ingest the raw buffer directly.
+            from livekit.rtc import VideoBufferType
+            rgba = frame.convert(VideoBufferType.RGBA)
+            img = Image.frombytes("RGBA", (rgba.width, rgba.height), bytes(rgba.data))
+            # JPEG doesn't carry alpha, so drop to RGB before encoding.
+            img = img.convert("RGB")
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            jpeg_bytes = buf.getvalue()
+        except Exception as exc:
+            logger.error("[%s] frame encode failed for %s: %s", self.name, identity, exc)
+            await self._publish_agent_event(
+                "agent:frame-capture-failed",
+                {"reason": "encode-error", "identity": identity, "detail": str(exc)},
+            )
+            return
+
+        tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, f"frame_{uuid.uuid4().hex[:12]}.jpg")
+        with open(path, "wb") as f:
+            f.write(jpeg_bytes)
+
+        self._pending_captures.append((path, "image/jpeg"))
+        logger.info(
+            "[%s] captured %dx%d frame from %s (%d bytes) — pending=%d",
+            self.name, frame.width, frame.height, identity,
+            len(jpeg_bytes), len(self._pending_captures),
+        )
+        await self._publish_agent_event(
+            "agent:frame-captured",
+            {
+                "identity": identity,
+                "width": frame.width,
+                "height": frame.height,
+                "bytes": len(jpeg_bytes),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            },
+        )
+
+    async def _handle_client_message(self, msg: Dict[str, Any], identity: str) -> None:
+        """Inject a typed text message as if it were a transcribed voice utterance.
+
+        Useful for clients that want to text-chat with the agent over the
+        LiveKit data channel (no STT needed). Any pending captures attach
+        to this message, same as the voice path.
+        """
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
+
+        media_urls, media_types = self._drain_pending_captures()
+
+        source = self.build_source(
+            chat_id=self._room_name,
+            chat_name=self._room_name,
+            chat_type="group",
+            user_id=identity or "client",
+            user_name=identity or "client",
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=uuid.uuid4().hex[:12],
+            media_urls=media_urls,
+            media_types=media_types,
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+
+        await self._publish_agent_event(
+            "agent:user-transcript",
+            {"transcript": text, "final": True, "identity": identity, "source": "text"},
+        )
+        await self._publish_agent_event("agent:thinking-start")
+        await self.handle_message(event)
+
+    async def _handle_client_control(self, msg: Dict[str, Any], identity: str) -> None:
+        """Runtime control hooks from the client. Placeholder for now.
+
+        Currently recognized actions:
+          - ``pause``  — stop sampling inbound audio (already used internally
+            during TTS playback); kept here as an explicit client-facing hook
+            for future "mute me" UX.
+          - ``resume`` — re-enable audio sampling.
+        """
+        action = (msg.get("action") or "").strip().lower()
+        if action == "pause":
+            self._paused = True
+            logger.info("[%s] paused by client %s", self.name, identity)
+        elif action == "resume":
+            self._paused = False
+            logger.info("[%s] resumed by client %s", self.name, identity)
+        else:
+            logger.debug("[%s] unknown client:control action %r", self.name, action)
+
+    def _drain_pending_captures(self) -> tuple[list[str], list[str]]:
+        """Pop all buffered frame paths into parallel (urls, types) lists.
+
+        Temp files are NOT unlinked here — the hermes agent loop reads them
+        after handle_message returns (the dispatch is fire-and-forget). The
+        files live under <tempdir>/hermes_livekit/ and are cleaned up on
+        disconnect; OS tempdir housekeeping handles anything we miss.
+        """
+        urls: list[str] = []
+        types: list[str] = []
+        while self._pending_captures:
+            path, mime = self._pending_captures.pop(0)
+            urls.append(path)
+            types.append(mime)
+        return urls, types
 
     # -- Outbound messaging -------------------------------------------------
 

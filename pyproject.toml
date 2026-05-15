@@ -4,24 +4,28 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-livekit"
-version = "0.1.0"
+version = "0.2.0"
 description = "LiveKit WebRTC voice gateway plugin for hermes-agent"
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "Franci Penov" }]
+authors = [{ name = "kortexa.ai", email = "info@kortexa.ai" }]
 license = { text = "MIT" }
 dependencies = [
   "hermes-agent",
   # Exact pins (mirrors hermes-agent's 2026-05-12 supply-chain hardening
-  # policy): PyPI cannot ship a new livekit/livekit-api into a user's
-  # install without an intentional bump here. Update the pins AND verify
-  # release notes / Socket advisories before changing.
+  # policy): PyPI cannot ship a new livekit/livekit-api/Pillow into a
+  # user's install without an intentional bump here. Update the pins
+  # AND verify release notes / Socket advisories before changing.
   #   livekit==1.1.7      released 2026-04-27, no yanks (skipped 1.1.8
   #                       from 2026-05-13 — too fresh).
   #   livekit-api==1.1.0  released 2025-12-02, six months stable
   #                       (skipped 1.0.8 — yanked: wrong dependencies).
+  #   Pillow==12.2.0      released 2026-04-01, no yanks. Used to JPEG-
+  #                       encode sampled video frames before handing them
+  #                       to hermes's vision pipeline via media_urls.
   "livekit==1.1.7",
   "livekit-api==1.1.0",
+  "Pillow==12.2.0",
 ]
 
 [project.entry-points."hermes_agent.plugins"]

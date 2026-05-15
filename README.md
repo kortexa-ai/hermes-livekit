@@ -99,6 +99,75 @@ Join the configured room from any LiveKit client (web, mobile, voice-agent
 desktop). The agent watches the room when empty and joins as soon as a real
 participant arrives, then transcribes incoming audio and replies via TTS.
 
+## Data channel protocol
+
+Outbound (agent → client) is unchanged from earlier voice-only versions —
+final text replies on topic `hermes-chat`, `agent:*` lifecycle events with
+no topic. The 0.2.0 release adds an **inbound** channel for client-driven
+control + camera snapshots.
+
+### Outbound (agent → client)
+
+| Topic | Payload | When |
+|---|---|---|
+| `hermes-chat` | UTF-8 text | After agent generates a reply |
+| _(no topic)_ | JSON `{"type": "agent:<...>", "payload": {...}}` | Lifecycle events (see below) |
+
+Agent lifecycle event types:
+
+- `agent:listening-start` / `agent:listening-stop` — VAD detected speech start/end
+- `agent:user-transcript` — STT (or typed message) finalized; payload `{transcript, final, identity, source?}`
+- `agent:thinking-start` — agent about to invoke the LLM
+- `agent:speaking-start` / `agent:speaking-stop` — TTS playback boundary
+- `agent:agent-transcript` — assistant reply text mirrored on data channel
+- `agent:frame-captured` — a video frame was sampled and queued; payload `{identity, width, height, bytes, timestamp}`
+- `agent:frame-capture-failed` — `client:capture-frame` could not be honored; payload `{reason, identity?, detail?}`
+
+### Inbound (client → agent), topic `hermes-control`
+
+JSON payloads of the form `{"type": "client:<...>", ...}`:
+
+```jsonc
+// sample the next frame from this client's published video track
+{"type": "client:capture-frame"}
+
+// inject a typed message (skips STT). Pending captures attach automatically.
+{"type": "client:message", "text": "what's in this picture?"}
+
+// runtime control hooks
+{"type": "client:control", "action": "pause"}    // stop sampling audio
+{"type": "client:control", "action": "resume"}   // resume sampling audio
+```
+
+Unknown `type` values are ignored silently — keeps the topic compatible
+with apps that share the same data channel for unrelated control traffic.
+
+### Video / camera-frame semantics
+
+The agent does **not** consume video tracks continuously. When you
+publish a camera as a video track, the adapter just subscribes to it —
+no frames are decoded until you ask. Send `{"type": "client:capture-frame"}`
+on `hermes-control` and the agent samples the **very next** frame, encodes
+it as JPEG (quality 85), and queues it locally.
+
+The frame attaches to **the next user message** dispatched by the adapter
+(either a closed voice utterance or a `client:message`). The hermes agent
+loop then processes it through its existing `image_input_mode: auto`
+vision path — exactly the same code path used by image attachments on
+other platforms.
+
+Frames captured but never claimed by a message are cleaned up on
+disconnect. Frames attached to a message stay on disk through the agent
+turn (the agent loop is fire-and-forget after `handle_message`).
+
+### Reserved for future work
+
+`client:tool-register`, `client:tool-unregister`, and `client:tool-result`
+message types are reserved for a future iteration that lets the client
+publish remote tools the agent can invoke over the data channel — think
+teleoperated robotics, browser actions, hardware controllers. Don't ship
+clients that send those types yet; the protocol shape may change.
+
 ## Status
 
 Experimental. Carved out of the `kortexa/gateway-livekit` branch on the
