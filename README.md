@@ -123,6 +123,15 @@ Agent lifecycle event types:
 - `agent:frame-captured` — a video frame was sampled and queued; payload `{identity, width, height, bytes, timestamp}`
 - `agent:frame-capture-failed` — `client:capture-frame` could not be honored; payload `{reason, identity?, detail?}`
 
+Remote-tool events (0.3.0+, flat envelope — no `payload` wrapper, sent
+only to the owning participant via `destination_identities`):
+
+- `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?, detail?}`
+- `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
+- `agent:tool-call` — agent invoking a client-registered tool; `{call_id, name, arguments}`
+- `agent:tool-call-cancelled` — agent loop unwound while the call was in flight; `{call_id, name}`
+- `agent:tool-call-timeout` — plugin timed out waiting for a result (default 30s, override via `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC`); `{call_id, name}`
+
 ### Inbound (client → agent), topic `hermes-control`
 
 JSON payloads of the form `{"type": "client:<...>", ...}`:
@@ -138,6 +147,40 @@ JSON payloads of the form `{"type": "client:<...>", ...}`:
 {"type": "client:control", "action": "pause"}    // stop sampling audio
 {"type": "client:control", "action": "resume"}   // resume sampling audio
 ```
+
+Remote-tool messages (0.3.0+):
+
+```jsonc
+// register a tool the agent can call. input_schema is JSON Schema for
+// the tool's arguments (`type: object`, with `properties` and `required`).
+{
+  "type": "client:tool-register",
+  "name": "desktop_notify",
+  "description": "Show a desktop notification.",
+  "input_schema": {
+    "type": "object",
+    "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+    "required": ["title", "body"]
+  }
+}
+
+// give back a tool the client no longer wants to offer
+{"type": "client:tool-unregister", "name": "desktop_notify"}
+
+// respond to an inbound agent:tool-call (exactly one of result/error)
+{"type": "client:tool-result", "call_id": "tc_abc123", "result": {"shown": true}}
+{"type": "client:tool-result", "call_id": "tc_abc123", "error": "permission denied"}
+```
+
+For tools to be visible to the LLM, add `hermes-livekit-tools` to the
+livekit toolset list in `~/.hermes/config.yaml`
+(`platform_toolsets.livekit`). The plugin does not auto-activate the
+toolset.
+
+Tools and pending calls are cleaned up automatically when the registering
+participant disconnects. Full design and roadmap (large/binary results,
+multi-client coexistence, native LiveKit RPC pivot) in
+[`docs/remote-tools-design.md`](docs/remote-tools-design.md).
 
 Unknown `type` values are ignored silently — keeps the topic compatible
 with apps that share the same data channel for unrelated control traffic.
@@ -159,14 +202,6 @@ other platforms.
 Frames captured but never claimed by a message are cleaned up on
 disconnect. Frames attached to a message stay on disk through the agent
 turn (the agent loop is fire-and-forget after `handle_message`).
-
-### Reserved for future work
-
-`client:tool-register`, `client:tool-unregister`, and `client:tool-result`
-message types are reserved for a future iteration that lets the client
-publish remote tools the agent can invoke over the data channel — think
-teleoperated robotics, browser actions, hardware controllers. Don't ship
-clients that send those types yet; the protocol shape may change.
 
 ## Status
 

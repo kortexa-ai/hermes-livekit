@@ -4,6 +4,41 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-16
+
+### Added
+
+- **Remote tools over the data channel.** Connected clients can register
+  tools that the hermes agent's LLM can invoke. The agent calls them
+  via a targeted `agent:tool-call` JSON message; the client runs the
+  tool locally (whatever that means — pop a notification, drive a
+  browser tab, move a robot arm) and replies with `client:tool-result`.
+  Three new inbound types on the `hermes-control` topic
+  (`client:tool-register`, `client:tool-unregister`, `client:tool-result`)
+  and matching outbound `agent:tool-*` events. Full design in
+  `docs/remote-tools-design.md`.
+- Tools register into the hermes registry under the
+  `hermes-livekit-tools` toolset. **Operators must add
+  `hermes-livekit-tools` to the active toolsets in `~/.hermes/config.yaml`
+  (`platform_toolsets.livekit`)** for the LLM to see client-registered
+  tools. The plugin does not auto-activate.
+- `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` env override (default 30s) for the
+  per-call timeout when waiting for a `client:tool-result`.
+- Cleanup: tools and pending calls owned by a disconnecting client are
+  deregistered automatically; full adapter teardown wipes all tool state;
+  agent-loop cancellation propagates `agent:tool-call-cancelled` to the
+  owner.
+
+### Scope notes (v1 design choices)
+
+- Single-client assumption — collisions between distinct clients
+  registering the same tool name are undefined.
+- Trust-on-connect — any participant in the room can register any tool.
+  No allowlist; the LiveKit room's existing auth is the consent surface.
+- Large / binary tool results (e.g. camera snapshots) are Phase 1.5 work
+  via LiveKit byte streams; v0.3.0 supports small JSON-shaped results
+  only.
+
 ## [0.2.1] — 2026-05-15
 
 ### Fixed

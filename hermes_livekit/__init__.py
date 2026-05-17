@@ -5,12 +5,52 @@ point. No core hermes-agent edits are required — every integration touch
 point uses an existing ``register_platform()`` hook.
 """
 
+import logging
 import os
 from typing import Optional
 
-from .adapter import LiveKitAdapter, check_livekit_requirements
+from .adapter import LIVE_ADAPTERS, LiveKitAdapter, check_livekit_requirements
+
+logger = logging.getLogger("gateway.platforms.livekit")
 
 __all__ = ["register", "LiveKitAdapter", "check_livekit_requirements"]
+
+
+def _on_session_finalize_hook(**kwargs) -> None:
+    """Cancel pending remote tool calls when the user resets the session.
+
+    Hermes fires ``on_session_finalize`` from ``_handle_reset_command`` —
+    i.e. when the user issues ``/new``. The adapter's proxy coroutines are
+    blocked on per-call futures; without this hook they'd hang until the
+    per-call timeout. (For ``/stop`` mid-turn, see PLAN.md — the upstream
+    PR adding ``agent_loop_stopped`` is the matching hook.)
+    """
+    for adapter in list(LIVE_ADAPTERS):
+        try:
+            n = adapter.cancel_pending_tool_calls_for_session_reset()
+            if n:
+                logger.info("session finalize: cancelled %d in-flight remote tool call(s)", n)
+        except Exception as exc:
+            logger.debug("session-finalize cleanup failed for %s: %s", adapter, exc)
+
+
+def _on_agent_loop_stopped_hook(**kwargs) -> None:
+    """Cancel pending remote tool calls when the agent loop is interrupted.
+
+    Subscribes to the upstream ``agent_loop_stopped`` hook proposed by the
+    hermes-agent PR linked in PLAN.md. Until that PR lands, hermes-agent's
+    ``register_hook`` accepts the registration (with a warning about an
+    unknown hook name) but never fires it — so this handler is a no-op on
+    today's main. Once the upstream PR is merged, it starts catching
+    ``/stop`` mid-turn without any further plugin change.
+    """
+    for adapter in list(LIVE_ADAPTERS):
+        try:
+            n = adapter.cancel_pending_tool_calls_for_session_reset()
+            if n:
+                logger.info("agent loop stopped: cancelled %d in-flight remote tool call(s)", n)
+        except Exception as exc:
+            logger.debug("loop-stopped cleanup failed for %s: %s", adapter, exc)
 
 
 _LIVEKIT_PLATFORM_HINT = (
@@ -159,3 +199,12 @@ def register(ctx) -> None:
         # Toolset registration is best-effort; the adapter still works
         # without it (resolves through the gateway umbrella toolset).
         pass
+
+    # Remote-tool cancellation hooks. See docs/remote-tools-design.md and
+    # PLAN.md. on_session_finalize covers /new today; agent_loop_stopped
+    # covers /stop once the upstream PR lands.
+    try:
+        ctx.register_hook("on_session_finalize", _on_session_finalize_hook)
+        ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
+    except Exception as exc:
+        logger.debug("hook registration failed: %s", exc)
