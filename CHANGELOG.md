@@ -4,6 +4,31 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-17
+
+### Fixed
+
+- **Silence-only participants could trigger STT on silence.**
+  `_on_track_subscribed` seeded `_last_audio_time` on subscribe, which
+  defeated the `_check_silence_loop` guard that treats a missing entry
+  as "this participant has never spoken" (and discards accumulated
+  noise instead of transcribing it). The timestamp is now set only on
+  the first chunk above the RMS floor.
+- **Last words could be dropped when a track ended abruptly.** The
+  track-end utterance flush in `_cleanup_participant` subtracted a
+  fixed silence window (`len(buf) - silence_bytes`) before transcribing,
+  which chopped real speech — or zeroed the flush entirely — when a
+  track ended right after a word with no trailing silence buffered. The
+  flush now transcribes the whole buffer; trailing silence handed to
+  STT is harmless, lost words are not.
+- Corrected a stale docstring on `prepare_tts_text` — upstream
+  `BasePlatformAdapter` now calls the hook (landed via
+  NousResearch/hermes-agent#27308), so the override is live, not a
+  no-op.
+
+Both adapter fixes address review feedback from the now-closed core
+PR NousResearch/hermes-agent#3894.
+
 ## [0.3.0] — 2026-05-16
 
 ### Added

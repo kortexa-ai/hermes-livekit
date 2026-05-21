@@ -550,7 +550,13 @@ class LiveKitAdapter(BasePlatformAdapter):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info("[%s] Audio track subscribed: %s", self.name, identity)
             self._audio_buffers[identity] = bytearray()
-            self._last_audio_time[identity] = time.monotonic()
+            # Deliberately do NOT seed _last_audio_time here. _check_silence_loop
+            # sets it on the first chunk above RMS_SILENCE_FLOOR, and treats a
+            # missing entry as "this participant has never spoken" — discarding
+            # accumulated noise instead of feeding silence to STT. Seeding it on
+            # subscribe defeats that guard: a participant who only ever publishes
+            # silence would accrue a stale timestamp and eventually trip an
+            # utterance.
             stream = rtc.AudioStream(track)
             task = asyncio.create_task(self._audio_receive_loop(stream, identity))
             self._audio_streams[identity] = task
@@ -742,8 +748,16 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Flush a pending utterance, if any, before tearing buffers down.
         buf = self._audio_buffers.get(identity)
         if buf is not None and identity in self._speaking_participants and len(buf) > 0:
-            silence_bytes = int(SILENCE_THRESHOLD_SECONDS * SAMPLE_RATE * NUM_CHANNELS * 2)
-            speech_end = max(0, len(buf) - silence_bytes)
+            # Use the whole buffer: the track just ended, so there is no
+            # "ongoing silence" to trim — the buffer ends at (or very close
+            # to) the last spoken word. The steady-state path in
+            # _check_silence_loop trims trailing silence because the
+            # participant is still connected; here, subtracting a fixed
+            # silence window would chop real speech (or zero the flush
+            # entirely) when the track ends right after a word. Trailing
+            # silence in the audio handed to STT is harmless; lost words
+            # are not.
+            speech_end = len(buf)
             duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
             if duration >= MIN_SPEECH_DURATION:
                 pcm_data = bytes(buf[:speech_end])
@@ -1581,10 +1595,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         The full response is already sent via data channel — TTS should
         only speak the conversational parts.
 
-        Note: BasePlatformAdapter on upstream main inlines a simpler
-        markdown strip and does NOT call prepare_tts_text(). This method
-        is a no-op there. It activates when running on a hermes-agent
-        build that has the prepare_tts_text hook in base.py.
+        Overrides ``BasePlatformAdapter.prepare_tts_text``, which upstream
+        calls in the auto-TTS path (the hook landed via NousResearch/
+        hermes-agent#27308). The base default does a basic markdown strip;
+        this override additionally removes code fences, inline code, URLs,
+        file paths, and MEDIA: tags.
         """
         import re as _re
 
