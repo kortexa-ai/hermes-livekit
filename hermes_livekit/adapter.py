@@ -422,6 +422,17 @@ class LiveKitAdapter(BasePlatformAdapter):
     async def _join_room(self) -> bool:
         """Actually establish the LiveKit room connection and start audio I/O."""
         try:
+            # Overwriting self._room would orphan the previous one. Its FFI
+            # listen task keeps it alive, so its ICE sockets would never be
+            # released -- see _release_room.
+            if self._room is not None:
+                logger.warning(
+                    "[%s] joining with a room already set; releasing the old one",
+                    self.name,
+                )
+                stale, self._room = self._room, None
+                await self._release_room(stale, why="stale-on-join")
+
             self._room = rtc.Room()
 
             # Register event handlers
@@ -523,11 +534,11 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         if self._room:
             self._graceful_leave = True
+            room, self._room = self._room, None
             try:
-                await self._room.disconnect()
+                await self._release_room(room, why="disconnect")
             finally:
                 self._graceful_leave = False
-            self._room = None
 
         self._audio_source = None
         self._local_track = None
@@ -643,6 +654,52 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] Last participant left '%s', leaving room", self.name, self._room_name)
             asyncio.create_task(self._leave_and_watch())
 
+    async def _release_room(self, room: Optional["rtc.Room"], *, why: str) -> None:
+        """Disconnect a room and make sure its FFI resources are actually freed.
+
+        ``Room.disconnect()`` returns early when the room is already down::
+
+            if not self.isconnected():
+                return
+
+        which skips ``await self._task`` and the queue unsubscribe below it. That
+        task is ``create_task(self._listen_task())`` — a bound coroutine — so
+        while it lives the event loop holds the Room, ``FfiHandle.__del__``
+        never runs, and the ~15 UDP sockets that room gathered for ICE stay open
+        for the life of the process. A gateway that accumulates those hits
+        ``[Errno 24] Too many open files`` and then fails at something unrelated,
+        like writing a temp WAV for STT.
+
+        Rooms die that way routinely: the server closes them, a reconnect
+        replaces them, or the last participant leaves. So free them explicitly
+        rather than trusting the garbage collector to find a task-pinned object.
+        """
+        if room is None:
+            return
+        try:
+            await room.disconnect()
+        except Exception as e:
+            logger.debug("[%s] disconnect during %s: %s", self.name, why, e)
+
+        # Everything below is what disconnect() skips on the early-return path.
+        task = getattr(room, "_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        queue = getattr(room, "_ffi_queue", None)
+        if queue is not None:
+            try:
+                from livekit.rtc._ffi_client import FfiClient
+
+                FfiClient.instance.queue.unsubscribe(queue)
+            except Exception:
+                pass
+        handle = getattr(room, "_ffi_handle", None)
+        if handle is not None and not getattr(handle, "disposed", True):
+            try:
+                handle.dispose()
+            except Exception:
+                logger.debug("[%s] handle dispose during %s failed", self.name, why)
+
     async def _leave_and_watch(self) -> None:
         """Tear down the room connection and resume presence polling."""
         # Stop silence detection and audio streams, but keep self._running
@@ -667,13 +724,11 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         if self._room:
             self._graceful_leave = True
+            room, self._room = self._room, None
             try:
-                await self._room.disconnect()
-            except Exception as e:
-                logger.debug("[%s] leave error: %s", self.name, e)
+                await self._release_room(room, why="leave")
             finally:
                 self._graceful_leave = False
-            self._room = None
         self._audio_source = None
         self._local_track = None
 
