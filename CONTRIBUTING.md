@@ -36,6 +36,20 @@ You'll need:
 - `ffmpeg` on `PATH` (TTS decode)
 - The LiveKit CLI (`brew install livekit-cli`) for ad-hoc room testing
 
+### Tests
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+`tests/test_adapter_contract.py` checks that every `LiveKitAdapter` override
+still accepts what the gateway passes to `BasePlatformAdapter`. That drift has
+broken a whole path twice — `play_tts()` missing `caption` killed every voice
+reply, `connect()` missing `is_reconnect` kept the platform down after any
+disconnect — and neither shows up until that exact path runs against a live
+gateway. Run it after any upstream bump.
+
 A reasonable smoke test loop, given those:
 
 1. Restart the gateway, confirm `Connecting to livekit... ✓ livekit connected`

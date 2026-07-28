@@ -28,6 +28,9 @@ dependencies = [
   "Pillow==12.2.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.entry-points."hermes_agent.plugins"]
 # Point to the package, not the function — the hermes-agent plugin loader
 # does ep.load() and then getattr(module, "register"), so the target must
