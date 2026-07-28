@@ -206,6 +206,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Pause audio capture during TTS playback
         self._paused = False
 
+        # Throttle for presence-check failure warnings (see
+        # _count_remote_participants).
+        self._presence_error_logged = 0.0
+
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
 
@@ -381,7 +385,20 @@ class LiveKitAdapter(BasePlatformAdapter):
             finally:
                 await client.aclose()
         except Exception as e:
-            logger.debug("[%s] presence check failed: %s", self.name, e)
+            # A failing presence check is indistinguishable from an empty room:
+            # we return 0 either way and the agent simply never joins, silently,
+            # forever. Say so out loud the first time and then periodically,
+            # rather than hiding it at DEBUG (which the gateway's log handler
+            # drops anyway).
+            now = time.time()
+            if now - self._presence_error_logged > 300:
+                self._presence_error_logged = now
+                logger.warning(
+                    "[%s] presence check failed — the agent cannot see participants in '%s': %s: %s",
+                    self.name, self._room_name, type(e).__name__, e,
+                )
+            else:
+                logger.debug("[%s] presence check failed: %s", self.name, e)
             return 0
 
     async def _presence_watch_loop(self) -> None:
