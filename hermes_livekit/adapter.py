@@ -896,38 +896,51 @@ class LiveKitAdapter(BasePlatformAdapter):
                     # Trim trailing silence from the buffer (keep only up to
                     # SILENCE_THRESHOLD worth of trailing audio)
                     silence_bytes = int(SILENCE_THRESHOLD_SECONDS * SAMPLE_RATE * NUM_CHANNELS * 2)
-                    speech_end = max(0, buf_len - silence_bytes)
-
-                    duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
-                    if duration < MIN_SPEECH_DURATION:
-                        # Too short — discard as noise
-                        self._audio_buffers[identity] = bytearray()
-                        self._last_audio_time.pop(identity, None)
-                        # False alarm — revert the listening-start we sent
-                        if identity in self._speaking_participants:
-                            self._speaking_participants.discard(identity)
-                            asyncio.create_task(
-                                self._publish_agent_event(
-                                    "agent:listening-stop", {"identity": identity}
-                                )
-                            )
-                        continue
-
-                    # Extract the utterance (speech portion only) and reset
-                    pcm_data = bytes(buf[:speech_end])
-                    self._audio_buffers[identity] = bytearray()
-                    self._last_audio_time.pop(identity, None)
-                    self._speaking_participants.discard(identity)
-                    asyncio.create_task(
-                        self._publish_agent_event(
-                            "agent:listening-stop", {"identity": identity}
-                        )
-                    )
-
-                    logger.info("[%s] Utterance from %s: %.1fs audio", self.name, identity, duration)
-                    asyncio.create_task(self._process_voice_input(identity, pcm_data))
+                    self._flush_utterance(identity, max(0, buf_len - silence_bytes))
         except asyncio.CancelledError:
             return
+
+    def _flush_utterance(self, identity: str, speech_end: int) -> bool:
+        """Close a buffered utterance and hand it to STT. Returns True if sent.
+
+        Shared by the silence detector and by ``client:control end-of-turn``.
+        A client doing its own endpointing already knows the turn is over;
+        making it wait for us to rediscover that costs SILENCE_THRESHOLD_SECONDS
+        on every single reply.
+
+        Deliberately synchronous up to the dispatch: the buffer is reset before
+        any await, so the silence loop and an inbound control frame racing each
+        other cannot transcribe the same audio twice.
+        """
+        buf = self._audio_buffers.get(identity)
+        if not buf or speech_end <= 0:
+            return False
+
+        duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
+        if duration < MIN_SPEECH_DURATION:
+            # Too short — discard as noise
+            self._audio_buffers[identity] = bytearray()
+            self._last_audio_time.pop(identity, None)
+            # False alarm — revert the listening-start we sent
+            if identity in self._speaking_participants:
+                self._speaking_participants.discard(identity)
+                asyncio.create_task(
+                    self._publish_agent_event("agent:listening-stop", {"identity": identity})
+                )
+            return False
+
+        # Extract the utterance (speech portion only) and reset
+        pcm_data = bytes(buf[:speech_end])
+        self._audio_buffers[identity] = bytearray()
+        self._last_audio_time.pop(identity, None)
+        self._speaking_participants.discard(identity)
+        asyncio.create_task(
+            self._publish_agent_event("agent:listening-stop", {"identity": identity})
+        )
+
+        logger.info("[%s] Utterance from %s: %.1fs audio", self.name, identity, duration)
+        asyncio.create_task(self._process_voice_input(identity, pcm_data))
+        return True
 
     async def _process_voice_input(self, identity: str, pcm_data: bytes):
         """Transcribe audio and feed into the agent loop."""
@@ -1178,9 +1191,19 @@ class LiveKitAdapter(BasePlatformAdapter):
             during TTS playback); kept here as an explicit client-facing hook
             for future "mute me" UX.
           - ``resume`` — re-enable audio sampling.
+          - ``end-of-turn`` — the client has finished speaking and says so, so
+            transcribe what is buffered now instead of waiting for the silence
+            detector to reach the same conclusion a second and a half later.
+            Scoped to the sender: it flushes only that participant's buffer.
         """
         action = (msg.get("action") or "").strip().lower()
-        if action == "pause":
+        if action in ("end-of-turn", "end_of_turn"):
+            buf = self._audio_buffers.get(identity)
+            if self._flush_utterance(identity, len(buf) if buf else 0):
+                logger.info("[%s] end-of-turn from %s", self.name, identity)
+            else:
+                logger.debug("[%s] end-of-turn from %s with nothing buffered", self.name, identity)
+        elif action == "pause":
             self._paused = True
             logger.info("[%s] paused by client %s", self.name, identity)
         elif action == "resume":
