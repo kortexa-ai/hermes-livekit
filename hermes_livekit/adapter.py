@@ -182,13 +182,6 @@ class LiveKitAdapter(BasePlatformAdapter):
         # creates a pseudo-member on first lookup.
         super().__init__(config, Platform("livekit"))
 
-        # Point streaming TTS at the configured endpoint rather than the
-        # environment's. No-op when tts.openai.base_url isn't set, so a real
-        # OpenAI setup is untouched. See streaming_tts.install().
-        from .streaming_tts import install as _install_streaming_tts
-
-        _install_streaming_tts()
-
         extra = config.extra or {}
         self._url: str = extra.get("url") or os.getenv("LIVEKIT_URL", "")
         self._api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
