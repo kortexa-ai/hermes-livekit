@@ -4,6 +4,26 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-07-27
+
+### Fixed
+
+Two adapter overrides had drifted from the `BasePlatformAdapter` contract,
+each breaking a whole path with a `TypeError`.
+
+- **Every voice reply failed.** The gateway's auto-TTS path calls
+  `play_tts(..., caption=...)` on every platform, but the override pinned a
+  fixed signature without it — so each voice turn died *after* the TTS audio
+  had already been generated, and the room got "Sorry, I encountered an
+  error (TypeError)" instead of the reply. `play_tts` now takes `caption`
+  (accepted and ignored: LiveKit delivers reply text separately on
+  `hermes-chat`, and leaving the caption unconsumed is exactly what makes
+  the caller still send that text) plus `**kwargs`, matching the base
+  signature, which takes `**kwargs` and can grow keywords at any time.
+- **The platform stayed down permanently after any disconnect.**
+  hermes-agent's reconnection watcher calls `connect(is_reconnect=True)`;
+  without the kwarg every reconnect attempt raised a `TypeError`.
+
 ## [0.3.1] — 2026-05-17
 
 ### Fixed

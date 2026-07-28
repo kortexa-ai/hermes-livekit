@@ -1514,8 +1514,19 @@ class LiveKitAdapter(BasePlatformAdapter):
         audio_path: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        caption: Optional[str] = None,
+        **kwargs: Any,
     ) -> SendResult:
-        """Play TTS audio into the LiveKit room via the published audio track."""
+        """Play TTS audio into the LiveKit room via the published audio track.
+
+        ``caption`` is the Telegram-style "attach the text to the voice message"
+        hook; the gateway passes it on every platform. LiveKit delivers reply
+        text separately on ``hermes-chat``, so it is accepted and ignored —
+        returning without consuming it leaves the caller's
+        ``_tts_caption_delivered`` False, which is what sends the text. The
+        ``**kwargs`` keeps this override compatible with the base signature,
+        which takes ``**kwargs`` and can grow new keywords at any time.
+        """
         if not self._audio_source or not self._room:
             return SendResult(success=False, error="Not connected to room")
 
