@@ -29,7 +29,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24,<2",
+]
 
 [project.entry-points."hermes_agent.plugins"]
 # Point to the package, not the function — the hermes-agent plugin loader

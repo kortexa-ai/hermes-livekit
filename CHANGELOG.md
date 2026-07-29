@@ -4,6 +4,18 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Incremental streaming TTS for compatible Hermes versions.** The adapter
+  implements Hermes's streaming-audio lifecycle and publishes PCM to the
+  LiveKit audio track as provider chunks arrive, instead of waiting for a
+  complete encoded audio file. Mono int16 input is resampled to LiveKit's
+  48 kHz output with the SDK's stateful resampler. Abort clears queued audio
+  immediately when cancellation is requested, while older Hermes versions
+  retain the existing whole-file `play_tts()` path.
+
 ## [0.4.0] — 2026-07-28
 
 ### Added
