@@ -146,7 +146,16 @@ JSON payloads of the form `{"type": "client:<...>", ...}`:
 // runtime control hooks
 {"type": "client:control", "action": "pause"}    // stop sampling audio
 {"type": "client:control", "action": "resume"}   // resume sampling audio
+
+// this speaker is done talking; close the utterance and dispatch it now (0.4.0+)
+{"type": "client:control", "action": "end-of-turn"}
 ```
+
+`end-of-turn` is for clients that endpoint locally. Without it the adapter can
+only notice you stopped once it has seen `SILENCE_THRESHOLD_SECONDS` of silence,
+and that wait lands on every single reply. Unlike `pause`/`resume` — which are
+global — this is scoped to the sending participant, so one client ending its
+turn cannot affect anyone else in the room.
 
 Remote-tool messages (0.3.0+):
 

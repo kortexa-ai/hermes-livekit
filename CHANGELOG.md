@@ -4,6 +4,41 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-07-28
+
+### Added
+
+- **`client:control` action `end-of-turn`.** Closes the sending participant's
+  utterance and dispatches it immediately, for clients that endpoint locally.
+  Without it the adapter cannot tell you have stopped until it has seen
+  `SILENCE_THRESHOLD_SECONDS` of silence, and that delay is paid on every
+  reply. Scoped to the sender, unlike the global `pause`/`resume`.
+
+### Fixed
+
+- **Leaked UDP sockets on every room teardown, ending in
+  `[Errno 24] Too many open files`.** A connected room holds ~15 sockets from
+  ICE gathering, and the gateway had accumulated 209 — about 14 rooms alive at
+  once in a process that should hold one. It surfaced far from the cause: STT
+  could not write its temp WAV and the kanban dispatcher failed its tick.
+
+  `Room.disconnect()` returns early when the room is already disconnected,
+  skipping both `await self._task` and the FFI queue unsubscribe. That task is
+  a bound coroutine, so while it lives the event loop keeps the Room alive, its
+  handle is never dropped, and the sockets stay open for the life of the
+  process. Rooms end that way routinely — the server closes them, the last
+  participant leaves, a reconnect replaces them. Teardown now cancels the task,
+  unsubscribes the queue and disposes the handle itself. `_join_room()` also
+  assigned a fresh `rtc.Room()` unconditionally, orphaning any existing one;
+  it now releases first and warns, since reaching that branch means a race.
+
+  All private-attribute access is best-effort, so an SDK shape change degrades
+  to the previous behaviour rather than breaking teardown.
+
+- **Silent presence failures.** A failing remote-participant count logged at
+  `DEBUG`, so a room that never saw its participants looked idle. It now warns,
+  throttled to once per 5 minutes.
+
 ## [0.3.2] — 2026-07-27
 
 ### Fixed
