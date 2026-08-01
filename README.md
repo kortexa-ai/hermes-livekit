@@ -21,10 +21,17 @@ TTS replies back to the room as audio.
 Install into the **same Python environment** as your `hermes-agent`:
 
 ```bash
-pip install git+https://github.com/kortexa-ai/hermes-livekit.git
+python -m pip install git+https://github.com/kortexa-ai/hermes-livekit.git
 ```
 
 pip resolves the pinned `livekit` / `livekit-api` SDK versions automatically.
+If Hermes' environment does not contain pip, target its interpreter with uv:
+
+```bash
+uv pip install --python /path/to/hermes/python \
+  git+https://github.com/kortexa-ai/hermes-livekit.git
+```
+
 The plugin is auto-discovered through the `hermes_agent.plugins` entry-point
 group — no edits to hermes-agent's source tree are required.
 
@@ -40,7 +47,17 @@ group — no edits to hermes-agent's source tree are required.
 For development on a checkout (e.g. `~/src/hermes-livekit/`):
 
 ```bash
-pip install -e ~/src/hermes-livekit
+python -m pip install -e ~/src/hermes-livekit
+```
+
+Run that command with the Python interpreter from the same environment as
+Hermes. Re-run it after pulling a change to `pyproject.toml`: editable installs
+reflect Python source edits immediately, but package metadata such as the
+version, dependencies, and plugin entry point is generated at install time.
+The uv equivalent is:
+
+```bash
+uv pip install --python /path/to/hermes/python -e ~/src/hermes-livekit
 ```
 
 ## Enable

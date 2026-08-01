@@ -12,7 +12,7 @@ cd hermes-livekit
 # Install editable into the SAME venv your hermes-agent gateway runs in.
 # (If you don't know which one, check `ps -ef | grep hermes_cli.main` and
 # read the python path off the running process.)
-pip install -e .
+python -m pip install -e .
 ```
 
 If you use `uv` and the gateway venv is at `~/src/hermes-agent/venv`:
@@ -23,6 +23,10 @@ VIRTUAL_ENV=~/src/hermes-agent/venv uv pip install -e .
 
 The plugin auto-discovers through the `hermes_agent.plugins` entry-point
 group — no config edits required to make the install visible to hermes.
+
+Re-run the editable install after changing or pulling changes to
+`pyproject.toml`. Source files are linked live, but packaging metadata — the
+version, dependencies, and entry point — is refreshed only at install time.
 
 To enable it in a running hermes, add `livekit` to `plugins.enabled` in
 `~/.hermes/config.yaml`, then restart the gateway.
@@ -39,7 +43,7 @@ You'll need:
 ### Tests
 
 ```bash
-pip install -e '.[dev]'
+python -m pip install -e '.[dev]'
 pytest
 ```
 
