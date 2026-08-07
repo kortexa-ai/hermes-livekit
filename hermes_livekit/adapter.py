@@ -12,6 +12,8 @@ Requires:
     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET env vars
 """
 
+from __future__ import annotations
+
 import asyncio
 import io
 import logging
@@ -24,8 +26,9 @@ import tempfile
 import time
 import uuid
 import wave
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 try:
     from livekit import rtc
@@ -64,6 +67,32 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+
+STREAMING_TTS_CONTRACT_AVAILABLE = False
+
+if TYPE_CHECKING:
+    from gateway.platforms.base import AudioFormat, StreamingTTSHandle
+else:
+    try:
+        from gateway.platforms.base import AudioFormat, StreamingTTSHandle
+        STREAMING_TTS_CONTRACT_AVAILABLE = True
+    except ImportError:
+        # hermes-livekit remains importable on Hermes versions predating the
+        # streaming adapter contract. Those versions continue through play_tts().
+        @dataclass
+        class AudioFormat:  # type: ignore[no-redef]
+            sample_rate: int = 24000
+            channels: int = 1
+            sample_width: int = 2
+
+        @dataclass
+        class StreamingTTSHandle:  # type: ignore[no-redef]
+            chat_id: str = ""
+            audio_format: AudioFormat = field(default_factory=AudioFormat)
+            audible: bool = False
+            aborted: bool = False
+
+        STREAMING_TTS_CONTRACT_AVAILABLE = False
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -109,6 +138,7 @@ IDLE_POLL_INTERVAL = 2.0          # silence check interval when no remote partic
 # LiveKit audio defaults
 SAMPLE_RATE = 48000
 NUM_CHANNELS = 1
+TTS_ECHO_GUARD_SECONDS = 0.3
 
 # Reconnection
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
@@ -169,6 +199,31 @@ def _pcm_to_wav(pcm_data: bytes, sample_rate: int, channels: int) -> bytes:
     return buf.getvalue()
 
 
+@dataclass
+class LiveKitStreamingTTSHandle(StreamingTTSHandle):
+    """Per-reply state for Hermes's streaming-TTS adapter contract."""
+
+    resampler: Any = None
+    input_remainder: bytearray = field(default_factory=bytearray)
+    speaking: bool = False
+    restore_paused: bool = False
+    finishing: bool = False
+    finished: bool = False
+    has_published_frame: bool = False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            name == "audible"
+            and value
+            and "has_published_frame" in self.__dict__
+            and not self.has_published_frame
+        ):
+            # Hermes currently marks every successful non-empty write audible.
+            # Ignore that optimistic assignment until LiveKit has a real frame.
+            return
+        super().__setattr__(name, value)
+
+
 class LiveKitAdapter(BasePlatformAdapter):
     """LiveKit voice adapter using WebRTC.
 
@@ -197,6 +252,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._connect_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
         self._graceful_leave: bool = False  # set while intentionally leaving
+        self._reconnecting: bool = False
+        self._streaming_tts_available: bool = False
 
         # Per-participant audio buffers: identity -> (pcm bytearray, last_audio_time)
         self._audio_buffers: Dict[str, bytearray] = {}
@@ -205,6 +262,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Pause audio capture during TTS playback
         self._paused = False
+
+        # Only one outbound reply may own the shared LiveKit AudioSource at a
+        # time. Frame writes deliberately release this lock so abort can clear
+        # LiveKit backpressure immediately.
+        self._streaming_tts_lock = asyncio.Lock()
+        self._streaming_tts_handle: Optional[LiveKitStreamingTTSHandle] = None
 
         # Throttle for presence-check failure warnings (see
         # _count_remote_participants).
@@ -421,6 +484,10 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     async def _join_room(self) -> bool:
         """Actually establish the LiveKit room connection and start audio I/O."""
+        self._streaming_tts_available = False
+        handle = self._streaming_tts_handle
+        if handle is not None:
+            await self.abort_streaming_tts(handle, "LiveKit audio transport replaced")
         try:
             # Overwriting self._room would orphan the previous one. Its FFI
             # listen task keeps it alive, so its ICE sockets would never be
@@ -482,6 +549,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             # Start silence detection loop
             self._silence_task = asyncio.create_task(self._check_silence_loop())
 
+            self._reconnecting = False
+            self._streaming_tts_available = True
             self._mark_connected()
             logger.info("[%s] Connected to room '%s' at %s", self.name, self._room_name, self._url)
 
@@ -497,7 +566,14 @@ class LiveKitAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from LiveKit room."""
         self._running = False
+        self._reconnecting = False
+        self._streaming_tts_available = False
         self._mark_disconnected()
+
+        if self._streaming_tts_handle is not None:
+            await self.abort_streaming_tts(
+                self._streaming_tts_handle, "LiveKit adapter disconnected"
+            )
 
         if self._presence_task:
             self._presence_task.cancel()
@@ -704,6 +780,12 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Tear down the room connection and resume presence polling."""
         # Stop silence detection and audio streams, but keep self._running
         # so the presence loop can resume us later.
+        self._streaming_tts_available = False
+        if self._streaming_tts_handle is not None:
+            await self.abort_streaming_tts(
+                self._streaming_tts_handle, "LiveKit room became empty"
+            )
+
         if self._silence_task:
             self._silence_task.cancel()
             try:
@@ -741,10 +823,19 @@ class LiveKitAdapter(BasePlatformAdapter):
         Graceful leaves (empty room, full teardown) set ``_graceful_leave``
         so we don't fight with ``_leave_and_watch`` / ``disconnect``.
         """
-        if not self._running or self._graceful_leave:
+        if not self._running or self._graceful_leave or self._reconnecting:
             return
         logger.warning("[%s] Disconnected from room: %s. Will reconnect.", self.name, reason)
-        self._connect_task = asyncio.create_task(self._reconnect_loop())
+        self._reconnecting = True
+        self._streaming_tts_available = False
+        self._connect_task = asyncio.create_task(self._recover_from_disconnect())
+
+    async def _recover_from_disconnect(self) -> None:
+        """Abort stale playout state before establishing a replacement room."""
+        handle = self._streaming_tts_handle
+        if handle is not None:
+            await self.abort_streaming_tts(handle, "LiveKit room disconnected")
+        await self._reconnect_loop()
 
     async def _reconnect_loop(self):
         """Reconnect to LiveKit with exponential backoff.
@@ -1259,10 +1350,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             else:
                 logger.debug("[%s] end-of-turn from %s with nothing buffered", self.name, identity)
         elif action == "pause":
+            if self._streaming_tts_handle is not None:
+                self._streaming_tts_handle.restore_paused = True
             self._paused = True
             logger.info("[%s] paused by client %s", self.name, identity)
         elif action == "resume":
-            self._paused = False
+            if self._streaming_tts_handle is not None:
+                self._streaming_tts_handle.restore_paused = False
+                self._paused = self._streaming_tts_handle.speaking
+            else:
+                self._paused = False
             logger.info("[%s] resumed by client %s", self.name, identity)
         else:
             logger.debug("[%s] unknown client:control action %r", self.name, action)
@@ -1671,6 +1768,233 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self._publish_agent_event("agent:speaking-stop")
             logger.error("[%s] TTS playback error: %s", self.name, e)
             return SendResult(success=False, error=str(e))
+
+    # -- Streaming TTS ------------------------------------------------------
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
+        """Accept mono int16 PCM while connected to a LiveKit room."""
+        return bool(
+            STREAMING_TTS_CONTRACT_AVAILABLE
+            and self._room
+            and self._audio_source
+            and self._streaming_tts_available
+            and not self._reconnecting
+            and audio_format.sample_rate > 0
+            and audio_format.channels == NUM_CHANNELS
+            and audio_format.sample_width == 2
+        )
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[StreamingTTSHandle]:
+        """Reserve the shared outbound track for one streaming reply."""
+        if not self.supports_streaming_tts(chat_id, audio_format):
+            return None
+
+        async with self._streaming_tts_lock:
+            # Teardown can begin after the optimistic check above but before
+            # this lock is acquired. Never reserve a stale audio transport.
+            if not self.supports_streaming_tts(chat_id, audio_format):
+                return None
+            if self._streaming_tts_handle is not None:
+                logger.warning("[%s] declining overlapping streaming TTS reply", self.name)
+                return None
+
+            try:
+                resampler = None
+                if audio_format.sample_rate != SAMPLE_RATE:
+                    if rtc is None:
+                        return None
+                    resampler = rtc.AudioResampler(
+                        audio_format.sample_rate,
+                        SAMPLE_RATE,
+                        num_channels=NUM_CHANNELS,
+                    )
+            except Exception as e:
+                logger.warning("[%s] could not create streaming TTS resampler: %s", self.name, e)
+                return None
+
+            handle = LiveKitStreamingTTSHandle(
+                chat_id=chat_id,
+                audio_format=audio_format,
+                resampler=resampler,
+                restore_paused=self._paused,
+            )
+            self._streaming_tts_handle = handle
+            return handle
+
+    async def _capture_streaming_pcm(
+        self,
+        handle: LiveKitStreamingTTSHandle,
+        pcm_data: bytes,
+    ) -> None:
+        """Publish PCM promptly in LiveKit frames of up to 20 ms."""
+        if not pcm_data:
+            return
+        if self._audio_source is None:
+            raise RuntimeError("LiveKit audio source is unavailable")
+        if rtc is None:
+            raise RuntimeError("LiveKit SDK is unavailable")
+
+        bytes_per_frame = (SAMPLE_RATE // 50) * NUM_CHANNELS * 2
+        for offset in range(0, len(pcm_data), bytes_per_frame):
+            if handle.aborted or self._streaming_tts_handle is not handle:
+                return
+            chunk = pcm_data[offset:offset + bytes_per_frame]
+            samples = len(chunk) // (NUM_CHANNELS * 2)
+            if samples <= 0:
+                continue
+            frame = rtc.AudioFrame(
+                data=chunk,
+                sample_rate=SAMPLE_RATE,
+                num_channels=NUM_CHANNELS,
+                samples_per_channel=samples,
+            )
+            await self._audio_source.capture_frame(frame)
+            if handle.aborted or self._streaming_tts_handle is not handle:
+                # Hermes treats a successfully returned write as audible. Raise
+                # when cancellation won the backpressure race so the consumer
+                # does not suppress its pre-audible fallback incorrectly.
+                raise RuntimeError("Streaming TTS aborted during LiveKit frame capture")
+            handle.has_published_frame = True
+            handle.audible = True
+
+    async def write_streaming_tts(
+        self,
+        handle: StreamingTTSHandle,
+        chunk: bytes,
+    ) -> None:
+        """Resample and publish one provider PCM chunk without whole-file buffering."""
+        if not chunk or not isinstance(handle, LiveKitStreamingTTSHandle):
+            return
+
+        async with self._streaming_tts_lock:
+            if (
+                handle.aborted
+                or handle.finishing
+                or handle.finished
+                or self._streaming_tts_handle is not handle
+            ):
+                return
+            if self._room is None or self._audio_source is None:
+                raise RuntimeError("Not connected to LiveKit room")
+
+            # A provider may split a 16-bit sample across chunks. Hold only the
+            # incomplete byte, never the reply audio itself.
+            incoming = bytes(handle.input_remainder) + chunk
+            aligned_size = len(incoming) - (len(incoming) % 2)
+            handle.input_remainder = bytearray(incoming[aligned_size:])
+            aligned = incoming[:aligned_size]
+            if not aligned:
+                return
+
+            if not handle.speaking:
+                self._paused = True
+                handle.speaking = True
+                await self._publish_agent_event("agent:speaking-start")
+
+        # Do not hold the ownership lock while capture_frame applies LiveKit
+        # backpressure. abort_streaming_tts must be able to acquire the lock and
+        # clear the SDK queue immediately during barge-in.
+        if handle.resampler is None:
+            await self._capture_streaming_pcm(handle, aligned)
+            return
+
+        for frame in handle.resampler.push(bytearray(aligned)):
+            await self._capture_streaming_pcm(handle, frame.data.tobytes())
+
+    async def finish_streaming_tts(
+        self,
+        handle: StreamingTTSHandle,
+        *,
+        interrupted: bool = False,
+    ) -> None:
+        """Flush resampled PCM, wait for playout, and restore capture."""
+        if interrupted:
+            await self.abort_streaming_tts(handle, "interrupted")
+            return
+        if not isinstance(handle, LiveKitStreamingTTSHandle):
+            return
+
+        async with self._streaming_tts_lock:
+            if handle.finishing or handle.finished or handle.aborted:
+                return
+            if self._streaming_tts_handle is not handle:
+                handle.finished = True
+                return
+            # Reject any late write while the resampler is being flushed, but
+            # retain ownership until queued audio has finished playing.
+            handle.finishing = True
+
+        try:
+            if handle.input_remainder:
+                logger.warning("[%s] dropping incomplete final PCM sample", self.name)
+                handle.input_remainder.clear()
+            if handle.resampler is not None:
+                for frame in handle.resampler.flush():
+                    await self._capture_streaming_pcm(handle, frame.data.tobytes())
+            if handle.audible and not handle.aborted and self._audio_source is not None:
+                await self._audio_source.wait_for_playout()
+                if not handle.aborted:
+                    # Avoid feeding the speaker tail straight back into STT.
+                    await asyncio.sleep(TTS_ECHO_GUARD_SECONDS)
+        except BaseException:
+            # finish failures happen after the consumer has stopped writing. Do
+            # not leave already-queued speech playing under whole-file fallback.
+            if self._audio_source is not None:
+                try:
+                    self._audio_source.clear_queue()
+                except Exception:
+                    pass
+            raise
+        finally:
+            publish_stop = False
+            async with self._streaming_tts_lock:
+                handle.finishing = False
+                handle.finished = True
+                if self._streaming_tts_handle is handle:
+                    self._streaming_tts_handle = None
+                    self._paused = handle.restore_paused
+                if handle.speaking:
+                    handle.speaking = False
+                    publish_stop = True
+            if publish_stop:
+                await self._publish_agent_event("agent:speaking-stop")
+
+    async def abort_streaming_tts(
+        self,
+        handle: StreamingTTSHandle,
+        error: Optional[str] = None,
+    ) -> None:
+        """Stop queued audio immediately; safe for cancellation and late chunks."""
+        if not isinstance(handle, LiveKitStreamingTTSHandle):
+            return
+
+        async with self._streaming_tts_lock:
+            if handle.aborted:
+                return
+            handle.aborted = True
+            handle.input_remainder.clear()
+
+            # A late abort for an old handle must not stop a newer reply.
+            if self._streaming_tts_handle is not handle:
+                return
+
+            self._streaming_tts_handle = None
+            if self._audio_source is not None:
+                try:
+                    self._audio_source.clear_queue()
+                except Exception as e:
+                    logger.debug("[%s] could not clear aborted TTS queue: %s", self.name, e)
+            self._paused = handle.restore_paused
+            if handle.speaking:
+                handle.speaking = False
+                await self._publish_agent_event("agent:speaking-stop")
+            if error:
+                logger.debug("[%s] streaming TTS aborted: %s", self.name, error)
 
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:

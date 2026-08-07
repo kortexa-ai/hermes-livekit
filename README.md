@@ -116,6 +116,18 @@ Join the configured room from any LiveKit client (web, mobile, voice-agent
 desktop). The agent watches the room when empty and joins as soon as a real
 participant arrives, then transcribes incoming audio and replies via TTS.
 
+### Streaming TTS
+
+On Hermes versions that expose the streaming-TTS adapter contract, replies are
+published to LiveKit as mono PCM while synthesis is still running. The adapter
+uses LiveKit's stateful resampler for the room's 48 kHz track, emits audio in
+frames of up to 20 ms, and clears queued playout when cancellation is requested.
+No separate LiveKit setting is required. Older Hermes versions continue to use
+the existing whole-file `play_tts()` path.
+
+Cancellation is currently initiated by Hermes's streaming consumer.
+Microphone-driven barge-in detection is outside this adapter release.
+
 ## Data channel protocol
 
 Outbound (agent → client) is unchanged from earlier voice-only versions —
