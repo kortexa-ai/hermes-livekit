@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,29 +7,31 @@ name = "hermes-livekit"
 version = "0.4.0"
 description = "LiveKit WebRTC voice gateway plugin for hermes-agent"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "kortexa.ai", email = "info@kortexa.ai" }]
-license = { text = "MIT" }
+license = "MIT"
 dependencies = [
-  "hermes-agent",
+  "hermes-agent>=0.20.0",
   # Exact pins (mirrors hermes-agent's 2026-05-12 supply-chain hardening
   # policy): PyPI cannot ship a new livekit/livekit-api/Pillow into a
   # user's install without an intentional bump here. Update the pins
-  # AND verify release notes / Socket advisories before changing.
-  #   livekit==1.1.7      released 2026-04-27, no yanks (skipped 1.1.8
-  #                       from 2026-05-13 — too fresh).
-  #   livekit-api==1.1.0  released 2025-12-02, six months stable
-  #                       (skipped 1.0.8 — yanked: wrong dependencies).
-  #   Pillow==12.2.0      released 2026-04-01, no yanks. Used to JPEG-
-  #                       encode sampled video frames before handing them
-  #                       to hermes's vision pipeline via media_urls.
-  "livekit==1.1.7",
-  "livekit-api==1.1.0",
-  "Pillow==12.2.0",
+  # AND verify release notes / security advisories before changing.
+  #   livekit==1.1.14     released 2026-07-31, no yanks; includes
+  #                        remote-disconnect queue cleanup and race fixes.
+  #   livekit-api==1.2.0   released 2026-07-11, no yanks.
+  #   Pillow==12.3.0       released 2026-07-01, no yanks. Used to JPEG-
+  #                        encode sampled video frames before handing them
+  #                        to Hermes' vision pipeline via media_urls.
+  "livekit==1.1.14",
+  "livekit-api==1.2.0",
+  "Pillow==12.3.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = [
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+]
 
 [project.entry-points."hermes_agent.plugins"]
 # Point to the package, not the function — the hermes-agent plugin loader
@@ -39,3 +41,6 @@ livekit = "hermes_livekit"
 
 [tool.setuptools.packages.find]
 include = ["hermes_livekit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

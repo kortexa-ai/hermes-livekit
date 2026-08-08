@@ -33,12 +33,15 @@ uv pip install --python /path/to/hermes/python \
 ```
 
 The plugin is auto-discovered through the `hermes_agent.plugins` entry-point
-group — no edits to hermes-agent's source tree are required.
+group — no edits to hermes-agent's source tree are required. This revision
+requires Hermes Agent 0.20.0 or newer because that host line carries the
+Pillow 12.3 security fixes and the current platform-registration contract.
+Until 0.20.0 is published, install against a current Hermes source checkout.
 
 > Note: `hermes plugins install kortexa-ai/hermes-livekit` is **not** the
 > right path for this plugin. That command `git clone`s into
 > `~/.hermes/plugins/` without resolving pip deps; you'd then have to
-> `pip install 'livekit==1.1.7' 'livekit-api==1.1.0'` by hand. The pip
+> `pip install 'livekit==1.1.14' 'livekit-api==1.2.0'` by hand. The pip
 > install above is one command and keeps the SDK pins in sync with the
 > plugin version.
 
@@ -83,8 +86,18 @@ plugins:
 
 ## Configure
 
-Set these env vars (or supply equivalents under `platforms.livekit.extra`
-in `~/.hermes/config.yaml`):
+Set these env vars. Current Hermes also accepts the matching lowercase keys
+either directly under `platforms.livekit` or inside `platforms.livekit.extra`:
+
+```yaml
+platforms:
+  livekit:
+    enabled: true
+    url: wss://your-project.livekit.cloud
+    api_key: your-project-key
+    api_secret: your-project-secret
+    room: hermes
+```
 
 | Var                              | Required | Notes                                                              |
 |----------------------------------|----------|--------------------------------------------------------------------|

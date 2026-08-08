@@ -4,6 +4,17 @@ All notable changes to **hermes-livekit** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Updated the pinned SDKs to `livekit==1.1.14`, `livekit-api==1.2.0`, and
+  `Pillow==12.3.0`; raised the minimum Hermes package to `0.20.0`.
+- Moved platform dependency and credential checks onto Hermes' current passive
+  `check_fn` / `validate_config` contract and added direct YAML-key bridging.
+- Removed private LiveKit FFI teardown now that the SDK owns remote-disconnect
+  queue cleanup.
+
 ## [0.4.0] — 2026-07-28
 
 ### Added

@@ -139,12 +139,13 @@ LIVE_ADAPTERS: "set[LiveKitAdapter]" = set()
 
 
 def check_livekit_requirements() -> bool:
-    """Check if LiveKit dependencies are available and configured."""
-    if not LIVEKIT_AVAILABLE or not LIVEKIT_API_AVAILABLE:
-        return False
-    if not os.getenv("LIVEKIT_URL") or not os.getenv("LIVEKIT_API_KEY") or not os.getenv("LIVEKIT_API_SECRET"):
-        return False
-    return True
+    """Passively report whether the pinned LiveKit SDKs are importable.
+
+    Hermes calls platform ``check_fn`` from status and config-loading paths, so
+    this probe must not inspect credentials or perform installation. Credential
+    validation belongs to the platform registration's ``validate_config`` hook.
+    """
+    return LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE
 
 
 def _compute_rms(pcm_data: bytes) -> float:
@@ -655,24 +656,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             asyncio.create_task(self._leave_and_watch())
 
     async def _release_room(self, room: Optional["rtc.Room"], *, why: str) -> None:
-        """Disconnect a room and make sure its FFI resources are actually freed.
+        """Disconnect through LiveKit's public API and let the SDK own FFI cleanup.
 
-        ``Room.disconnect()`` returns early when the room is already down::
-
-            if not self.isconnected():
-                return
-
-        which skips ``await self._task`` and the queue unsubscribe below it. That
-        task is ``create_task(self._listen_task())`` — a bound coroutine — so
-        while it lives the event loop holds the Room, ``FfiHandle.__del__``
-        never runs, and the ~15 UDP sockets that room gathered for ICE stay open
-        for the life of the process. A gateway that accumulates those hits
-        ``[Errno 24] Too many open files`` and then fails at something unrelated,
-        like writing a temp WAV for STT.
-
-        Rooms die that way routinely: the server closes them, a reconnect
-        replaces them, or the last participant leaves. So free them explicitly
-        rather than trusting the garbage collector to find a task-pinned object.
+        LiveKit 1.1.10 added a listen-task completion callback that unsubscribes
+        the FFI queue even when ``Room.disconnect()`` returns early after a remote
+        disconnect. Reaching into ``_task``, ``_ffi_queue``, and ``_ffi_handle``
+        here would now duplicate SDK cleanup and couple the adapter to internals.
         """
         if room is None:
             return
@@ -680,25 +669,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             await room.disconnect()
         except Exception as e:
             logger.debug("[%s] disconnect during %s: %s", self.name, why, e)
-
-        # Everything below is what disconnect() skips on the early-return path.
-        task = getattr(room, "_task", None)
-        if task is not None and not task.done():
-            task.cancel()
-        queue = getattr(room, "_ffi_queue", None)
-        if queue is not None:
-            try:
-                from livekit.rtc._ffi_client import FfiClient
-
-                FfiClient.instance.queue.unsubscribe(queue)
-            except Exception:
-                pass
-        handle = getattr(room, "_ffi_handle", None)
-        if handle is not None and not getattr(handle, "disposed", True):
-            try:
-                handle.dispose()
-            except Exception:
-                logger.debug("[%s] handle dispose during %s failed", self.name, why)
 
     async def _leave_and_watch(self) -> None:
         """Tear down the room connection and resume presence polling."""

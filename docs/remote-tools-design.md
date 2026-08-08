@@ -391,7 +391,7 @@ production. `camera.snapshot` is the demo for that phase.
 
 ### Mechanism — LiveKit byte streams
 
-The SDK we pin (`livekit==1.1.7`) ships
+The SDK we pin (`livekit==1.1.14`) ships
 [byte streams](https://docs.livekit.io/home/client/data/byte-streams/)
 natively. Confirmed in the installed source:
 
@@ -455,7 +455,7 @@ size.
 
 ### Aside — LiveKit native RPC
 
-While checking byte streams, found that `livekit==1.1.7` also ships
+While checking byte streams, found that `livekit==1.1.14` also ships
 RPC: `local_participant.register_rpc_method(name, handler)` +
 `local_participant.perform_rpc(destination_identity, method, payload)`
 with `RpcError` for failures. (See
@@ -605,7 +605,7 @@ opt-out for the single-client common case.
 
 ### Protocol pivot to LiveKit native RPC (v0.4+ candidate)
 
-`livekit==1.1.7` ships `register_rpc_method` / `perform_rpc` which
+`livekit==1.1.14` ships `register_rpc_method` / `perform_rpc` which
 maps almost 1:1 onto our register/call/result/error semantics with
 SDK-handled correlation, timeouts, and error propagation. Pivoting
 would delete most of the hand-rolled JSON-message scaffolding in this

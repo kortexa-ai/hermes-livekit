@@ -10,14 +10,17 @@ Operational state of the plugin and dependencies that don't show up in
   invokes via `agent:tool-call` JSON over data channel, `client:tool-result`
   comes back. Single-client, trust-on-connect, small JSON-shaped results
   only. End-to-end verified with the agent (Avery) and `examples/test_client.py`.
-- Plugin subscribes to `on_session_finalize` (live now) and
-  `agent_loop_stopped` (no-op until the upstream PR below lands). Both
-  call `LiveKitAdapter.cancel_pending_tool_calls_for_session_reset`.
+- Plugin subscribes to `on_session_finalize` now and conditionally registers
+  `agent_loop_stopped` when the host advertises it. Until the upstream PR below
+  lands, that second path is a quiet no-op. Both callbacks call
+  `LiveKitAdapter.cancel_pending_tool_calls_for_session_reset`.
 
 ## Pending upstream — required for `/stop` cancellation
 
-The plugin's `agent_loop_stopped` subscription is wired but the core
-doesn't fire that hook yet.
+The plugin's `agent_loop_stopped` callback is wired but upstream main
+`0c2cdccccc805063f7e74e6e1c26196a1140a496` does not fire that hook. The
+2026-08-08 maintenance audit confirmed that the issue and mergeable PR remain
+open.
 
 - **Issue:** https://github.com/NousResearch/hermes-agent/issues/27206
 - **PR:** https://github.com/NousResearch/hermes-agent/pull/27208
@@ -52,7 +55,7 @@ Worth doing before piling more protocol on top of the JSON layer. See
 
 Adds `camera.snapshot` (and future tools returning binary payloads) via
 LiveKit byte streams. Mechanism confirmed: `stream_bytes` /
-`register_byte_stream_handler` ship in `livekit==1.1.7`. Protocol shape
+`register_byte_stream_handler` ship in the current `livekit==1.1.14` pin. Protocol shape
 sketched in `docs/remote-tools-design.md` (`### Large tool results — design`).
 
 Four open questions to resolve before coding (also in the design doc):

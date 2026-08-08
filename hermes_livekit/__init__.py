@@ -37,12 +37,11 @@ def _on_session_finalize_hook(**kwargs) -> None:
 def _on_agent_loop_stopped_hook(**kwargs) -> None:
     """Cancel pending remote tool calls when the agent loop is interrupted.
 
-    Subscribes to the upstream ``agent_loop_stopped`` hook proposed by the
-    hermes-agent PR linked in PLAN.md. Until that PR lands, hermes-agent's
-    ``register_hook`` accepts the registration (with a warning about an
-    unknown hook name) but never fires it — so this handler is a no-op on
-    today's main. Once the upstream PR is merged, it starts catching
-    ``/stop`` mid-turn without any further plugin change.
+    The plugin registers this callback only when the host advertises the
+    ``agent_loop_stopped`` hook proposed by the hermes-agent PR linked in
+    PLAN.md. Until that lands, registration is a quiet compatibility no-op.
+    Once the hook appears, new gateway processes start catching ``/stop``
+    mid-turn without any further plugin change.
     """
     for adapter in list(LIVE_ADAPTERS):
         try:
@@ -100,17 +99,47 @@ def _env_enablement() -> Optional[dict]:
     return seed
 
 
-def _is_connected(cfg) -> bool:
-    """True when the gateway should consider LiveKit configured.
-
-    Mirrors the ``cfg.extra.get('url')`` check that the kortexa branch
-    inlined in ``_PLATFORM_CONNECTED_CHECKERS``. The url is the load-bearing
-    field — without it, neither the SDK nor presence polling can run.
-    """
+def _configured_value(cfg, key: str, env_name: str) -> str:
+    """Read a platform extra with the matching environment variable fallback."""
     try:
-        return bool((cfg.extra or {}).get("url"))
+        value = (cfg.extra or {}).get(key)
     except Exception:
-        return False
+        value = None
+    return str(value or os.getenv(env_name) or "").strip()
+
+
+def _validate_config(cfg) -> bool:
+    """True when all credentials needed to connect are configured."""
+    return all(
+        (
+            _configured_value(cfg, "url", "LIVEKIT_URL"),
+            _configured_value(cfg, "api_key", "LIVEKIT_API_KEY"),
+            _configured_value(cfg, "api_secret", "LIVEKIT_API_SECRET"),
+        )
+    )
+
+
+def _is_connected(cfg) -> bool:
+    """Tell Hermes whether LiveKit is sufficiently configured to start."""
+    return _validate_config(cfg)
+
+
+def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
+    """Preserve LiveKit-specific YAML keys in ``PlatformConfig.extra``.
+
+    Current Hermes preserves arbitrary adapter settings only when they are
+    nested under ``extra``. This bridge also accepts the ergonomic direct form
+    under ``platforms.livekit`` or ``gateway.platforms.livekit``.
+    """
+    nested = platform_cfg.get("extra")
+    nested = nested if isinstance(nested, dict) else {}
+    seeded: dict = {}
+    for key in ("url", "api_key", "api_secret", "room", "agent_name", "agent_avatar"):
+        if key in nested:
+            seeded[key] = nested[key]
+        elif key in platform_cfg:
+            seeded[key] = platform_cfg[key]
+    return seeded or None
 
 
 def _interactive_setup() -> None:
@@ -160,6 +189,7 @@ def register(ctx) -> None:
         label="LiveKit",
         adapter_factory=lambda cfg: LiveKitAdapter(cfg),
         check_fn=check_livekit_requirements,
+        validate_config=_validate_config,
         is_connected=_is_connected,
         required_env=["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],
         install_hint="pip install hermes-livekit  # adds livekit + livekit-api SDKs",
@@ -168,6 +198,7 @@ def register(ctx) -> None:
         # from LIVEKIT_* env vars, so env-only setups show up in
         # `hermes gateway status` without instantiating the adapter.
         env_enablement_fn=_env_enablement,
+        apply_yaml_config_fn=_apply_yaml_config,
         # Cron home-channel delivery support.
         cron_deliver_env_var="LIVEKIT_HOME_CHANNEL",
         # Auth env vars
@@ -202,9 +233,14 @@ def register(ctx) -> None:
 
     # Remote-tool cancellation hooks. See docs/remote-tools-design.md and
     # PLAN.md. on_session_finalize covers /new today; agent_loop_stopped
-    # covers /stop once the upstream PR lands.
+    # registers and covers /stop once the upstream PR lands.
     try:
         ctx.register_hook("on_session_finalize", _on_session_finalize_hook)
-        ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
+        from hermes_cli.plugins import VALID_HOOKS
+
+        if "agent_loop_stopped" in VALID_HOOKS:
+            ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
+        else:
+            logger.debug("agent_loop_stopped is not available in this Hermes host")
     except Exception as exc:
         logger.debug("hook registration failed: %s", exc)
