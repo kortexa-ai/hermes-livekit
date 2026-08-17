@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import hermes_livekit
-from hermes_livekit.adapter import check_livekit_requirements
+from hermes_livekit.adapter import TOOLSET_NAME, check_livekit_requirements
 
 
 _CREDENTIAL_VARS = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
@@ -72,6 +72,26 @@ def test_register_exposes_current_platform_callbacks() -> None:
     assert observed["validate_config"] is hermes_livekit._validate_config
     assert observed["is_connected"] is hermes_livekit._is_connected
     assert observed["apply_yaml_config_fn"] is hermes_livekit._apply_yaml_config
+
+
+def test_register_declares_late_bound_remote_toolset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from toolsets import TOOLSETS, validate_toolset
+
+    monkeypatch.delitem(TOOLSETS, TOOLSET_NAME, raising=False)
+
+    class Context:
+        def register_platform(self, **_kwargs: object) -> None:
+            return None
+
+        def register_hook(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    hermes_livekit.register(Context())
+
+    assert validate_toolset(TOOLSET_NAME) is True
+    assert TOOLSETS[TOOLSET_NAME]["tools"] == []
 
 
 def test_register_adds_loop_stop_hook_only_when_host_advertises_it(

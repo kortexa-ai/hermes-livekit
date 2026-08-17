@@ -9,7 +9,7 @@ import logging
 import os
 from typing import Optional
 
-from .adapter import LIVE_ADAPTERS, LiveKitAdapter, check_livekit_requirements
+from .adapter import LIVE_ADAPTERS, TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
@@ -214,16 +214,21 @@ def register(ctx) -> None:
         platform_hint=_LIVEKIT_PLATFORM_HINT,
     )
 
-    # Provide a hermes-livekit toolset alias so cli/gateway tooling defaults
-    # match the kortexa branch behaviour.  ``get_all_platforms()`` already
-    # synthesises the ``hermes-{name}`` mapping in PlatformInfo, but the
-    # toolset itself has to exist in the TOOLSETS dict for tool resolution.
+    # Declare both the platform bundle and the late-bound remote-tool toolset.
+    # Client tools are registered only after a participant connects, but the
+    # empty declaration keeps config validation truthful before that happens.
     try:
         from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
         if "hermes-livekit" not in TOOLSETS:
             TOOLSETS["hermes-livekit"] = {
                 "description": "LiveKit voice toolset — interact with Hermes via WebRTC voice",
                 "tools": _HERMES_CORE_TOOLS,
+                "includes": [],
+            }
+        if TOOLSET_NAME not in TOOLSETS:
+            TOOLSETS[TOOLSET_NAME] = {
+                "description": "Tools offered by connected LiveKit clients",
+                "tools": [],
                 "includes": [],
             }
     except Exception:
