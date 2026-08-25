@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hermes_livekit.adapter import LiveKitAdapter
+from hermes_livekit.tool_safety import ToolAuditLog, ToolPolicy
 from tools.registry import registry
 
 
@@ -43,6 +44,20 @@ def adapter_with_client(
         remote_participants={identity: object()},
     )
     adapter._tool_call_timeout = 12.5
+    adapter._tool_policy = ToolPolicy.parse(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "participant_identity": identity,
+                        "tool_name": "desktop_notify",
+                        "tier": 1,
+                    }
+                ]
+            }
+        )
+    )
+    adapter._tool_audit = ToolAuditLog(clock=lambda: 100.0)
     return adapter
 
 
@@ -57,6 +72,21 @@ def adapter_for_registration() -> LiveKitAdapter:
     adapter._tool_owners = {}
     adapter._tool_methods = {}
     adapter._publish_typed = AsyncMock()
+    adapter._tool_policy = ToolPolicy.parse(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "participant_identity": identity,
+                        "tool_name": "desktop_notify",
+                        "tier": 1,
+                    }
+                    for identity in ("client-a", "client-b")
+                ]
+            }
+        )
+    )
+    adapter._tool_audit = ToolAuditLog(clock=lambda: 100.0)
     return adapter
 
 

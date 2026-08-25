@@ -61,6 +61,23 @@ adapter also requires that exact room to remain current and the sender to
 remain present. A queued packet from a disconnected participant or replaced
 room is ignored.
 
+Registration also requires an exact operator policy entry. The policy is
+loaded once from `HERMES_LIVEKIT_REMOTE_TOOL_POLICY`; an absent, malformed,
+duplicate, oversized, or unknown-field policy becomes an empty deny policy.
+The JSON document contains only `tools`, with at most 64 entries and at most
+16 KiB total:
+
+```json
+{
+  "tools": [
+    {"participant_identity": "sensor", "tool_name": "read_status", "tier": 1},
+    {"participant_identity": "desktop", "tool_name": "desktop_notify", "tier": 2,
+     "consent_expires_at": 1798761600},
+    {"participant_identity": "admin", "tool_name": "run_shell", "tier": 3}
+  ]
+}
+```
+
 To remove the tool, the client sends:
 
 ```json
@@ -93,6 +110,9 @@ pending-future table.
 
 The default response timeout is 30 seconds. Operators can set
 `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` to a positive number.
+The adapter re-evaluates the exact participant/name policy before every
+invocation, so expired Tier 2 consent cannot remain active through an earlier
+registration or reconnect.
 
 ## Lifecycle
 
@@ -107,7 +127,8 @@ The default response timeout is 30 seconds. Operators can set
 
 ## Safety and scope
 
-- Trust on connect: any authorized room participant can offer a tool.
+- Room authorization alone does not activate tools. The operator policy must
+  contain the exact participant identity and advertised name.
 - Different participants can advertise the same RPC method name. Each gets a
   distinct model-visible registry name and only that participant's handler.
 - Participant identities must be non-empty, have no leading/trailing
@@ -120,6 +141,34 @@ The default response timeout is 30 seconds. Operators can set
   `platform_toolsets.livekit`.
 - Arguments and results are small JSON values. RPC payload limits are not a
   binary transport.
+
+### Closed safety tiers
+
+- Tier 1 is for observation that does not modify external state and does not
+  acquire sensitive camera, microphone, location, credential, or account data.
+  An exact allowlist entry permits registration and invocation.
+- Tier 2 is for bounded sensitive reads or bounded, reversible user-visible
+  effects such as a notification. Its exact entry must include a finite future
+  Unix `consent_expires_at`; equality with the expiry is denied.
+- Tier 3 covers credential or secret access, arbitrary code, process,
+  filesystem, service, security or account changes, financial operations, and
+  destructive or irreversible effects. Tier 3 is always denied, even when an
+  entry exists.
+
+This is a cooperative declaration boundary: the operator classifies known
+participant/tool pairs and must not allow a client that misrepresents what its
+RPC method does. A tool cannot inherit another participant's entry or consent.
+
+### Bounded audit records
+
+The adapter retains the newest 256 records in process memory across room
+reconnects. Records use only `sequence`, `recorded_at`, `event`, bounded
+participant identity, bounded tool name, numeric tier, and a closed outcome.
+Events cover registration, policy decisions, invocation outcomes,
+cancellation, and owner removal. Records never contain argument bodies,
+results, binary bytes, credentials, policy text, exception text, or arbitrary
+diagnostics. Restarting the adapter clears the ring; no inspection or export
+surface is part of this protocol.
 
 ## Large and binary results
 
@@ -272,7 +321,6 @@ unregister and shutdown cannot wait forever.
 
 ## Deferred
 
-- Per-participant allowlists and explicit consent.
 - Audit-log inspection.
 - Full JSON Schema validation.
 - General non-image attachment delivery to the model.

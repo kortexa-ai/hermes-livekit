@@ -112,6 +112,7 @@ platforms:
 | `LIVEKIT_ALLOW_ALL_USERS`        | no       | `1`/`true` allows any participant (dev only)                       |
 | `LIVEKIT_PRESENCE_POLL_INTERVAL` | no       | seconds; auto-picked (cloud 30s, local 5s)                         |
 | `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` | no      | native RPC response timeout; default 30 seconds                    |
+| `HERMES_LIVEKIT_REMOTE_TOOL_POLICY` | no    | bounded JSON policy; absent or invalid denies all remote tools     |
 
 Or run the interactive prompt:
 
@@ -157,7 +158,7 @@ Agent lifecycle event types:
 Remote-tool events (0.3.0+, flat envelope — no `payload` wrapper, sent
 only to the owning participant via `destination_identities`):
 
-- `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?, detail?}`
+- `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?}`
 - `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
 - `agent:tool-result-stream-ready` — the targeted binary-result receiver is
   installed; `{stream_id, topic}`
@@ -208,6 +209,18 @@ Remote-tool messages (0.3.0+):
 // give back a tool the client no longer wants to offer
 {"type": "client:tool-unregister", "name": "desktop_notify"}
 ```
+
+Remote tools are disabled unless `HERMES_LIVEKIT_REMOTE_TOOL_POLICY` contains
+an exact participant/name entry. Tier 1 permits the exact entry. Tier 2 also
+requires a future Unix `consent_expires_at`. Tier 3 is always denied:
+
+```json
+{"tools":[{"participant_identity":"desktop-client","tool_name":"desktop_notify","tier":2,"consent_expires_at":1798761600}]}
+```
+
+The policy is loaded once when the adapter is constructed. See
+[`docs/remote-tools-design.md`](docs/remote-tools-design.md) for the closed
+classification, bounds, and audit contract.
 
 Before advertising a tool, the client registers a LiveKit RPC method with the
 same name. The agent calls that method with the tool arguments encoded as a

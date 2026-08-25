@@ -16,6 +16,7 @@ from hermes_livekit.adapter import (
     MAX_PENDING_BINARY_RESULTS,
     LiveKitAdapter,
 )
+from hermes_livekit.tool_safety import ToolAuditLog, ToolPolicy
 
 
 STREAM_ID = "0123456789abcdef0123456789abcdef"
@@ -129,6 +130,21 @@ def make_adapter(result: str) -> tuple[LiveKitAdapter, FakeRoom]:
     adapter._binary_replacement_scheduled = False
     adapter._client_tools = {"client-1": {"camera_snapshot"}}
     adapter._tool_owners = {"camera_snapshot": "client-1"}
+    adapter._tool_methods = {"camera_snapshot": "camera_snapshot"}
+    adapter._tool_policy = ToolPolicy.parse(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "participant_identity": "client-1",
+                        "tool_name": "camera_snapshot",
+                        "tier": 1,
+                    }
+                ]
+            }
+        )
+    )
+    adapter._tool_audit = ToolAuditLog(clock=lambda: 100.0)
     adapter._tool_call_timeout = 30.0
     adapter._running = False
     adapter._graceful_leave = False

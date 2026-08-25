@@ -10,11 +10,15 @@ Operational state of the plugin and dependencies that don't show up in
 - Client tools use JSON `client:tool-register` / `client:tool-unregister`
   messages for discovery and LiveKit native RPC for invocation. The SDK owns
   correlation, response timeouts, and error transport.
-- Remote tools are scoped by participant identity and remain trust-on-connect.
+- Remote tools are scoped by participant identity and operator policy.
   Multiple clients can advertise the same RPC method without replacing each
   other. Results can be small JSON values or bounded byte streams.
   `examples/test_client.py` implements the complete contract with
   `desktop_notify` and a deterministic `camera.snapshot` PNG fixture.
+- Remote tools default to denied. A bounded operator policy binds exact
+  participant/tool pairs to Tier 1, expiring Tier 2 consent, or always-denied
+  Tier 3. A fixed-field in-memory audit ring records lifecycle outcomes without
+  tool data or arbitrary diagnostics.
 - The former Hermes `/stop` hook dependency applied only to the removed custom
   pending-call table. Cancelling the calling coroutine now abandons the native
   RPC wait, so this plugin no longer needs session-reset hooks.
@@ -41,6 +45,4 @@ reference; the byte stream carries the payload.
 
 Documented in `docs/remote-tools-design.md` "Deferred for future":
 
-- Multi-client coexistence (per-identity prefix + opt-out)
-- Tier-2 / Tier-3 safety (env allowlist, explicit consent, audit log)
 - UX polish (`agent:tools-list`, bundled example client)

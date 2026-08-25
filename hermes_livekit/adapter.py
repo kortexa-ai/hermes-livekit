@@ -18,12 +18,10 @@ import io
 import logging
 import math
 import os
-import re
 import struct
 import subprocess
 import tempfile
 import time
-import unicodedata
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -82,6 +80,14 @@ from .tool_result_protocol import (
     stream_ready_message,
     validate_completed_size,
     validate_stream_header,
+)
+from .tool_safety import (
+    PolicyDecision,
+    ToolAuditLog,
+    ToolPolicy,
+    ToolPolicyError,
+    valid_participant_identity,
+    valid_tool_name,
 )
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
@@ -147,8 +153,6 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 # Remote tools (client-offered, callable by the agent). See
 # docs/remote-tools-design.md. v0.3.0 ships protocol + desktop_notify-style
 # small JSON results and bounded byte-stream results.
-TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
-MAX_PARTICIPANT_IDENTITY_BYTES = 128
 SCOPED_TOOL_PREFIX = "lk_"
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
@@ -264,6 +268,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._client_tools: Dict[str, set[str]] = {}  # identity -> registry names
         self._tool_owners: Dict[str, str] = {}  # registry name -> owner identity
         self._tool_methods: Dict[str, str] = {}  # registry name -> RPC method
+        self._tool_policy = self._resolve_tool_policy()
+        self._tool_audit = ToolAuditLog()
 
         # Binary RPC results use one reserved LiveKit topic per pending call.
         # State is also initialized lazily for contract tests that construct the
@@ -321,6 +327,18 @@ class LiveKitAdapter(BasePlatformAdapter):
             except ValueError:
                 logger.warning("[%s] HERMES_LIVEKIT_TOOL_TIMEOUT_SEC=%r is not a number; using default", self.name, raw)
         return TOOL_CALL_TIMEOUT_DEFAULT
+
+    def _resolve_tool_policy(self) -> ToolPolicy:
+        """Load the closed operator policy; malformed input denies every tool."""
+        raw = os.getenv("HERMES_LIVEKIT_REMOTE_TOOL_POLICY", "")
+        try:
+            return ToolPolicy.parse(raw)
+        except ToolPolicyError:
+            logger.warning(
+                "[%s] remote-tool policy invalid; all remote tools denied",
+                self.name,
+            )
+            return ToolPolicy()
 
     @staticmethod
     def _find_default_avatar() -> str:
@@ -1732,6 +1750,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         input_schema = msg.get("input_schema")
 
         if not self._valid_tool_owner_identity(identity):
+            self._audit_tool("registration", identity, name, 0, "denied")
             if identity:
                 await self._publish_typed(
                     {
@@ -1744,7 +1763,8 @@ class LiveKitAdapter(BasePlatformAdapter):
                 )
             return
 
-        if TOOL_NAME_RE.fullmatch(name) is None:
+        if not valid_tool_name(name):
+            self._audit_tool("registration", identity, name, 0, "denied")
             await self._publish_typed(
                 {"type": "agent:tool-registered", "name": name, "success": False, "reason": "name-invalid"},
                 identity=identity,
@@ -1752,16 +1772,32 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
 
         if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
+            self._audit_tool("registration", identity, name, 0, "denied")
             await self._publish_typed(
                 {"type": "agent:tool-registered", "name": name, "success": False, "reason": "schema-invalid"},
                 identity=identity,
             )
             return
 
+        decision = self._tool_policy_decision(identity, name)
+        if not decision.allowed:
+            self._audit_tool("registration", identity, name, decision.tier, "denied")
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "policy-denied",
+                },
+                identity=identity,
+            )
+            return
+
         try:
             from tools.registry import registry
-        except Exception as exc:
-            logger.error("[%s] tool registry unavailable: %s", self.name, exc)
+        except Exception:
+            logger.error("[%s] tool registry unavailable", self.name)
+            self._audit_tool("registration", identity, name, decision.tier, "error")
             await self._publish_typed(
                 {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
                 identity=identity,
@@ -1773,6 +1809,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         owner = self._tool_owners.get(registry_name)
         method = self._tool_methods.get(registry_name)
         if owner is not None and (owner, method) != (identity, name):
+            self._audit_tool("registration", identity, name, decision.tier, "denied")
             await self._publish_typed(
                 {
                     "type": "agent:tool-registered",
@@ -1785,6 +1822,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
         existing = registry.get_entry(registry_name)
         if existing is not None and owner is None:
+            self._audit_tool("registration", identity, name, decision.tier, "denied")
             await self._publish_typed(
                 {
                     "type": "agent:tool-registered",
@@ -1817,15 +1855,15 @@ class LiveKitAdapter(BasePlatformAdapter):
                 description=description,
                 override=True,
             )
-        except Exception as exc:
-            logger.warning("[%s] tool register %r failed: %s", self.name, name, exc)
+        except Exception:
+            logger.warning("[%s] tool register %r failed", self.name, name)
+            self._audit_tool("registration", identity, name, decision.tier, "error")
             await self._publish_typed(
                 {
                     "type": "agent:tool-registered",
                     "name": name,
                     "success": False,
                     "reason": "register-failed",
-                    "detail": str(exc),
                 },
                 identity=identity,
             )
@@ -1834,6 +1872,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._client_tools.setdefault(identity, set()).add(registry_name)
         self._tool_owners[registry_name] = identity
         self._tool_methods[registry_name] = name
+        self._audit_tool("registration", identity, name, decision.tier, "accepted")
         logger.info(
             "[%s] client %s registered tool %r as %r",
             self.name,
@@ -1876,7 +1915,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                     identity=identity,
                 )
             return
-        if TOOL_NAME_RE.fullmatch(name) is None:
+        if not valid_tool_name(name):
             registry_name = ""
         else:
             registry_name = self._scoped_tool_name(identity, name)
@@ -1906,28 +1945,51 @@ class LiveKitAdapter(BasePlatformAdapter):
         async def proxy(args: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> Any:
             import json as _json
 
-            arguments: Dict[str, Any] = dict(args or {})
-            if not self._room or owner_identity not in self._room.remote_participants:
-                raise RuntimeError(
-                    f"client {owner_identity!r} who registered {registered_name!r} is not connected"
+            decision = self._tool_policy_decision(owner_identity, registered_name)
+            if not decision.allowed:
+                self._audit_tool(
+                    "invocation", owner_identity, registered_name, decision.tier, "denied"
                 )
-            room = self._room
-            self._ensure_binary_state()
-            generation = self._room_generation
-            result = await room.local_participant.perform_rpc(
-                destination_identity=owner_identity,
-                method=registered_name,
-                payload=_json.dumps(arguments),
-                response_timeout=self._tool_call_timeout,
+                raise RuntimeError("remote tool invocation denied by policy")
+            try:
+                arguments: Dict[str, Any] = dict(args or {})
+                if not self._room or owner_identity not in self._room.remote_participants:
+                    raise RuntimeError(
+                        f"client {owner_identity!r} who registered {registered_name!r} is not connected"
+                    )
+                room = self._room
+                self._ensure_binary_state()
+                generation = self._room_generation
+                result = await room.local_participant.perform_rpc(
+                    destination_identity=owner_identity,
+                    method=registered_name,
+                    payload=_json.dumps(arguments),
+                    response_timeout=self._tool_call_timeout,
+                )
+                decoded = _json.loads(result)
+                if isinstance(decoded, dict) and decoded.get("type") == REFERENCE_TYPE:
+                    decoded = await self._receive_binary_result(
+                        result,
+                        owner_identity=owner_identity,
+                        room=room,
+                        generation=generation,
+                    )
+            except asyncio.CancelledError:
+                self._audit_tool(
+                    "invocation", owner_identity, registered_name, decision.tier, "cancelled"
+                )
+                self._audit_tool(
+                    "cancellation", owner_identity, registered_name, decision.tier, "cancelled"
+                )
+                raise
+            except Exception:
+                self._audit_tool(
+                    "invocation", owner_identity, registered_name, decision.tier, "error"
+                )
+                raise
+            self._audit_tool(
+                "invocation", owner_identity, registered_name, decision.tier, "success"
             )
-            decoded = _json.loads(result)
-            if isinstance(decoded, dict) and decoded.get("type") == REFERENCE_TYPE:
-                return await self._receive_binary_result(
-                    result,
-                    owner_identity=owner_identity,
-                    room=room,
-                    generation=generation,
-                )
             return decoded
 
         return proxy
@@ -1935,19 +1997,46 @@ class LiveKitAdapter(BasePlatformAdapter):
     @staticmethod
     def _valid_tool_owner_identity(identity: str) -> bool:
         """Return whether a participant identity has one unambiguous encoding."""
-        if (
-            not isinstance(identity, str)
-            or not identity
-            or identity != identity.strip()
-        ):
-            return False
-        if any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in identity):
-            return False
-        try:
-            encoded = identity.encode("utf-8")
-        except UnicodeEncodeError:
-            return False
-        return len(encoded) <= MAX_PARTICIPANT_IDENTITY_BYTES
+        return valid_participant_identity(identity)
+
+    def _ensure_tool_safety_state(self) -> None:
+        """Initialize deny-by-default safety state for lightweight adapters."""
+        if not hasattr(self, "_tool_policy"):
+            self._tool_policy = ToolPolicy()
+        if not hasattr(self, "_tool_audit"):
+            self._tool_audit = ToolAuditLog()
+
+    def _tool_policy_decision(
+        self, participant_identity: str, tool_name: str
+    ) -> PolicyDecision:
+        self._ensure_tool_safety_state()
+        decision = self._tool_policy.decide(participant_identity, tool_name)
+        self._audit_tool(
+            "policy",
+            participant_identity,
+            tool_name,
+            decision.tier,
+            decision.reason,
+        )
+        return decision
+
+    def _audit_tool(
+        self,
+        event: str,
+        participant_identity: str,
+        tool_name: str,
+        tier: int,
+        outcome: str,
+    ) -> None:
+        self._ensure_tool_safety_state()
+        self._tool_audit.append(
+            event, participant_identity, tool_name, tier, outcome
+        )
+
+    def _tool_audit_snapshot(self) -> tuple[dict[str, object], ...]:
+        """Return a detached read-only view for diagnostics and tests."""
+        self._ensure_tool_safety_state()
+        return self._tool_audit.snapshot()
 
     def _tool_message_is_current(
         self,
@@ -1990,8 +2079,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             from tools.registry import registry
             registry.deregister(name)
-        except Exception as exc:
-            logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
+        except Exception:
+            logger.debug("[%s] tool deregister %r failed", self.name, name)
         self._tool_owners.pop(name, None)
         self._tool_methods.pop(name, None)
         tools = self._client_tools.get(identity)
@@ -2004,6 +2093,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Deregister all tools owned by ``identity``."""
         self._ensure_client_tool_maps()
         for name in list(self._client_tools.get(identity, set())):
+            method = self._tool_methods.get(name, "")
+            decision = self._tool_policy_decision(identity, method)
+            self._audit_tool(
+                "owner_disconnect", identity, method, decision.tier, "removed"
+            )
             self._deregister_tool(name, identity)
 
     def _cleanup_all_client_tools(self) -> None:
