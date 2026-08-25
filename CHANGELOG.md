@@ -8,6 +8,10 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Changed
 
+- Replaced custom remote-tool call/result correlation over JSON data messages
+  with LiveKit native RPC. Clients still advertise tools through
+  `client:tool-register`, then serve an RPC method with the same name. LiveKit
+  now owns correlation, response timeout, and error transport.
 - Updated the pinned SDKs to `livekit==1.1.14`, `livekit-api==1.2.0`, and
   `Pillow==12.3.0`; raised the minimum Hermes package to `0.20.0`.
 - Moved platform dependency and credential checks onto Hermes' current passive

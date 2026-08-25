@@ -9,47 +9,11 @@ import logging
 import os
 from typing import Optional
 
-from .adapter import LIVE_ADAPTERS, TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
+from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
 __all__ = ["register", "LiveKitAdapter", "check_livekit_requirements"]
-
-
-def _on_session_finalize_hook(**kwargs) -> None:
-    """Cancel pending remote tool calls when the user resets the session.
-
-    Hermes fires ``on_session_finalize`` from ``_handle_reset_command`` —
-    i.e. when the user issues ``/new``. The adapter's proxy coroutines are
-    blocked on per-call futures; without this hook they'd hang until the
-    per-call timeout. (For ``/stop`` mid-turn, see PLAN.md — the upstream
-    PR adding ``agent_loop_stopped`` is the matching hook.)
-    """
-    for adapter in list(LIVE_ADAPTERS):
-        try:
-            n = adapter.cancel_pending_tool_calls_for_session_reset()
-            if n:
-                logger.info("session finalize: cancelled %d in-flight remote tool call(s)", n)
-        except Exception as exc:
-            logger.debug("session-finalize cleanup failed for %s: %s", adapter, exc)
-
-
-def _on_agent_loop_stopped_hook(**kwargs) -> None:
-    """Cancel pending remote tool calls when the agent loop is interrupted.
-
-    The plugin registers this callback only when the host advertises the
-    ``agent_loop_stopped`` hook proposed by the hermes-agent PR linked in
-    PLAN.md. Until that lands, registration is a quiet compatibility no-op.
-    Once the hook appears, new gateway processes start catching ``/stop``
-    mid-turn without any further plugin change.
-    """
-    for adapter in list(LIVE_ADAPTERS):
-        try:
-            n = adapter.cancel_pending_tool_calls_for_session_reset()
-            if n:
-                logger.info("agent loop stopped: cancelled %d in-flight remote tool call(s)", n)
-        except Exception as exc:
-            logger.debug("loop-stopped cleanup failed for %s: %s", adapter, exc)
 
 
 _LIVEKIT_PLATFORM_HINT = (
@@ -235,17 +199,3 @@ def register(ctx) -> None:
         # Toolset registration is best-effort; the adapter still works
         # without it (resolves through the gateway umbrella toolset).
         pass
-
-    # Remote-tool cancellation hooks. See docs/remote-tools-design.md and
-    # PLAN.md. on_session_finalize covers /new today; agent_loop_stopped
-    # registers and covers /stop once the upstream PR lands.
-    try:
-        ctx.register_hook("on_session_finalize", _on_session_finalize_hook)
-        from hermes_cli.plugins import VALID_HOOKS
-
-        if "agent_loop_stopped" in VALID_HOOKS:
-            ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
-        else:
-            logger.debug("agent_loop_stopped is not available in this Hermes host")
-    except Exception as exc:
-        logger.debug("hook registration failed: %s", exc)

@@ -132,12 +132,6 @@ TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
 
-# Live adapter instances — used by the plugin's session-finalize hook to find
-# the adapter(s) whose pending remote-tool calls need cancellation when the
-# user issues /new. Set membership is managed by __init__ / disconnect.
-LIVE_ADAPTERS: "set[LiveKitAdapter]" = set()
-
-
 def check_livekit_requirements() -> bool:
     """Passively report whether the pinned LiveKit SDKs are importable.
 
@@ -233,15 +227,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         # client is expected to register at a time.
         self._client_tools: Dict[str, set[str]] = {}        # identity -> tool names
         self._tool_owners: Dict[str, str] = {}              # tool name -> owner identity
-        self._pending_tool_calls: Dict[str, asyncio.Future] = {}  # call_id -> future
-        self._pending_tool_owners: Dict[str, str] = {}      # call_id -> owner identity
 
         self._presence_poll_interval: float = self._resolve_presence_poll_interval()
         self._tool_call_timeout: float = self._resolve_tool_call_timeout()
-
-        # Register in module-level set so the plugin's session-finalize hook
-        # can reach us. (Multi-room would mean multiple adapters; v1 is one.)
-        LIVE_ADAPTERS.add(self)
 
     def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
         """LiveKit is voice-first — always auto-TTS unless the chat opted out.
@@ -560,7 +548,6 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Drop every client-registered tool from the hermes registry.
         self._cleanup_all_client_tools()
 
-        LIVE_ADAPTERS.discard(self)
 
         logger.info("[%s] Disconnected", self.name)
 
@@ -648,7 +635,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         identity = participant.identity
         logger.info("[%s] Participant disconnected: %s", self.name, identity)
         self._cleanup_participant(identity)
-        # Drop any tools this client had registered + fail their pending calls.
+        # Drop any tools this client had registered.
         self._cleanup_client_tools(identity)
 
         if self._room and not self._room.remote_participants:
@@ -1081,7 +1068,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             "client:control": lambda: self._handle_client_control(msg, participant_identity),
             "client:tool-register": lambda: self._register_client_tool(msg, participant_identity),
             "client:tool-unregister": lambda: self._unregister_client_tool(msg, participant_identity),
-            "client:tool-result": lambda: self._handle_tool_result(msg, participant_identity),
         }
         handler = handlers.get(msg_type)
         if handler is None:
@@ -1354,21 +1340,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             identity=identity,
         )
 
-    async def _handle_tool_result(self, msg: Dict[str, Any], identity: str) -> None:
-        call_id = (msg.get("call_id") or "").strip()
-        if not call_id:
-            return
-        future = self._pending_tool_calls.pop(call_id, None)
-        self._pending_tool_owners.pop(call_id, None)
-        if future is None or future.done():
-            # Late result for a cancelled/timed-out call — ignore.
-            logger.debug("[%s] tool-result for unknown call_id %r", self.name, call_id)
-            return
-        if "error" in msg:
-            future.set_exception(RuntimeError(str(msg.get("error") or "tool reported error")))
-        else:
-            future.set_result(msg.get("result"))
-
     def _build_tool_handler(self, owner_identity: str, registered_name: str):
         """Return an async fn that hermes will call when the LLM picks this tool.
 
@@ -1378,45 +1349,20 @@ class LiveKitAdapter(BasePlatformAdapter):
         """
 
         async def proxy(args: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> Any:
+            import json as _json
+
             arguments: Dict[str, Any] = dict(args or {})
             if not self._room or owner_identity not in self._room.remote_participants:
                 raise RuntimeError(
                     f"client {owner_identity!r} who registered {registered_name!r} is not connected"
                 )
-            call_id = f"tc_{uuid.uuid4().hex[:12]}"
-            loop = asyncio.get_running_loop()
-            future = loop.create_future()
-            self._pending_tool_calls[call_id] = future
-            self._pending_tool_owners[call_id] = owner_identity
-            try:
-                await self._publish_typed(
-                    {
-                        "type": "agent:tool-call",
-                        "call_id": call_id,
-                        "name": registered_name,
-                        "arguments": arguments,
-                    },
-                    identity=owner_identity,
-                )
-                return await asyncio.wait_for(future, timeout=self._tool_call_timeout)
-            except asyncio.TimeoutError:
-                await self._publish_typed(
-                    {"type": "agent:tool-call-timeout", "call_id": call_id, "name": registered_name},
-                    identity=owner_identity,
-                )
-                raise RuntimeError(
-                    f"remote tool {registered_name!r} timed out after {self._tool_call_timeout:.0f}s"
-                )
-            except asyncio.CancelledError:
-                # Agent loop is unwinding — let the client abort.
-                await self._publish_typed(
-                    {"type": "agent:tool-call-cancelled", "call_id": call_id, "name": registered_name},
-                    identity=owner_identity,
-                )
-                raise
-            finally:
-                self._pending_tool_calls.pop(call_id, None)
-                self._pending_tool_owners.pop(call_id, None)
+            result = await self._room.local_participant.perform_rpc(
+                destination_identity=owner_identity,
+                method=registered_name,
+                payload=_json.dumps(arguments),
+                response_timeout=self._tool_call_timeout,
+            )
+            return _json.loads(result)
 
         return proxy
 
@@ -1435,75 +1381,16 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._client_tools.pop(identity, None)
 
     def _cleanup_client_tools(self, identity: str) -> None:
-        """Deregister all tools owned by ``identity`` and fail their pending calls."""
+        """Deregister all tools owned by ``identity``."""
         for name in list(self._client_tools.get(identity, set())):
             self._deregister_tool(name, identity)
-        for call_id in list(self._pending_tool_owners.keys()):
-            if self._pending_tool_owners.get(call_id) != identity:
-                continue
-            future = self._pending_tool_calls.pop(call_id, None)
-            self._pending_tool_owners.pop(call_id, None)
-            if future is not None and not future.done():
-                future.set_exception(
-                    RuntimeError(f"client {identity!r} disconnected mid-call")
-                )
 
     def _cleanup_all_client_tools(self) -> None:
-        """Deregister every client-offered tool and fail every pending call."""
+        """Deregister every client-offered tool."""
         for identity in list(self._client_tools.keys()):
             self._cleanup_client_tools(identity)
-        # Belt + braces — anything not keyed by a tracked identity.
-        for call_id, future in list(self._pending_tool_calls.items()):
-            if not future.done():
-                future.set_exception(RuntimeError("livekit adapter shutting down"))
-        self._pending_tool_calls.clear()
-        self._pending_tool_owners.clear()
         self._client_tools.clear()
         self._tool_owners.clear()
-
-    def cancel_pending_tool_calls_for_session_reset(self) -> int:
-        """Fail in-flight remote tool calls and tell the owning clients.
-
-        Called from the plugin's ``on_session_finalize`` hook (and the
-        upstream ``agent_loop_stopped`` hook, once that lands). The agent
-        loop is gone but our proxy coroutines are blocked on the result
-        future — without this, they'd hang until the call's timeout (or
-        until the client responds to a call the agent no longer cares
-        about). Tool *registrations* stay intact — only the in-flight
-        invocations are cancelled.
-
-        Returns the number of calls that were cancelled.
-        """
-        if not self._pending_tool_calls:
-            return 0
-        cancelled = 0
-        for call_id, future in list(self._pending_tool_calls.items()):
-            owner = self._pending_tool_owners.get(call_id, "")
-            if owner:
-                # Best-effort notification — schedule on the same loop the
-                # adapter runs on. If no loop is running, the publish just
-                # gets skipped (the future-failure path still runs).
-                try:
-                    asyncio.create_task(
-                        self._publish_typed(
-                            {
-                                "type": "agent:tool-call-cancelled",
-                                "call_id": call_id,
-                                "reason": "session-reset",
-                            },
-                            identity=owner,
-                        )
-                    )
-                except RuntimeError:
-                    pass  # no running loop
-            if not future.done():
-                future.set_exception(
-                    RuntimeError("agent session reset; tool call abandoned")
-                )
-            cancelled += 1
-        self._pending_tool_calls.clear()
-        self._pending_tool_owners.clear()
-        return cancelled
 
     def _drain_pending_captures(self) -> tuple[list[str], list[str]]:
         """Pop all buffered frame paths into parallel (urls, types) lists.

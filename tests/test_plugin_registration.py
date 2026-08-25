@@ -94,16 +94,7 @@ def test_register_declares_late_bound_remote_toolset(
     assert TOOLSETS[TOOLSET_NAME]["tools"] == []
 
 
-def test_register_adds_loop_stop_hook_only_when_host_advertises_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from hermes_cli import plugins as hermes_plugins
-
-    monkeypatch.setattr(
-        hermes_plugins,
-        "VALID_HOOKS",
-        {*hermes_plugins.VALID_HOOKS, "agent_loop_stopped"},
-    )
+def test_register_does_not_add_obsolete_remote_tool_cancellation_hooks() -> None:
     hooks: list[tuple[str, object]] = []
 
     class Context:
@@ -115,5 +106,4 @@ def test_register_adds_loop_stop_hook_only_when_host_advertises_it(
 
     hermes_livekit.register(Context())
 
-    assert ("on_session_finalize", hermes_livekit._on_session_finalize_hook) in hooks
-    assert ("agent_loop_stopped", hermes_livekit._on_agent_loop_stopped_hook) in hooks
+    assert hooks == []

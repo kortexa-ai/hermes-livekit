@@ -8,7 +8,7 @@ on the voice/ASR path.
 Capabilities:
   - Joins a LiveKit room with a self-minted token
   - Registers a single tool, ``desktop_notify(title, body)``, that
-    pops a macOS notification via ``osascript`` and logs the call
+    pops a macOS notification via ``osascript`` through LiveKit RPC
   - Logs every inbound data-channel message (any topic)
   - Reads stdin: each typed line is sent as a ``client:message`` user
     prompt to the agent (same path the voice transcript takes)
@@ -148,6 +148,11 @@ class TestClient:
         # race here; the second arrival is a no-op.
         if self._registered:
             return
+        if self.room is None:
+            return
+        self.room.local_participant.register_rpc_method(
+            TOOL_NAME, self._handle_tool_call
+        )
         self._registered = True
         await self.publish(
             {
@@ -185,6 +190,10 @@ class TestClient:
             )
         except Exception as exc:
             LOG.debug("tool unregister failed: %s", exc)
+        finally:
+            if self.room is not None and self._registered:
+                self.room.local_participant.unregister_rpc_method(TOOL_NAME)
+            self._registered = False
 
     def _on_data(self, packet: rtc.DataPacket) -> None:
         """Sync handler (livekit-rtc fires synchronously). Decode and dispatch."""
@@ -204,9 +213,7 @@ class TestClient:
             if len(summary) > 500:
                 summary = summary[:500] + "…"
             LOG.info("inbound [%s] %s: %s", topic, msg_type, summary)
-            if msg_type == "agent:tool-call" and self._loop is not None:
-                asyncio.run_coroutine_threadsafe(self._handle_tool_call(msg), self._loop)
-            elif msg_type == "agent:agent-transcript":
+            if msg_type == "agent:agent-transcript":
                 # Final assistant reply for this turn — signal oneshot mode to
                 # exit. (Wrapped events have payload.final; flat ones would have
                 # final at top level. Check both.)
@@ -216,38 +223,35 @@ class TestClient:
         else:
             LOG.info("inbound [%s] non-dict payload: %r", topic, msg)
 
-    async def _handle_tool_call(self, msg: dict[str, Any]) -> None:
-        call_id = msg.get("call_id")
-        name = msg.get("name")
-        args = msg.get("arguments") or {}
-        if name != TOOL_NAME:
-            LOG.warning("tool-call for unknown tool %r (call_id=%s)", name, call_id)
-            await self.publish(
-                {
-                    "type": "client:tool-result",
-                    "call_id": call_id,
-                    "error": f"unknown tool: {name}",
-                },
-                topic=HERMES_CONTROL_TOPIC,
-            )
-            return
+    async def _handle_tool_call(self, invocation: rtc.RpcInvocationData) -> str:
+        try:
+            args = json.loads(invocation.payload)
+            if not isinstance(args, dict):
+                raise ValueError("arguments must be an object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise rtc.RpcError(
+                rtc.RpcError.ErrorCode.APPLICATION_ERROR,
+                "invalid tool arguments",
+            ) from exc
         title = str(args.get("title", ""))
         body = str(args.get("body", ""))
-        LOG.info("→ desktop_notify(title=%r, body=%r) [call_id=%s]", title, body, call_id)
+        LOG.info(
+            "→ desktop_notify(title=%r, body=%r) [request_id=%s]",
+            title,
+            body,
+            invocation.request_id,
+        )
         try:
             macos_notify(title, body)
             result = {"shown": True}
-            await self.publish(
-                {"type": "client:tool-result", "call_id": call_id, "result": result},
-                topic=HERMES_CONTROL_TOPIC,
-            )
             LOG.info("← tool-result %s", result)
+            return json.dumps(result)
         except Exception as exc:
             LOG.exception("notification failed")
-            await self.publish(
-                {"type": "client:tool-result", "call_id": call_id, "error": str(exc)},
-                topic=HERMES_CONTROL_TOPIC,
-            )
+            raise rtc.RpcError(
+                rtc.RpcError.ErrorCode.APPLICATION_ERROR,
+                "notification failed",
+            ) from exc
 
     async def send_prompt(self, text: str) -> None:
         await self.publish(

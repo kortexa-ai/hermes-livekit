@@ -111,6 +111,7 @@ platforms:
 | `LIVEKIT_ALLOWED_USERS`          | no       | comma-separated participant identities                             |
 | `LIVEKIT_ALLOW_ALL_USERS`        | no       | `1`/`true` allows any participant (dev only)                       |
 | `LIVEKIT_PRESENCE_POLL_INTERVAL` | no       | seconds; auto-picked (cloud 30s, local 5s)                         |
+| `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` | no      | native RPC response timeout; default 30 seconds                    |
 
 Or run the interactive prompt:
 
@@ -158,9 +159,6 @@ only to the owning participant via `destination_identities`):
 
 - `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?, detail?}`
 - `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
-- `agent:tool-call` — agent invoking a client-registered tool; `{call_id, name, arguments}`
-- `agent:tool-call-cancelled` — agent loop unwound while the call was in flight; `{call_id, name}`
-- `agent:tool-call-timeout` — plugin timed out waiting for a result (default 30s, override via `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC`); `{call_id, name}`
 
 ### Inbound (client → agent), topic `hermes-control`
 
@@ -205,20 +203,23 @@ Remote-tool messages (0.3.0+):
 
 // give back a tool the client no longer wants to offer
 {"type": "client:tool-unregister", "name": "desktop_notify"}
-
-// respond to an inbound agent:tool-call (exactly one of result/error)
-{"type": "client:tool-result", "call_id": "tc_abc123", "result": {"shown": true}}
-{"type": "client:tool-result", "call_id": "tc_abc123", "error": "permission denied"}
 ```
+
+Before advertising a tool, the client registers a LiveKit RPC method with the
+same name. The agent calls that method with the tool arguments encoded as a
+JSON object. The method returns its JSON-shaped result as a JSON string, or
+raises `RpcError`. LiveKit owns request correlation, response timeout, and
+error transport; cancelling the caller abandons the RPC wait. These calls do
+not use custom `agent:tool-call` or `client:tool-result` data messages. See
+`examples/test_client.py` for a working Python client.
 
 For tools to be visible to the LLM, add `hermes-livekit-tools` to the
 livekit toolset list in `~/.hermes/config.yaml`
 (`platform_toolsets.livekit`). The plugin does not auto-activate the
 toolset.
 
-Tools and pending calls are cleaned up automatically when the registering
-participant disconnects. Full design and roadmap (large/binary results,
-multi-client coexistence, native LiveKit RPC pivot) in
+Tools are removed automatically when the registering participant disconnects.
+Full design and roadmap (large/binary results and multi-client coexistence) in
 [`docs/remote-tools-design.md`](docs/remote-tools-design.md).
 
 Unknown `type` values are ignored silently — keeps the topic compatible
