@@ -203,9 +203,25 @@ types, version 1 returns only the bounded summary and `{mime_type, size,
 available_to_model: false}` metadata after validating the bytes; the payload is
 discarded because Hermes has no general binary attachment result shape.
 
-The protocol module and fixtures are transport-independent. The LiveKit
-receiver is a separate adapter unit; defining this contract does not register a
-stream handler or change the current JSON RPC path.
+The adapter detects this reference after the normal RPC completes. It reserves
+at most eight binary results at once, registers one exact-topic byte handler,
+and sends the ready message. Ordinary JSON RPC results keep their existing
+path. The receiver validates the sender and every advertised header field
+before buffering, accounts before every append, applies one deadline to ready
+publication and transfer, and maps only exact-length completed bytes to the
+result shapes above. A stream from another participant is drained separately
+and cannot claim or fail the owner's pending result. At most four such ignored
+readers are drained concurrently per room generation; another ignored header
+coalesces the same bounded room-replacement escalation instead of creating an
+unbounded task or queue set.
+
+Participant departure fails that owner's pending binary results and clears
+their partial buffers. Room disconnect or replacement fails every pending
+result from the old generation, clears handlers and reservations, and requires
+tool rediscovery after rejoin. Caller cancellation clears its result buffer and
+waiter immediately, sends the targeted cancel message, and applies the bounded
+drain behavior above to any accepted reader. Diagnostics expose fixed protocol
+codes, not participant-supplied fields or payload bytes.
 
 ## Deferred
 

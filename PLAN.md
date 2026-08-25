@@ -28,9 +28,11 @@ LiveKit byte streams. Mechanism confirmed: `stream_bytes` /
 The bounded version 1 reference, identity binding, per-stream topic, size and
 timeout limits, cancellation rules, Hermes image mapping, and non-image
 fallback are defined in `docs/remote-tools-design.md` and the executable
-`tool_result_protocol` fixtures. The adapter receiver and camera example remain
-separate phases. RPC still carries invocation and the small stream reference;
-the byte stream carries the payload.
+`tool_result_protocol` fixtures. The adapter implements the bounded receiver,
+including exact owner/header checks, pending and byte caps, cancellation drain,
+and room-generation cleanup. The camera example remains a separate phase. RPC
+still carries invocation and the small stream reference; the byte stream
+carries the payload.
 
 ## Deferred indefinitely
 

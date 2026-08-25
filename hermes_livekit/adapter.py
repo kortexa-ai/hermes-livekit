@@ -24,6 +24,7 @@ import tempfile
 import time
 import uuid
 import wave
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -63,6 +64,22 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+)
+
+from .tool_result_protocol import (
+    DRAIN_TIMEOUT_SEC,
+    REFERENCE_TYPE,
+    BinaryResultProtocolError,
+    BinaryResultReference,
+    bounded_next_size,
+    format_completed_result,
+    parse_reference,
+    release_stream,
+    reserve_stream,
+    stream_cancel_message,
+    stream_ready_message,
+    validate_completed_size,
+    validate_stream_header,
 )
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
@@ -127,10 +144,26 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 
 # Remote tools (client-offered, callable by the agent). See
 # docs/remote-tools-design.md. v0.3.0 ships protocol + desktop_notify-style
-# small-result tools; large/binary results are Phase 1.5.
+# small JSON results and bounded byte-stream results.
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
+MAX_PENDING_BINARY_RESULTS = 8
+MAX_IGNORED_BINARY_DRAINS = 4
+
+
+@dataclass
+class _BinaryTransfer:
+    reference: BinaryResultReference
+    room: Any
+    generation: int
+    result: asyncio.Future[bytes]
+    buffer: bytearray = field(default_factory=bytearray)
+    reader_task: Optional[asyncio.Task[None]] = None
+    drain_task: Optional[asyncio.Task[None]] = None
+    trailer_received: asyncio.Event = field(default_factory=asyncio.Event)
+    terminal: bool = False
+    handler_registered: bool = False
 
 def check_livekit_requirements() -> bool:
     """Passively report whether the pinned LiveKit SDKs are importable.
@@ -227,6 +260,16 @@ class LiveKitAdapter(BasePlatformAdapter):
         # client is expected to register at a time.
         self._client_tools: Dict[str, set[str]] = {}        # identity -> tool names
         self._tool_owners: Dict[str, str] = {}              # tool name -> owner identity
+
+        # Binary RPC results use one reserved LiveKit topic per pending call.
+        # State is also initialized lazily for contract tests that construct the
+        # adapter with object.__new__.
+        self._binary_topics: set[str] = set()
+        self._binary_transfers: Dict[str, _BinaryTransfer] = {}
+        self._room_generation = 0
+        self._room_replacement_started = False
+        self._binary_ignored_drains: set[asyncio.Task[None]] = set()
+        self._binary_replacement_scheduled = False
 
         self._presence_poll_interval: float = self._resolve_presence_poll_interval()
         self._tool_call_timeout: float = self._resolve_tool_call_timeout()
@@ -420,9 +463,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                     self.name,
                 )
                 stale, self._room = self._room, None
+                self._fail_binary_generation(self._room_generation, "room_replaced")
                 await self._release_room(stale, why="stale-on-join")
 
             self._room = rtc.Room()
+            self._room_generation += 1
+            self._room_replacement_started = False
+            self._binary_ignored_drains = set()
+            self._binary_replacement_scheduled = False
 
             # Register event handlers
             self._room.on("track_subscribed", self._on_track_subscribed)
@@ -525,6 +573,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._graceful_leave = True
             room, self._room = self._room, None
             try:
+                self._fail_binary_generation(self._room_generation, "room_replaced")
                 await self._release_room(room, why="disconnect")
             finally:
                 self._graceful_leave = False
@@ -637,6 +686,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._cleanup_participant(identity)
         # Drop any tools this client had registered.
         self._cleanup_client_tools(identity)
+        self._fail_binary_owner(identity)
 
         if self._room and not self._room.remote_participants:
             logger.info("[%s] Last participant left '%s', leaving room", self.name, self._room_name)
@@ -678,6 +728,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Clients will be gone after we drop the room — clear their tools.
         self._cleanup_all_client_tools()
+        self._fail_binary_generation(self._room_generation, "room_replaced")
 
         if self._room:
             self._graceful_leave = True
@@ -700,6 +751,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         """
         if not self._running or self._graceful_leave:
             return
+        self._fail_binary_generation(self._room_generation, "room_replaced")
+        self._cleanup_all_client_tools()
         logger.warning("[%s] Disconnected from room: %s. Will reconnect.", self.name, reason)
         self._connect_task = asyncio.create_task(self._reconnect_loop())
 
@@ -1231,14 +1284,14 @@ class LiveKitAdapter(BasePlatformAdapter):
         *,
         identity: Optional[str] = None,
         topic: str = "",
-    ) -> None:
+    ) -> bool:
         """Publish a flat-envelope JSON message; optionally target one participant.
 
         Unlike _publish_agent_event (which wraps payload in {type, payload}),
         the remote-tool protocol is flat by spec — every field at top level.
         """
         if not self._room:
-            return
+            return False
         import json as _json
         try:
             data = _json.dumps(msg).encode("utf-8")
@@ -1246,8 +1299,383 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self._room.local_participant.publish_data(
                 data, reliable=True, topic=topic, destination_identities=dest,
             )
+            return True
         except Exception as exc:
             logger.debug("[%s] typed publish failed (%s): %s", self.name, msg.get("type"), exc)
+            return False
+
+    def _ensure_binary_state(self) -> None:
+        if not hasattr(self, "_binary_topics"):
+            self._binary_topics = set()
+            self._binary_transfers = {}
+            self._room_generation = 1
+            self._room_replacement_started = False
+        if not hasattr(self, "_binary_ignored_drains"):
+            self._binary_ignored_drains = set()
+            self._binary_replacement_scheduled = False
+
+    @staticmethod
+    def _binary_error(code: str) -> RuntimeError:
+        return RuntimeError(f"binary tool result failed: {code}")
+
+    def _unregister_binary_handler(self, transfer: _BinaryTransfer) -> None:
+        if not transfer.handler_registered:
+            return
+        transfer.handler_registered = False
+        try:
+            transfer.room.unregister_byte_stream_handler(transfer.reference.topic)
+        except Exception:
+            pass
+
+    def _cleanup_binary_transfer(self, transfer: _BinaryTransfer) -> None:
+        self._unregister_binary_handler(transfer)
+        transfer.buffer.clear()
+        release_stream(transfer.reference, self._binary_topics)
+        current = self._binary_transfers.get(transfer.reference.topic)
+        if current is transfer:
+            self._binary_transfers.pop(transfer.reference.topic, None)
+
+    def _fail_binary_transfer(
+        self,
+        transfer: _BinaryTransfer,
+        code: str,
+        *,
+        cancel_waiter: bool = False,
+    ) -> None:
+        if transfer.terminal:
+            return
+        transfer.terminal = True
+        transfer.buffer.clear()
+        self._unregister_binary_handler(transfer)
+        if not transfer.result.done():
+            if cancel_waiter:
+                transfer.result.cancel()
+            else:
+                transfer.result.set_exception(self._binary_error(code))
+
+    def _fail_binary_owner(self, identity: str) -> None:
+        self._ensure_binary_state()
+        for transfer in list(self._binary_transfers.values()):
+            if transfer.reference.owner_identity != identity:
+                continue
+            self._fail_binary_transfer(transfer, "owner_disconnected")
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=False)
+
+    def _fail_binary_generation(self, generation: int, code: str) -> None:
+        self._ensure_binary_state()
+        current_task = asyncio.current_task()
+        for transfer in list(self._binary_transfers.values()):
+            if transfer.generation != generation:
+                continue
+            self._fail_binary_transfer(transfer, code)
+            for task in (transfer.reader_task, transfer.drain_task):
+                if task is not None and task is not current_task and not task.done():
+                    task.cancel()
+            self._cleanup_binary_transfer(transfer)
+        if generation == self._room_generation:
+            for task in list(self._binary_ignored_drains):
+                if task is not current_task and not task.done():
+                    task.cancel()
+            self._binary_ignored_drains.clear()
+
+    def _schedule_binary_room_replacement(self, generation: int) -> None:
+        if (
+            generation != self._room_generation
+            or self._room_replacement_started
+            or self._binary_replacement_scheduled
+        ):
+            return
+        self._binary_replacement_scheduled = True
+        asyncio.create_task(self._replace_binary_room_generation(generation))
+
+    def _track_unclaimed_reader(self, reader: Any, generation: int) -> None:
+        self._ensure_binary_state()
+        if generation != self._room_generation:
+            return
+        self._binary_ignored_drains = {
+            task for task in self._binary_ignored_drains if not task.done()
+        }
+        if len(self._binary_ignored_drains) >= MAX_IGNORED_BINARY_DRAINS:
+            self._schedule_binary_room_replacement(generation)
+            return
+        task = asyncio.create_task(self._drain_unclaimed_reader(reader, generation))
+        self._binary_ignored_drains.add(task)
+        task.add_done_callback(self._binary_ignored_drains.discard)
+
+    def _schedule_binary_terminal_cleanup(
+        self, transfer: _BinaryTransfer, *, send_cancel: bool
+    ) -> None:
+        if transfer.reader_task is None:
+            self._cleanup_binary_transfer(transfer)
+            return
+        if transfer.drain_task is not None:
+            return
+        transfer.drain_task = asyncio.create_task(
+            self._finish_binary_terminal(transfer, send_cancel=send_cancel)
+        )
+
+    async def _publish_binary_control(
+        self, transfer: _BinaryTransfer, message: Dict[str, Any]
+    ) -> bool:
+        """Publish only through the exact room generation that owns a transfer."""
+        if (
+            transfer.room is not self._room
+            or transfer.generation != self._room_generation
+        ):
+            return False
+        import json as _json
+
+        try:
+            await transfer.room.local_participant.publish_data(
+                _json.dumps(message).encode("utf-8"),
+                reliable=True,
+                topic="hermes-control",
+                destination_identities=[transfer.reference.owner_identity],
+            )
+            return (
+                transfer.room is self._room
+                and transfer.generation == self._room_generation
+            )
+        except Exception:
+            return False
+
+    async def _finish_binary_terminal(
+        self, transfer: _BinaryTransfer, *, send_cancel: bool
+    ) -> None:
+        try:
+            if send_cancel and transfer.room is self._room:
+                await self._publish_binary_control(
+                    transfer, stream_cancel_message(transfer.reference)
+                )
+            try:
+                await asyncio.wait_for(
+                    transfer.trailer_received.wait(), timeout=DRAIN_TIMEOUT_SEC
+                )
+            except asyncio.TimeoutError:
+                await self._replace_binary_room_generation(transfer.generation)
+                return
+            self._cleanup_binary_transfer(transfer)
+        except asyncio.CancelledError:
+            return
+
+    async def _replace_binary_room_generation(self, generation: int) -> None:
+        self._ensure_binary_state()
+        if generation != self._room_generation or self._room_replacement_started:
+            return
+        self._room_replacement_started = True
+        room, self._room = self._room, None
+        self._fail_binary_generation(generation, "room_replaced")
+        self._cleanup_all_client_tools()
+        silence_task = getattr(self, "_silence_task", None)
+        if silence_task is not None:
+            silence_task.cancel()
+            try:
+                await silence_task
+            except asyncio.CancelledError:
+                pass
+            self._silence_task = None
+        audio_tasks = list(getattr(self, "_audio_streams", {}).values())
+        for task in audio_tasks:
+            task.cancel()
+        if audio_tasks:
+            await asyncio.gather(*audio_tasks, return_exceptions=True)
+        getattr(self, "_audio_streams", {}).clear()
+        for stream in list(getattr(self, "_video_streams", {}).values()):
+            try:
+                await stream.aclose()
+            except Exception:
+                pass
+        getattr(self, "_video_streams", {}).clear()
+        getattr(self, "_audio_buffers", {}).clear()
+        getattr(self, "_last_audio_time", {}).clear()
+        getattr(self, "_speaking_participants", set()).clear()
+        self._audio_source = None
+        self._local_track = None
+        if room is not None:
+            self._graceful_leave = True
+            try:
+                await self._release_room(room, why="binary-drain-timeout")
+            finally:
+                self._graceful_leave = False
+        if self._running:
+            joined = await self._join_room()
+            if not joined and (self._connect_task is None or self._connect_task.done()):
+                self._connect_task = asyncio.create_task(self._reconnect_loop())
+
+    async def _consume_binary_stream(
+        self,
+        transfer: _BinaryTransfer,
+        reader: Any,
+        sender_identity: str,
+    ) -> None:
+        try:
+            info = reader.info
+            validate_stream_header(
+                transfer.reference,
+                sender_identity=sender_identity,
+                stream_id=info.stream_id,
+                topic=info.topic,
+                mime_type=info.mime_type,
+                total_size=info.size,
+            )
+        except BinaryResultProtocolError as exc:
+            self._fail_binary_transfer(transfer, exc.code)
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+        except Exception:
+            self._fail_binary_transfer(transfer, "header_mismatch")
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+
+        try:
+            async for chunk in reader:
+                if transfer.terminal:
+                    continue
+                try:
+                    bounded_next_size(
+                        transfer.reference, len(transfer.buffer), len(chunk)
+                    )
+                except BinaryResultProtocolError as exc:
+                    self._fail_binary_transfer(transfer, exc.code)
+                    self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+                    continue
+                transfer.buffer.extend(chunk)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self._fail_binary_transfer(transfer, "transfer_incomplete")
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+            return
+
+        transfer.trailer_received.set()
+        if transfer.terminal:
+            self._cleanup_binary_transfer(transfer)
+            current = asyncio.current_task()
+            if (
+                transfer.drain_task is not None
+                and transfer.drain_task is not current
+                and not transfer.drain_task.done()
+            ):
+                transfer.drain_task.cancel()
+            return
+        try:
+            validate_completed_size(transfer.reference, len(transfer.buffer))
+        except BinaryResultProtocolError as exc:
+            self._fail_binary_transfer(transfer, exc.code)
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=False)
+            return
+        payload = bytes(transfer.buffer)
+        transfer.buffer.clear()
+        if not transfer.result.done():
+            transfer.result.set_result(payload)
+
+    def _on_binary_stream(
+        self,
+        transfer: _BinaryTransfer,
+        reader: Any,
+        sender_identity: str,
+    ) -> None:
+        if (
+            transfer.generation != self._room_generation
+            or self._binary_transfers.get(transfer.reference.topic) is not transfer
+        ):
+            self._track_unclaimed_reader(reader, transfer.generation)
+            return
+        if sender_identity != transfer.reference.owner_identity:
+            self._track_unclaimed_reader(reader, transfer.generation)
+            return
+        if transfer.reader_task is not None:
+            self._fail_binary_transfer(transfer, "stream_collision")
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+            self._track_unclaimed_reader(reader, transfer.generation)
+            return
+        transfer.reader_task = asyncio.create_task(
+            self._consume_binary_stream(transfer, reader, sender_identity)
+        )
+
+    async def _drain_unclaimed_reader(self, reader: Any, generation: int) -> None:
+        try:
+            async def drain() -> None:
+                async for _chunk in reader:
+                    pass
+
+            await asyncio.wait_for(drain(), timeout=DRAIN_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            await self._replace_binary_room_generation(generation)
+        except (asyncio.CancelledError, Exception):
+            return
+
+    async def _receive_binary_result(
+        self,
+        payload: str,
+        *,
+        owner_identity: str,
+        room: Any,
+        generation: int,
+    ) -> Any:
+        self._ensure_binary_state()
+        try:
+            reference = parse_reference(
+                payload,
+                rpc_owner_identity=owner_identity,
+                configured_timeout_sec=self._tool_call_timeout,
+            )
+            if len(self._binary_transfers) >= MAX_PENDING_BINARY_RESULTS:
+                raise BinaryResultProtocolError("too_many_pending")
+            reserve_stream(reference, self._binary_topics)
+        except BinaryResultProtocolError as exc:
+            raise self._binary_error(exc.code) from None
+
+        loop = asyncio.get_running_loop()
+        transfer = _BinaryTransfer(
+            reference=reference,
+            room=room,
+            generation=generation,
+            result=loop.create_future(),
+        )
+        self._binary_transfers[reference.topic] = transfer
+        try:
+            room.register_byte_stream_handler(
+                reference.topic,
+                lambda reader, identity: self._on_binary_stream(
+                    transfer, reader, identity
+                ),
+            )
+            transfer.handler_registered = True
+        except Exception:
+            self._cleanup_binary_transfer(transfer)
+            raise self._binary_error("handler_registration_failed") from None
+
+        deadline = loop.time() + reference.transfer_timeout_sec
+        try:
+            ready = await asyncio.wait_for(
+                self._publish_binary_control(transfer, stream_ready_message(reference)),
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            if not ready or room is not self._room or generation != self._room_generation:
+                raise self._binary_error("room_replaced")
+            payload_bytes = await asyncio.wait_for(
+                asyncio.shield(transfer.result),
+                timeout=max(0.0, deadline - loop.time()),
+            )
+            result = format_completed_result(reference, payload_bytes)
+            self._cleanup_binary_transfer(transfer)
+            return result
+        except asyncio.CancelledError:
+            self._fail_binary_transfer(
+                transfer, "transfer_cancelled", cancel_waiter=True
+            )
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+            raise
+        except asyncio.TimeoutError:
+            self._fail_binary_transfer(
+                transfer, "transfer_timeout", cancel_waiter=True
+            )
+            self._schedule_binary_terminal_cleanup(transfer, send_cancel=True)
+            raise self._binary_error("transfer_timeout") from None
+        except Exception:
+            if not transfer.terminal:
+                self._fail_binary_transfer(transfer, "room_replaced")
+                self._schedule_binary_terminal_cleanup(transfer, send_cancel=False)
+            raise
 
     async def _register_client_tool(self, msg: Dict[str, Any], identity: str) -> None:
         name = (msg.get("name") or "").strip()
@@ -1356,13 +1784,24 @@ class LiveKitAdapter(BasePlatformAdapter):
                 raise RuntimeError(
                     f"client {owner_identity!r} who registered {registered_name!r} is not connected"
                 )
-            result = await self._room.local_participant.perform_rpc(
+            room = self._room
+            self._ensure_binary_state()
+            generation = self._room_generation
+            result = await room.local_participant.perform_rpc(
                 destination_identity=owner_identity,
                 method=registered_name,
                 payload=_json.dumps(arguments),
                 response_timeout=self._tool_call_timeout,
             )
-            return _json.loads(result)
+            decoded = _json.loads(result)
+            if isinstance(decoded, dict) and decoded.get("type") == REFERENCE_TYPE:
+                return await self._receive_binary_result(
+                    result,
+                    owner_identity=owner_identity,
+                    room=room,
+                    generation=generation,
+                )
+            return decoded
 
         return proxy
 
