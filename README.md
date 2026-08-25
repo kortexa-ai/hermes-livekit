@@ -222,6 +222,11 @@ The policy is loaded once when the adapter is constructed. See
 [`docs/remote-tools-design.md`](docs/remote-tools-design.md) for the closed
 classification, bounds, and audit contract.
 
+Advertised RPC method names use case-sensitive ASCII identifier segments
+separated by single dots, with a 64-character total limit. For example,
+`camera.snapshot` is valid; `.camera`, `camera.`, `camera..snapshot`, path
+separators, whitespace, Unicode, and normalized aliases are not.
+
 Before advertising a tool, the client registers a LiveKit RPC method with the
 same name. The agent calls that method with the tool arguments encoded as a
 JSON object. The method returns either a JSON-shaped result or the bounded

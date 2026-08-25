@@ -2062,7 +2062,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             + advertised_name.encode("ascii")
         ).hexdigest()[:16]
         readable_limit = 64 - len(SCOPED_TOOL_PREFIX) - len(digest) - 1
-        return f"{SCOPED_TOOL_PREFIX}{digest}_{advertised_name[:readable_limit]}"
+        readable_name = advertised_name.replace(".", "_")
+        return f"{SCOPED_TOOL_PREFIX}{digest}_{readable_name[:readable_limit]}"
 
     def _ensure_client_tool_maps(self) -> None:
         """Initialize maps for lightweight contract-test adapter instances."""

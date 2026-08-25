@@ -16,7 +16,10 @@ MAX_POLICY_BYTES = 16 * 1024
 MAX_POLICY_ENTRIES = 64
 MAX_AUDIT_RECORDS = 256
 MAX_PARTICIPANT_IDENTITY_BYTES = 128
-TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+MAX_TOOL_METHOD_CHARS = 64
+TOOL_METHOD_RE = re.compile(
+    r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*"
+)
 
 _POLICY_REASONS = {
     "not-allowlisted",
@@ -69,8 +72,12 @@ def valid_participant_identity(identity: object) -> bool:
 
 
 def valid_tool_name(name: object) -> bool:
-    """Return whether a tool name exactly matches the Hermes function form."""
-    return isinstance(name, str) and TOOL_NAME_RE.fullmatch(name) is not None
+    """Return whether a method uses bounded canonical dotted identifiers."""
+    return (
+        isinstance(name, str)
+        and len(name) <= MAX_TOOL_METHOD_CHARS
+        and TOOL_METHOD_RE.fullmatch(name) is not None
+    )
 
 
 @dataclass(frozen=True)

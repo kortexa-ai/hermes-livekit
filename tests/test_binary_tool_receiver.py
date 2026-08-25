@@ -130,14 +130,14 @@ def make_adapter(result: str) -> tuple[LiveKitAdapter, FakeRoom]:
     adapter._binary_replacement_scheduled = False
     adapter._client_tools = {"client-1": {"camera_snapshot"}}
     adapter._tool_owners = {"camera_snapshot": "client-1"}
-    adapter._tool_methods = {"camera_snapshot": "camera_snapshot"}
+    adapter._tool_methods = {"camera_snapshot": "camera.snapshot"}
     adapter._tool_policy = ToolPolicy.parse(
         json.dumps(
             {
                 "tools": [
                     {
                         "participant_identity": "client-1",
-                        "tool_name": "camera_snapshot",
+                        "tool_name": "camera.snapshot",
                         "tier": 1,
                     }
                 ]
@@ -159,7 +159,7 @@ def make_adapter(result: str) -> tuple[LiveKitAdapter, FakeRoom]:
 
 async def start_call(adapter: LiveKitAdapter) -> asyncio.Task[Any]:
     task = asyncio.create_task(
-        adapter._build_tool_handler("client-1", "camera_snapshot")({})
+        adapter._build_tool_handler("client-1", "camera.snapshot")({})
     )
     for _ in range(10):
         await asyncio.sleep(0)
@@ -270,7 +270,7 @@ async def test_timeout_without_a_stream_removes_handler_and_waiter(
     adapter, room = make_adapter(reference_payload())
 
     with pytest.raises(RuntimeError, match="binary tool result failed: transfer_timeout"):
-        await adapter._build_tool_handler("client-1", "camera_snapshot")({})
+        await adapter._build_tool_handler("client-1", "camera.snapshot")({})
     assert room.handlers == {}
     assert adapter._binary_transfers == {}
     assert adapter._binary_topics == set()
@@ -380,6 +380,6 @@ async def test_pending_binary_results_have_a_fixed_cap(
     adapter, room = make_adapter(reference_payload())
 
     with pytest.raises(RuntimeError, match="binary tool result failed: too_many_pending"):
-        await adapter._build_tool_handler("client-1", "camera_snapshot")({})
+        await adapter._build_tool_handler("client-1", "camera.snapshot")({})
     assert room.handlers == {}
     assert adapter._binary_topics == set()

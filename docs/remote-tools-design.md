@@ -48,9 +48,12 @@ participant owner, and returns a targeted `agent:tool-registered`
 acknowledgement. The acknowledgement keeps the advertised name.
 
 The model-visible Hermes registry name is participant-scoped. It has the form
-`lk_<16 hex characters>_<advertised-name-prefix>`, where the digest covers the
-length-prefixed UTF-8 participant identity and the full advertised name. The
-readable suffix is truncated so the complete name is at most 64 characters.
+`lk_<16 hex characters>_<method-prefix>`, where the digest covers the
+length-prefixed UTF-8 participant identity and the exact full advertised
+method. Dots become underscores only in the readable registry suffix, which is
+truncated so the complete name is at most 64 characters. The digest therefore
+keeps `camera.snapshot` distinct from `camera_snapshot`; policy lookup and RPC
+routing preserve the exact advertised method.
 The adapter checks its owner and method maps plus the existing Hermes registry
 slot before mutation. A derived-name collision therefore fails closed instead
 of replacing another registration.
@@ -134,8 +137,10 @@ registration or reconnect.
 - Participant identities must be non-empty, have no leading/trailing
   whitespace or Unicode control, format, or surrogate characters, and fit
   within 128 UTF-8 bytes.
-- Tool names match `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$` exactly; the adapter does
-  not trim or normalize them.
+- Tool method names contain at most 64 ASCII characters and match
+  `[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*` exactly. Each dot
+  separates non-empty identifier segments. The adapter does not trim,
+  case-fold, Unicode-normalize, or otherwise alias them.
 - Input schemas must at least be objects with `type: object`.
 - Tool activation is explicit. Operators add `hermes-livekit-tools` to
   `platform_toolsets.livekit`.

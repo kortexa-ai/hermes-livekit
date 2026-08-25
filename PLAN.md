@@ -19,6 +19,9 @@ Operational state of the plugin and dependencies that don't show up in
   participant/tool pairs to Tier 1, expiring Tier 2 consent, or always-denied
   Tier 3. A fixed-field in-memory audit ring records lifecycle outcomes without
   tool data or arbitrary diagnostics.
+- Advertised method names use bounded case-sensitive dotted ASCII identifiers;
+  policy and RPC keep the exact method while Hermes registry suffixes remain
+  model-safe.
 - The former Hermes `/stop` hook dependency applied only to the removed custom
   pending-call table. Cancelling the calling coroutine now abandons the native
   RPC wait, so this plugin no longer needs session-reset hooks.

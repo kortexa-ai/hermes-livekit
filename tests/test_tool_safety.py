@@ -16,6 +16,7 @@ from hermes_livekit.tool_safety import (
     ToolAuditLog,
     ToolPolicy,
     ToolPolicyError,
+    valid_tool_name,
 )
 from tools.registry import registry
 
@@ -65,6 +66,36 @@ def test_closed_tiers_allow_tier1_valid_consent_and_deny_tier3() -> None:
 
     now[0] = 110.0
     assert policy.decide("actor", "notify").reason == "consent-expired"
+
+
+def test_canonical_dotted_method_grammar_is_exact_and_bounded() -> None:
+    assert valid_tool_name("camera.snapshot")
+    assert valid_tool_name("Camera.Snapshot_V2")
+    assert valid_tool_name("a" * 64)
+    for invalid in (
+        "",
+        ".camera",
+        "camera.",
+        "camera..snapshot",
+        "camera/snapshot",
+        "camera\\snapshot",
+        "camera snapshot",
+        "camera.\u0085snapshot",
+        "camera.\u200bsnapshot",
+        "cámara.snapshot",
+        "a" * 65,
+    ):
+        assert not valid_tool_name(invalid)
+
+
+def test_dotted_policy_lookup_preserves_case_and_does_not_alias_underscore() -> None:
+    policy = ToolPolicy.parse(
+        policy_json(entry("camera-client", "camera.snapshot", 1))
+    )
+
+    assert policy.decide("camera-client", "camera.snapshot").allowed
+    assert not policy.decide("camera-client", "Camera.snapshot").allowed
+    assert not policy.decide("camera-client", "camera_snapshot").allowed
 
 
 @pytest.mark.parametrize(

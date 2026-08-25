@@ -61,7 +61,7 @@ def adapter_with_client(
     return adapter
 
 
-def adapter_for_registration() -> LiveKitAdapter:
+def adapter_for_registration(tool_name: str = "desktop_notify") -> LiveKitAdapter:
     adapter = object.__new__(LiveKitAdapter)
     adapter.platform = SimpleNamespace(value="livekit")
     adapter._room = SimpleNamespace(
@@ -78,7 +78,7 @@ def adapter_for_registration() -> LiveKitAdapter:
                 "tools": [
                     {
                         "participant_identity": identity,
-                        "tool_name": "desktop_notify",
+                        "tool_name": tool_name,
                         "tier": 1,
                     }
                     for identity in ("client-a", "client-b")
@@ -131,6 +131,54 @@ async def test_same_advertised_name_gets_distinct_scoped_slots_and_routes_to_own
         adapter._tool_owners[name] for name in registered
     ]
     assert {call["method"] for call in participant.calls} == {"desktop_notify"}
+
+
+@pytest.mark.asyncio
+async def test_camera_snapshot_registers_routes_and_unregisters_for_two_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration("camera.snapshot")
+    registered: dict[str, dict[str, object]] = {}
+    removed: list[str] = []
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+    monkeypatch.setattr(
+        registry,
+        "register",
+        lambda **kwargs: registered.__setitem__(str(kwargs["name"]), kwargs),
+    )
+    monkeypatch.setattr(registry, "deregister", removed.append)
+    participant = FakeLocalParticipant()
+    adapter._room = SimpleNamespace(
+        local_participant=participant,
+        remote_participants={
+            "client-a": object(),
+            "client-b": object(),
+            "client-c": object(),
+        },
+    )
+    adapter._tool_call_timeout = 12.5
+    message = advertised_tool("camera.snapshot")
+
+    await adapter._register_client_tool(message, "client-a")
+    await adapter._register_client_tool(message, "client-b")
+    await adapter._register_client_tool(message, "client-c")
+    assert len(registered) == 2
+    assert adapter._publish_typed.await_args.args[0]["reason"] == "policy-denied"
+    assert all("." not in scoped_name for scoped_name in registered)
+
+    for scoped_name, registration in registered.items():
+        await registration["handler"]({"request": scoped_name})
+    assert {call["destination_identity"] for call in participant.calls} == {
+        "client-a",
+        "client-b",
+    }
+    assert {call["method"] for call in participant.calls} == {"camera.snapshot"}
+
+    client_a_slot = next(iter(adapter._client_tools["client-a"]))
+    client_b_slot = next(iter(adapter._client_tools["client-b"]))
+    await adapter._unregister_client_tool(message, "client-a")
+    assert removed == [client_a_slot]
+    assert client_b_slot in adapter._tool_owners
 
 
 @pytest.mark.asyncio
@@ -287,7 +335,23 @@ async def test_invalid_or_ambiguous_owner_identity_never_mutates_registry(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", [" desktop_notify", "desktop_notify ", "desktop_notify\n", 7])
+@pytest.mark.parametrize(
+    "name",
+    [
+        " desktop_notify",
+        "desktop_notify ",
+        "desktop_notify\n",
+        ".camera",
+        "camera.",
+        "camera..snapshot",
+        "camera/snapshot",
+        "camera\\snapshot",
+        "camera.\u200bsnapshot",
+        "cámara.snapshot",
+        "a" * 65,
+        7,
+    ],
+)
 async def test_invalid_or_ambiguous_tool_name_never_mutates_registry(
     name: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -309,6 +373,10 @@ def test_scoped_name_is_deterministic_bounded_and_pair_specific() -> None:
     assert len(first) == 64
     assert first != LiveKitAdapter._scoped_tool_name("participant-b", longest_name)
     assert first != LiveKitAdapter._scoped_tool_name("participant-a", "a" * 63 + "b")
+    dotted = LiveKitAdapter._scoped_tool_name("participant-a", "camera.snapshot")
+    underscored = LiveKitAdapter._scoped_tool_name("participant-a", "camera_snapshot")
+    assert "." not in dotted
+    assert dotted != underscored
 
 
 @pytest.mark.asyncio
