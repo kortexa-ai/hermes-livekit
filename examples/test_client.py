@@ -7,8 +7,10 @@ on the voice/ASR path.
 
 Capabilities:
   - Joins a LiveKit room with a self-minted token
-  - Registers a single tool, ``desktop_notify(title, body)``, that
+  - Registers ``desktop_notify(title, body)``, which
     pops a macOS notification via ``osascript`` through LiveKit RPC
+  - Registers ``camera.snapshot()``, which returns a deterministic 1x1 PNG
+    fixture through the bounded LiveKit byte-stream result protocol
   - Logs every inbound data-channel message (any topic)
   - Reads stdin: each typed line is sent as a ``client:message`` user
     prompt to the agent (same path the voice transcript takes)
@@ -25,15 +27,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
 from livekit import api, rtc
+
+from hermes_livekit.tool_result_protocol import MAX_RESULT_BYTES, TOPIC_PREFIX
 
 LOG = logging.getLogger("test-client")
 
@@ -49,6 +55,43 @@ TOOL_SCHEMA: dict[str, Any] = {
     },
     "required": ["title", "body"],
 }
+
+CAMERA_TOOL_NAME = "camera.snapshot"
+CAMERA_TOOL_DESCRIPTION = "Return the example client's deterministic PNG snapshot."
+CAMERA_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+CAMERA_MIME_TYPE = "image/png"
+CAMERA_PENDING_LIMIT = 8
+CAMERA_READY_TIMEOUT_SEC = 120.0
+CAMERA_TRANSFER_TIMEOUT_SEC = 120.0
+CAMERA_CLOSE_TIMEOUT_SEC = 5.0
+CAMERA_DISCONNECT_TIMEOUT_SEC = 5.0
+# A fixed 1x1 PNG keeps this example deterministic and camera-free. Replace the
+# source bytes in a real client; do not change the surrounding wire contract.
+CAMERA_FIXTURE_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
+class PendingSnapshot:
+    def __init__(
+        self,
+        *,
+        stream_id: str,
+        topic: str,
+        agent_identity: str,
+        payload: bytearray,
+    ) -> None:
+        self.stream_id = stream_id
+        self.topic = topic
+        self.agent_identity = agent_identity
+        self.payload = payload
+        self.send_task: Optional[asyncio.Task[None]] = None
+        self.expiry_task: Optional[asyncio.Task[None]] = None
+        self.close_task: Optional[asyncio.Task[None]] = None
 
 
 def load_env_fallback() -> None:
@@ -120,6 +163,8 @@ class TestClient:
         self._reply_done = asyncio.Event()   # set when agent:agent-transcript final:true arrives
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._registered: bool = False
+        self._pending_snapshots: dict[str, PendingSnapshot] = {}
+        self._snapshot_bytes = CAMERA_FIXTURE_BYTES
 
     async def connect(self) -> None:
         url, token = mint_token(self.room_name, self.identity)
@@ -164,6 +209,19 @@ class TestClient:
             topic=HERMES_CONTROL_TOPIC,
         )
         LOG.info("sent client:tool-register for %s", TOOL_NAME)
+        self.room.local_participant.register_rpc_method(
+            CAMERA_TOOL_NAME, self._handle_camera_snapshot
+        )
+        await self.publish(
+            {
+                "type": "client:tool-register",
+                "name": CAMERA_TOOL_NAME,
+                "description": CAMERA_TOOL_DESCRIPTION,
+                "input_schema": CAMERA_TOOL_SCHEMA,
+            },
+            topic=HERMES_CONTROL_TOPIC,
+        )
+        LOG.info("sent client:tool-register for %s", CAMERA_TOOL_NAME)
 
     def _agent_in_room(self) -> bool:
         if self.room is None:
@@ -188,12 +246,27 @@ class TestClient:
                 {"type": "client:tool-unregister", "name": TOOL_NAME},
                 topic=HERMES_CONTROL_TOPIC,
             )
+            await self.publish(
+                {"type": "client:tool-unregister", "name": CAMERA_TOOL_NAME},
+                topic=HERMES_CONTROL_TOPIC,
+            )
         except Exception as exc:
             LOG.debug("tool unregister failed: %s", exc)
         finally:
+            pending_tasks = [
+                task
+                for pending in self._pending_snapshots.values()
+                for task in (pending.send_task, pending.expiry_task)
+                if task is not None
+            ]
             if self.room is not None and self._registered:
                 self.room.local_participant.unregister_rpc_method(TOOL_NAME)
+                self.room.local_participant.unregister_rpc_method(CAMERA_TOOL_NAME)
             self._registered = False
+            for stream_id in list(self._pending_snapshots):
+                self._cleanup_snapshot(stream_id)
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
 
     def _on_data(self, packet: rtc.DataPacket) -> None:
         """Sync handler (livekit-rtc fires synchronously). Decode and dispatch."""
@@ -209,6 +282,11 @@ class TestClient:
         topic = packet.topic or "(default)"
         if isinstance(msg, dict):
             msg_type = msg.get("type")
+            if msg_type in {
+                "agent:tool-result-stream-ready",
+                "agent:tool-result-stream-cancel",
+            }:
+                self._handle_snapshot_control(msg, packet)
             summary = json.dumps(msg)
             if len(summary) > 500:
                 summary = summary[:500] + "…"
@@ -222,6 +300,183 @@ class TestClient:
                     self._reply_done.set()
         else:
             LOG.info("inbound [%s] non-dict payload: %r", topic, msg)
+
+    def _cleanup_snapshot(self, stream_id: str) -> None:
+        pending = self._pending_snapshots.pop(stream_id, None)
+        if pending is None:
+            return
+        pending.payload.clear()
+        current = asyncio.current_task()
+        for task in (pending.send_task, pending.expiry_task):
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+
+    async def _expire_snapshot(self, stream_id: str) -> None:
+        try:
+            await asyncio.sleep(CAMERA_READY_TIMEOUT_SEC)
+            self._cleanup_snapshot(stream_id)
+        except asyncio.CancelledError:
+            return
+
+    def _handle_snapshot_control(
+        self, msg: dict[str, Any], packet: rtc.DataPacket
+    ) -> None:
+        if packet.topic != HERMES_CONTROL_TOPIC or set(msg) != {
+            "type",
+            "stream_id",
+            "topic",
+        }:
+            return
+        stream_id = msg.get("stream_id")
+        if not isinstance(stream_id, str):
+            return
+        pending = self._pending_snapshots.get(stream_id)
+        if pending is None or msg.get("topic") != pending.topic:
+            return
+        participant = getattr(packet, "participant", None)
+        if participant is None or participant.identity != pending.agent_identity:
+            return
+        msg_type = msg.get("type")
+        if msg_type == "agent:tool-result-stream-cancel":
+            self._cleanup_snapshot(stream_id)
+            return
+        if msg_type != "agent:tool-result-stream-ready" or pending.send_task is not None:
+            return
+        if self._loop is None:
+            self._cleanup_snapshot(stream_id)
+            return
+        if pending.expiry_task is not None and not pending.expiry_task.done():
+            pending.expiry_task.cancel()
+        pending.send_task = self._loop.create_task(self._send_snapshot(pending))
+
+    @staticmethod
+    def _observe_detached_task(task: asyncio.Task[Any]) -> None:
+        def consume_result(completed: asyncio.Task[Any]) -> None:
+            try:
+                completed.exception()
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        task.add_done_callback(consume_result)
+
+    async def _disconnect_after_close_timeout(self) -> None:
+        if self.room is None:
+            return
+        task = asyncio.create_task(self.room.disconnect())
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=CAMERA_DISCONNECT_TIMEOUT_SEC
+            )
+        except asyncio.TimeoutError:
+            self._observe_detached_task(task)
+        except Exception:
+            pass
+
+    async def _close_snapshot_writer_once(
+        self, pending: PendingSnapshot, writer: Any, reason: str
+    ) -> bool:
+        if pending.close_task is None:
+            pending.close_task = asyncio.create_task(writer.aclose(reason=reason))
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(pending.close_task), timeout=CAMERA_CLOSE_TIMEOUT_SEC
+            )
+            return True
+        except asyncio.TimeoutError:
+            self._observe_detached_task(pending.close_task)
+            await self._disconnect_after_close_timeout()
+            return False
+        except Exception:
+            return False
+
+    async def _send_snapshot(self, pending: PendingSnapshot) -> None:
+        writer = None
+        try:
+            async with asyncio.timeout(CAMERA_TRANSFER_TIMEOUT_SEC):
+                if self.room is None:
+                    return
+                writer = await self.room.local_participant.stream_bytes(
+                    "camera.snapshot.png",
+                    total_size=len(pending.payload),
+                    mime_type=CAMERA_MIME_TYPE,
+                    stream_id=pending.stream_id,
+                    destination_identities=[pending.agent_identity],
+                    topic=pending.topic,
+                )
+                await writer.write(bytes(pending.payload))
+                await self._close_snapshot_writer_once(pending, writer, "")
+        except asyncio.CancelledError:
+            if writer is not None:
+                await self._close_snapshot_writer_once(
+                    pending, writer, "transfer_cancelled"
+                )
+            raise
+        except asyncio.TimeoutError:
+            if writer is not None:
+                await self._close_snapshot_writer_once(
+                    pending, writer, "transfer_timeout"
+                )
+        except Exception:
+            if writer is not None:
+                await self._close_snapshot_writer_once(
+                    pending, writer, "transfer_failed"
+                )
+        finally:
+            self._cleanup_snapshot(pending.stream_id)
+
+    async def _handle_camera_snapshot(self, invocation: rtc.RpcInvocationData) -> str:
+        try:
+            args = json.loads(invocation.payload)
+        except json.JSONDecodeError as exc:
+            raise rtc.RpcError(
+                rtc.RpcError.ErrorCode.APPLICATION_ERROR,
+                "invalid camera snapshot request",
+            ) from exc
+        source = self._snapshot_bytes
+        caller_identity = invocation.caller_identity
+        if (
+            not isinstance(args, dict)
+            or args
+            or not isinstance(source, (bytes, bytearray))
+            or not source
+            or len(source) > MAX_RESULT_BYTES
+            or not isinstance(caller_identity, str)
+            or not caller_identity
+            or len(caller_identity) > 128
+            or len(self._pending_snapshots) >= CAMERA_PENDING_LIMIT
+        ):
+            raise rtc.RpcError(
+                rtc.RpcError.ErrorCode.APPLICATION_ERROR,
+                "camera snapshot unavailable",
+            )
+        payload = bytes(source)
+        stream_id = uuid.uuid4().hex
+        if stream_id in self._pending_snapshots:
+            raise rtc.RpcError(
+                rtc.RpcError.ErrorCode.APPLICATION_ERROR,
+                "camera snapshot unavailable",
+            )
+        topic = TOPIC_PREFIX + stream_id
+        pending = PendingSnapshot(
+            stream_id=stream_id,
+            topic=topic,
+            agent_identity=caller_identity,
+            payload=bytearray(payload),
+        )
+        self._pending_snapshots[stream_id] = pending
+        pending.expiry_task = asyncio.create_task(self._expire_snapshot(stream_id))
+        return json.dumps(
+            {
+                "type": "livekit-byte-stream",
+                "version": 1,
+                "owner_identity": self.identity,
+                "stream_id": stream_id,
+                "topic": topic,
+                "mime_type": CAMERA_MIME_TYPE,
+                "expected_size": len(payload),
+                "text_summary": "Example camera snapshot.",
+            }
+        )
 
     async def _handle_tool_call(self, invocation: rtc.RpcInvocationData) -> str:
         try:

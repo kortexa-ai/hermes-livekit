@@ -2,9 +2,10 @@
 
 ## Status
 
-Small JSON-shaped remote tools are implemented. Clients advertise tools over
-the existing `hermes-control` data topic and serve calls through LiveKit native
-RPC. Large or binary results remain future work.
+Small JSON-shaped and bounded binary-result remote tools are implemented.
+Clients advertise tools over the existing `hermes-control` data topic and
+serve calls through LiveKit native RPC; binary payloads use targeted LiveKit
+byte streams after the RPC returns their reference.
 
 ## Goal
 
@@ -222,6 +223,33 @@ tool rediscovery after rejoin. Caller cancellation clears its result buffer and
 waiter immediately, sends the targeted cancel message, and applies the bounded
 drain behavior above to any accepted reader. Diagnostics expose fixed protocol
 codes, not participant-supplied fields or payload bytes.
+
+### `camera.snapshot` example
+
+`examples/test_client.py` registers `camera.snapshot` through the same discovery
+and RPC path as `desktop_notify`. Its RPC handler accepts an empty object,
+reserves at most eight pending snapshots, and returns the version 1 reference.
+The example source is a fixed 1x1 PNG so tests need no camera.
+
+The client binds each pending snapshot to `RpcInvocationData.caller_identity`.
+Only an exact ready or cancel message on `hermes-control` from that participant
+can act on it. On ready, `stream_bytes` declares the exact PNG size, MIME, ID,
+and topic and sets `destination_identities` to only that caller. Success closes
+the writer trailer. Cancellation closes it with `transfer_cancelled`. Oversize,
+empty, malformed, and over-cap requests fail before pending or stream state is
+created. A reference not claimed within 120 seconds expires, and every terminal
+path clears its fixture bytes and tasks.
+Ready publication cancels the reference-expiry timer; the stream writer then
+has its own fixed 120-second deadline and closes with `transfer_timeout` if it
+does not finish. Writer close is started at most once. If cancellation or the
+deadline arrives while the pinned SDK is sending its trailer, the client
+shields and awaits that same close task; it never retries `aclose()` after the
+SDK has marked the writer closed. The first close reason is immutable: if the
+normal trailer was already in flight, a later cancel or timeout does not rewrite
+it. Close has a separate fixed 5-second deadline. If the trailer call still has
+not returned, the example detaches and observes that single task, clears the
+pending slot and payload, and performs a bounded local room disconnect so
+unregister and shutdown cannot wait forever.
 
 ## Deferred
 

@@ -159,6 +159,10 @@ only to the owning participant via `destination_identities`):
 
 - `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?, detail?}`
 - `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
+- `agent:tool-result-stream-ready` — the targeted binary-result receiver is
+  installed; `{stream_id, topic}`
+- `agent:tool-result-stream-cancel` — stop and close that targeted binary
+  stream; `{stream_id, topic}`
 
 ### Inbound (client → agent), topic `hermes-control`
 
@@ -207,11 +211,18 @@ Remote-tool messages (0.3.0+):
 
 Before advertising a tool, the client registers a LiveKit RPC method with the
 same name. The agent calls that method with the tool arguments encoded as a
-JSON object. The method returns its JSON-shaped result as a JSON string, or
-raises `RpcError`. LiveKit owns request correlation, response timeout, and
-error transport; cancelling the caller abandons the RPC wait. These calls do
-not use custom `agent:tool-call` or `client:tool-result` data messages. See
-`examples/test_client.py` for a working Python client.
+JSON object. The method returns either a JSON-shaped result or the bounded
+byte-stream reference documented below, encoded as a JSON string, or raises
+`RpcError`. LiveKit owns request correlation, response timeout, and error
+transport. These calls do not use custom `agent:tool-call` or
+`client:tool-result` data messages.
+
+`examples/test_client.py` registers both `desktop_notify` and
+`camera.snapshot`. The camera tool deliberately returns a built-in 1x1 PNG, so
+the complete reference → targeted ready → byte stream → cleanup contract can be
+tested without camera hardware. A real client can replace those fixture bytes
+after applying the same 12 MiB bound. The stream header, chunks, and reference
+target only the agent participant whose RPC invocation requested the snapshot.
 
 For tools to be visible to the LLM, add `hermes-livekit-tools` to the
 livekit toolset list in `~/.hermes/config.yaml`
@@ -219,7 +230,7 @@ livekit toolset list in `~/.hermes/config.yaml`
 toolset.
 
 Tools are removed automatically when the registering participant disconnects.
-Full design and roadmap (large/binary results and multi-client coexistence) in
+Full JSON and bounded-binary design (plus deferred multi-client coexistence) in
 [`docs/remote-tools-design.md`](docs/remote-tools-design.md).
 
 Unknown `type` values are ignored silently — keeps the topic compatible

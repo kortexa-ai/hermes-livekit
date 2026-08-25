@@ -10,16 +10,17 @@ Operational state of the plugin and dependencies that don't show up in
 - Client tools use JSON `client:tool-register` / `client:tool-unregister`
   messages for discovery and LiveKit native RPC for invocation. The SDK owns
   correlation, response timeouts, and error transport.
-- Remote tools remain single-client, trust-on-connect, and limited to small
-  JSON-shaped arguments and results. `examples/test_client.py` implements the
-  complete client contract.
+- Remote tools remain single-client and trust-on-connect. Results can be small
+  JSON values or bounded byte streams. `examples/test_client.py` implements the
+  complete contract with `desktop_notify` and a deterministic
+  `camera.snapshot` PNG fixture.
 - The former Hermes `/stop` hook dependency applied only to the removed custom
   pending-call table. Cancelling the calling coroutine now abandons the native
   RPC wait, so this plugin no longer needs session-reset hooks.
 
 ## Next phases
 
-### Next minor release — Phase 1.5: large / binary tool results
+### Phase 1.5: large / binary tool results
 
 Adds `camera.snapshot` (and future tools returning binary payloads) via
 LiveKit byte streams. Mechanism confirmed: `stream_bytes` /
@@ -30,9 +31,10 @@ timeout limits, cancellation rules, Hermes image mapping, and non-image
 fallback are defined in `docs/remote-tools-design.md` and the executable
 `tool_result_protocol` fixtures. The adapter implements the bounded receiver,
 including exact owner/header checks, pending and byte caps, cancellation drain,
-and room-generation cleanup. The camera example remains a separate phase. RPC
-still carries invocation and the small stream reference; the byte stream
-carries the payload.
+and room-generation cleanup. The example client registers `camera.snapshot`,
+targets the invoking agent, and covers the ready/cancel/cleanup lifecycle with
+a camera-free PNG fixture. RPC still carries invocation and the small stream
+reference; the byte stream carries the payload.
 
 ## Deferred indefinitely
 
