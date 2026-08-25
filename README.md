@@ -230,7 +230,7 @@ livekit toolset list in `~/.hermes/config.yaml`
 toolset.
 
 Tools are removed automatically when the registering participant disconnects.
-Full JSON and bounded-binary design (plus deferred multi-client coexistence) in
+Full JSON, bounded-binary, and participant-scoped multi-client design in
 [`docs/remote-tools-design.md`](docs/remote-tools-design.md).
 
 Unknown `type` values are ignored silently — keeps the topic compatible

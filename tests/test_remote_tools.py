@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from hermes_livekit.adapter import LiveKitAdapter
+from tools.registry import registry
 
 
 _EXAMPLE_PATH = Path(__file__).parents[1] / "examples" / "test_client.py"
@@ -43,6 +44,241 @@ def adapter_with_client(
     )
     adapter._tool_call_timeout = 12.5
     return adapter
+
+
+def adapter_for_registration() -> LiveKitAdapter:
+    adapter = object.__new__(LiveKitAdapter)
+    adapter.platform = SimpleNamespace(value="livekit")
+    adapter._room = SimpleNamespace(
+        remote_participants={"client-a": object(), "client-b": object()}
+    )
+    adapter._room_generation = 1
+    adapter._client_tools = {}
+    adapter._tool_owners = {}
+    adapter._tool_methods = {}
+    adapter._publish_typed = AsyncMock()
+    return adapter
+
+
+def advertised_tool(name: str = "desktop_notify") -> dict[str, object]:
+    return {
+        "name": name,
+        "description": "Show a notification.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_same_advertised_name_gets_distinct_scoped_slots_and_routes_to_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    registered: dict[str, dict[str, object]] = {}
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+    monkeypatch.setattr(
+        registry,
+        "register",
+        lambda **kwargs: registered.__setitem__(str(kwargs["name"]), kwargs),
+    )
+    participant = FakeLocalParticipant()
+    adapter._room = SimpleNamespace(
+        local_participant=participant,
+        remote_participants={"client-a": object(), "client-b": object()},
+    )
+    adapter._tool_call_timeout = 12.5
+
+    await adapter._register_client_tool(advertised_tool(), "client-a")
+    await adapter._register_client_tool(advertised_tool(), "client-b")
+
+    assert len(registered) == 2
+    assert set(adapter._tool_owners.values()) == {"client-a", "client-b"}
+    for scoped_name, registration in registered.items():
+        assert len(scoped_name) <= 64
+        assert registration["schema"]["name"] == scoped_name
+        owner = adapter._tool_owners[scoped_name]
+        await registration["handler"]({"owner": owner})
+    assert [call["destination_identity"] for call in participant.calls] == [
+        adapter._tool_owners[name] for name in registered
+    ]
+    assert {call["method"] for call in participant.calls} == {"desktop_notify"}
+
+
+@pytest.mark.asyncio
+async def test_unregister_and_disconnect_are_scoped_to_exact_participant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    registered: dict[str, dict[str, object]] = {}
+    removed: list[str] = []
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+    monkeypatch.setattr(
+        registry,
+        "register",
+        lambda **kwargs: registered.__setitem__(str(kwargs["name"]), kwargs),
+    )
+    monkeypatch.setattr(registry, "deregister", removed.append)
+    await adapter._register_client_tool(advertised_tool(), "client-a")
+    await adapter._register_client_tool(advertised_tool(), "client-b")
+    client_a_slot = next(iter(adapter._client_tools["client-a"]))
+    client_b_slot = next(iter(adapter._client_tools["client-b"]))
+
+    await adapter._unregister_client_tool(advertised_tool(), "client-a")
+
+    assert removed == [client_a_slot]
+    assert client_b_slot in adapter._tool_owners
+    adapter._cleanup_client_tools("client-b")
+    assert removed == [client_a_slot, client_b_slot]
+    assert adapter._client_tools == {}
+    assert adapter._tool_owners == {}
+    assert adapter._tool_methods == {}
+
+
+@pytest.mark.asyncio
+async def test_reconnect_reregisters_only_the_same_owner_method_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    registered: dict[str, dict[str, object]] = {}
+    calls: list[str] = []
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+
+    def register(**kwargs: object) -> None:
+        name = str(kwargs["name"])
+        calls.append(name)
+        registered[name] = kwargs
+
+    monkeypatch.setattr(registry, "register", register)
+    monkeypatch.setattr(registry, "deregister", lambda name: registered.pop(name))
+    await adapter._register_client_tool(advertised_tool(), "client-a")
+    await adapter._register_client_tool(advertised_tool(), "client-a")
+    adapter._cleanup_client_tools("client-a")
+    await adapter._register_client_tool(advertised_tool(), "client-a")
+
+    assert len(set(calls)) == 1
+    assert len(calls) == 3
+    assert adapter._client_tools == {"client-a": {calls[0]}}
+
+
+@pytest.mark.asyncio
+async def test_scoped_name_collision_fails_before_registry_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    adapter._tool_owners = {"lk_collision": "client-a"}
+    adapter._tool_methods = {"lk_collision": "desktop_notify"}
+    adapter._client_tools = {"client-a": {"lk_collision"}}
+    register = AsyncMock()
+    monkeypatch.setattr(adapter, "_scoped_tool_name", lambda identity, name: "lk_collision")
+    monkeypatch.setattr(registry, "get_entry", lambda name: object())
+    monkeypatch.setattr(registry, "register", register)
+
+    await adapter._register_client_tool(advertised_tool(), "client-b")
+
+    register.assert_not_called()
+    assert adapter._tool_owners == {"lk_collision": "client-a"}
+    assert adapter._publish_typed.await_args.args[0]["reason"] == "registry-collision"
+
+
+def tool_packet(identity: str = "client-a") -> SimpleNamespace:
+    return SimpleNamespace(
+        topic=LiveKitAdapter.DATA_CHANNEL_CONTROL_TOPIC,
+        participant=SimpleNamespace(identity=identity),
+        data=json.dumps({"type": "client:tool-register", **advertised_tool()}).encode(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_queued_registration_after_disconnect_cannot_install_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    scheduled: list[object] = []
+    register = AsyncMock()
+    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
+    monkeypatch.setattr(registry, "register", register)
+
+    adapter._on_data_received(tool_packet())
+    adapter._room.remote_participants.clear()
+    await scheduled.pop()
+
+    register.assert_not_called()
+    assert adapter._client_tools == {}
+
+
+@pytest.mark.asyncio
+async def test_old_generation_registration_cannot_mutate_replacement_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    scheduled: list[object] = []
+    registered: dict[str, dict[str, object]] = {}
+    monkeypatch.setattr(asyncio, "create_task", lambda coroutine: scheduled.append(coroutine))
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+    monkeypatch.setattr(
+        registry,
+        "register",
+        lambda **kwargs: registered.__setitem__(str(kwargs["name"]), kwargs),
+    )
+
+    old_room = adapter._room
+    old_generation = adapter._room_generation
+    adapter._room = SimpleNamespace(remote_participants={"client-a": object()})
+    adapter._room_generation = 2
+    adapter._on_data_received(
+        tool_packet(),
+        receiving_room=old_room,
+        receiving_generation=old_generation,
+    )
+    await scheduled.pop()
+    assert registered == {}
+
+    adapter._on_data_received(tool_packet())
+    await scheduled.pop()
+    assert len(registered) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity",
+    [" client", "client ", "client\n", "client\u0085", "client\u200b", "\ud800", "", "é" * 65],
+)
+async def test_invalid_or_ambiguous_owner_identity_never_mutates_registry(
+    identity: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = adapter_for_registration()
+    register = AsyncMock()
+    monkeypatch.setattr(registry, "register", register)
+
+    await adapter._register_client_tool(advertised_tool(), identity)
+
+    register.assert_not_called()
+    assert not LiveKitAdapter._valid_tool_owner_identity(identity)
+    assert adapter._client_tools == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", [" desktop_notify", "desktop_notify ", "desktop_notify\n", 7])
+async def test_invalid_or_ambiguous_tool_name_never_mutates_registry(
+    name: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = adapter_for_registration()
+    register = AsyncMock()
+    monkeypatch.setattr(registry, "register", register)
+
+    await adapter._register_client_tool(advertised_tool(name), "client-a")
+
+    register.assert_not_called()
+    assert adapter._client_tools == {}
+
+
+def test_scoped_name_is_deterministic_bounded_and_pair_specific() -> None:
+    longest_name = "a" * 64
+    first = LiveKitAdapter._scoped_tool_name("participant-a", longest_name)
+
+    assert first == LiveKitAdapter._scoped_tool_name("participant-a", longest_name)
+    assert len(first) == 64
+    assert first != LiveKitAdapter._scoped_tool_name("participant-b", longest_name)
+    assert first != LiveKitAdapter._scoped_tool_name("participant-a", "a" * 63 + "b")
 
 
 @pytest.mark.asyncio

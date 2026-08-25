@@ -42,9 +42,24 @@ The client first registers an RPC method, then sends:
 }
 ```
 
-The adapter validates the name and object schema, registers a late-bound Hermes
-tool under `hermes-livekit-tools`, records the participant owner, and returns a
-targeted `agent:tool-registered` acknowledgement.
+The adapter validates the participant identity, name, and object schema. It
+registers a late-bound Hermes tool under `hermes-livekit-tools`, records the
+participant owner, and returns a targeted `agent:tool-registered`
+acknowledgement. The acknowledgement keeps the advertised name.
+
+The model-visible Hermes registry name is participant-scoped. It has the form
+`lk_<16 hex characters>_<advertised-name-prefix>`, where the digest covers the
+length-prefixed UTF-8 participant identity and the full advertised name. The
+readable suffix is truncated so the complete name is at most 64 characters.
+The adapter checks its owner and method maps plus the existing Hermes registry
+slot before mutation. A derived-name collision therefore fails closed instead
+of replacing another registration.
+
+Registration and unregistration tasks retain the room object and room
+generation that received the control packet. Before registry mutation, the
+adapter also requires that exact room to remain current and the sender to
+remain present. A queued packet from a disconnected participant or replaced
+room is ignored.
 
 To remove the tool, the client sends:
 
@@ -83,7 +98,7 @@ The default response timeout is 30 seconds. Operators can set
 
 | Event | Result |
 |---|---|
-| `client:tool-register` | Validate, register the Hermes tool, acknowledge |
+| `client:tool-register` | Validate, register a participant-scoped Hermes tool, acknowledge |
 | Hermes invokes the tool | Target the owner with native `perform_rpc` |
 | `client:tool-unregister` | Verify ownership, deregister, acknowledge |
 | Owner disconnects | Deregister all tools owned by that participant |
@@ -93,9 +108,13 @@ The default response timeout is 30 seconds. Operators can set
 ## Safety and scope
 
 - Trust on connect: any authorized room participant can offer a tool.
-- Single-client assumption: collisions between different clients are not yet
-  specified.
-- Tool names match `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$`.
+- Different participants can advertise the same RPC method name. Each gets a
+  distinct model-visible registry name and only that participant's handler.
+- Participant identities must be non-empty, have no leading/trailing
+  whitespace or Unicode control, format, or surrogate characters, and fit
+  within 128 UTF-8 bytes.
+- Tool names match `^[a-zA-Z_][a-zA-Z0-9_]{0,63}$` exactly; the adapter does
+  not trim or normalize them.
 - Input schemas must at least be objects with `type: object`.
 - Tool activation is explicit. Operators add `hermes-livekit-tools` to
   `platform_toolsets.livekit`.
@@ -253,7 +272,6 @@ unregister and shutdown cannot wait forever.
 
 ## Deferred
 
-- Multi-client naming and collision behavior.
 - Per-participant allowlists and explicit consent.
 - Audit-log inspection.
 - Full JSON Schema validation.

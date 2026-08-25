@@ -13,6 +13,7 @@ Requires:
 """
 
 import asyncio
+import hashlib
 import io
 import logging
 import math
@@ -22,6 +23,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import unicodedata
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -146,6 +148,8 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 # docs/remote-tools-design.md. v0.3.0 ships protocol + desktop_notify-style
 # small JSON results and bounded byte-stream results.
 TOOL_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+MAX_PARTICIPANT_IDENTITY_BYTES = 128
+SCOPED_TOOL_PREFIX = "lk_"
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
 TOOLSET_NAME = "hermes-livekit-tools"
 MAX_PENDING_BINARY_RESULTS = 8
@@ -255,11 +259,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._pending_captures: list[tuple[str, str]] = []
 
         # Remote tools registered by connected clients over the data channel.
-        # See docs/remote-tools-design.md. Single-client v1: we track per
-        # identity so participant-disconnect cleanup is uniform, but only one
-        # client is expected to register at a time.
-        self._client_tools: Dict[str, set[str]] = {}        # identity -> tool names
-        self._tool_owners: Dict[str, str] = {}              # tool name -> owner identity
+        # Registry names are participant-scoped; RPC method names remain the
+        # names advertised by each client.
+        self._client_tools: Dict[str, set[str]] = {}  # identity -> registry names
+        self._tool_owners: Dict[str, str] = {}  # registry name -> owner identity
+        self._tool_methods: Dict[str, str] = {}  # registry name -> RPC method
 
         # Binary RPC results use one reserved LiveKit topic per pending call.
         # State is also initialized lazily for contract tests that construct the
@@ -479,7 +483,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room.on("disconnected", self._on_disconnected)
             # Inbound data-channel: clients send control messages (capture-frame,
             # typed text, runtime control hooks) on the hermes-control topic.
-            self._room.on("data_received", self._on_data_received)
+            receiving_room = self._room
+            receiving_generation = self._room_generation
+            self._room.on(
+                "data_received",
+                lambda packet: self._on_data_received(
+                    packet,
+                    receiving_room=receiving_room,
+                    receiving_generation=receiving_generation,
+                ),
+            )
 
             # Create access token
             import json as _json
@@ -1079,7 +1092,13 @@ class LiveKitAdapter(BasePlatformAdapter):
     # untopic-ed agent:* lifecycle events) are unchanged.
     DATA_CHANNEL_CONTROL_TOPIC = "hermes-control"
 
-    def _on_data_received(self, packet) -> None:
+    def _on_data_received(
+        self,
+        packet,
+        *,
+        receiving_room: Any = None,
+        receiving_generation: Optional[int] = None,
+    ) -> None:
         """Route inbound data-channel packets.
 
         Called synchronously by the SDK's event thread; heavy work is
@@ -1096,6 +1115,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         participant_identity = (
             getattr(participant, "identity", "") if participant is not None else ""
         )
+        if receiving_room is None:
+            receiving_room = self._room
+        if receiving_generation is None:
+            receiving_generation = self._room_generation
 
         try:
             import json as _json
@@ -1119,8 +1142,18 @@ class LiveKitAdapter(BasePlatformAdapter):
             "client:capture-frame": lambda: self._capture_next_frame(participant_identity),
             "client:message": lambda: self._handle_client_message(msg, participant_identity),
             "client:control": lambda: self._handle_client_control(msg, participant_identity),
-            "client:tool-register": lambda: self._register_client_tool(msg, participant_identity),
-            "client:tool-unregister": lambda: self._unregister_client_tool(msg, participant_identity),
+            "client:tool-register": lambda: self._register_client_tool(
+                msg,
+                participant_identity,
+                receiving_room=receiving_room,
+                receiving_generation=receiving_generation,
+            ),
+            "client:tool-unregister": lambda: self._unregister_client_tool(
+                msg,
+                participant_identity,
+                receiving_room=receiving_room,
+                receiving_generation=receiving_generation,
+            ),
         }
         handler = handlers.get(msg_type)
         if handler is None:
@@ -1677,15 +1710,41 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._schedule_binary_terminal_cleanup(transfer, send_cancel=False)
             raise
 
-    async def _register_client_tool(self, msg: Dict[str, Any], identity: str) -> None:
-        name = (msg.get("name") or "").strip()
+    async def _register_client_tool(
+        self,
+        msg: Dict[str, Any],
+        identity: str,
+        *,
+        receiving_room: Any = None,
+        receiving_generation: Optional[int] = None,
+    ) -> None:
+        if receiving_room is None:
+            receiving_room = self._room
+        if receiving_generation is None:
+            receiving_generation = self._room_generation
+        if not self._tool_message_is_current(
+            identity, receiving_room, receiving_generation
+        ):
+            return
+        raw_name = msg.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
         description = msg.get("description") or ""
         input_schema = msg.get("input_schema")
 
-        if not identity:
+        if not self._valid_tool_owner_identity(identity):
+            if identity:
+                await self._publish_typed(
+                    {
+                        "type": "agent:tool-registered",
+                        "name": name,
+                        "success": False,
+                        "reason": "identity-invalid",
+                    },
+                    identity=identity,
+                )
             return
 
-        if not TOOL_NAME_RE.match(name):
+        if TOOL_NAME_RE.fullmatch(name) is None:
             await self._publish_typed(
                 {"type": "agent:tool-registered", "name": name, "success": False, "reason": "name-invalid"},
                 identity=identity,
@@ -1709,21 +1768,48 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
+        self._ensure_client_tool_maps()
+        registry_name = self._scoped_tool_name(identity, name)
+        owner = self._tool_owners.get(registry_name)
+        method = self._tool_methods.get(registry_name)
+        if owner is not None and (owner, method) != (identity, name):
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "registry-collision",
+                },
+                identity=identity,
+            )
+            return
+        existing = registry.get_entry(registry_name)
+        if existing is not None and owner is None:
+            await self._publish_typed(
+                {
+                    "type": "agent:tool-registered",
+                    "name": name,
+                    "success": False,
+                    "reason": "registry-collision",
+                },
+                identity=identity,
+            )
+            return
+
         handler = self._build_tool_handler(identity, name)
         # The registry's `schema` is the OpenAI function-envelope shape
         # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
         # the client-supplied input_schema accordingly.
         registry_schema = {
-            "name": name,
+            "name": registry_name,
             "description": description,
             "parameters": input_schema,
         }
         try:
-            # override=True so a reconnecting client can re-register without
-            # an explicit unregister round-trip. Single-client v1 — collisions
-            # between distinct clients are undefined per design doc.
+            # override=True permits the exact owner/method pair to re-register
+            # after reconnect. Collision checks above protect every other slot.
             registry.register(
-                name=name,
+                name=registry_name,
                 toolset=TOOLSET_NAME,
                 schema=registry_schema,
                 handler=handler,
@@ -1745,24 +1831,65 @@ class LiveKitAdapter(BasePlatformAdapter):
             )
             return
 
-        self._client_tools.setdefault(identity, set()).add(name)
-        self._tool_owners[name] = identity
-        logger.info("[%s] client %s registered tool %r", self.name, identity, name)
+        self._client_tools.setdefault(identity, set()).add(registry_name)
+        self._tool_owners[registry_name] = identity
+        self._tool_methods[registry_name] = name
+        logger.info(
+            "[%s] client %s registered tool %r as %r",
+            self.name,
+            identity,
+            name,
+            registry_name,
+        )
         await self._publish_typed(
             {"type": "agent:tool-registered", "name": name, "success": True},
             identity=identity,
         )
 
-    async def _unregister_client_tool(self, msg: Dict[str, Any], identity: str) -> None:
-        name = (msg.get("name") or "").strip()
-        owner = self._tool_owners.get(name)
-        if owner != identity:
+    async def _unregister_client_tool(
+        self,
+        msg: Dict[str, Any],
+        identity: str,
+        *,
+        receiving_room: Any = None,
+        receiving_generation: Optional[int] = None,
+    ) -> None:
+        if receiving_room is None:
+            receiving_room = self._room
+        if receiving_generation is None:
+            receiving_generation = self._room_generation
+        if not self._tool_message_is_current(
+            identity, receiving_room, receiving_generation
+        ):
+            return
+        raw_name = msg.get("name")
+        name = raw_name if isinstance(raw_name, str) else ""
+        if not self._valid_tool_owner_identity(identity):
+            if identity:
+                await self._publish_typed(
+                    {
+                        "type": "agent:tool-unregistered",
+                        "name": name,
+                        "success": False,
+                        "reason": "not-owned-by-you",
+                    },
+                    identity=identity,
+                )
+            return
+        if TOOL_NAME_RE.fullmatch(name) is None:
+            registry_name = ""
+        else:
+            registry_name = self._scoped_tool_name(identity, name)
+        self._ensure_client_tool_maps()
+        owner = self._tool_owners.get(registry_name)
+        method = self._tool_methods.get(registry_name)
+        if (owner, method) != (identity, name):
             await self._publish_typed(
                 {"type": "agent:tool-unregistered", "name": name, "success": False, "reason": "not-owned-by-you"},
                 identity=identity,
             )
             return
-        self._deregister_tool(name, identity)
+        self._deregister_tool(registry_name, identity)
         await self._publish_typed(
             {"type": "agent:tool-unregistered", "name": name, "success": True},
             identity=identity,
@@ -1805,14 +1932,68 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         return proxy
 
+    @staticmethod
+    def _valid_tool_owner_identity(identity: str) -> bool:
+        """Return whether a participant identity has one unambiguous encoding."""
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or identity != identity.strip()
+        ):
+            return False
+        if any(unicodedata.category(char) in {"Cc", "Cf", "Cs"} for char in identity):
+            return False
+        try:
+            encoded = identity.encode("utf-8")
+        except UnicodeEncodeError:
+            return False
+        return len(encoded) <= MAX_PARTICIPANT_IDENTITY_BYTES
+
+    def _tool_message_is_current(
+        self,
+        identity: str,
+        receiving_room: Any,
+        receiving_generation: int,
+    ) -> bool:
+        """Reject delayed tool mutations from departed clients or old rooms."""
+        return bool(
+            receiving_room is not None
+            and receiving_room is self._room
+            and receiving_generation == self._room_generation
+            and identity in receiving_room.remote_participants
+        )
+
+    @staticmethod
+    def _scoped_tool_name(identity: str, advertised_name: str) -> str:
+        """Build the bounded Hermes registry name for one advertised RPC method."""
+        identity_bytes = identity.encode("utf-8")
+        digest = hashlib.sha256(
+            len(identity_bytes).to_bytes(2, "big")
+            + identity_bytes
+            + advertised_name.encode("ascii")
+        ).hexdigest()[:16]
+        readable_limit = 64 - len(SCOPED_TOOL_PREFIX) - len(digest) - 1
+        return f"{SCOPED_TOOL_PREFIX}{digest}_{advertised_name[:readable_limit]}"
+
+    def _ensure_client_tool_maps(self) -> None:
+        """Initialize maps for lightweight contract-test adapter instances."""
+        if not hasattr(self, "_client_tools"):
+            self._client_tools = {}
+        if not hasattr(self, "_tool_owners"):
+            self._tool_owners = {}
+        if not hasattr(self, "_tool_methods"):
+            self._tool_methods = {}
+
     def _deregister_tool(self, name: str, identity: str) -> None:
         """Remove a single tool from the hermes registry and our maps."""
+        self._ensure_client_tool_maps()
         try:
             from tools.registry import registry
             registry.deregister(name)
         except Exception as exc:
             logger.debug("[%s] tool deregister %r failed: %s", self.name, name, exc)
         self._tool_owners.pop(name, None)
+        self._tool_methods.pop(name, None)
         tools = self._client_tools.get(identity)
         if tools:
             tools.discard(name)
@@ -1821,15 +2002,18 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     def _cleanup_client_tools(self, identity: str) -> None:
         """Deregister all tools owned by ``identity``."""
+        self._ensure_client_tool_maps()
         for name in list(self._client_tools.get(identity, set())):
             self._deregister_tool(name, identity)
 
     def _cleanup_all_client_tools(self) -> None:
         """Deregister every client-offered tool."""
+        self._ensure_client_tool_maps()
         for identity in list(self._client_tools.keys()):
             self._cleanup_client_tools(identity)
         self._client_tools.clear()
         self._tool_owners.clear()
+        self._tool_methods.clear()
 
     def _drain_pending_captures(self) -> tuple[list[str], list[str]]:
         """Pop all buffered frame paths into parallel (urls, types) lists.
