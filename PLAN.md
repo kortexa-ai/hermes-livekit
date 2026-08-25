@@ -23,20 +23,14 @@ Operational state of the plugin and dependencies that don't show up in
 
 Adds `camera.snapshot` (and future tools returning binary payloads) via
 LiveKit byte streams. Mechanism confirmed: `stream_bytes` /
-`register_byte_stream_handler` ship in the current `livekit==1.1.14` pin. Protocol shape
-sketched in `docs/remote-tools-design.md` (`### Large tool results — design`).
+`register_byte_stream_handler` ship in the current `livekit==1.1.14` pin.
 
-Four open questions to resolve before coding (also in the design doc):
-
-1. How hermes ingests binary tool results — `media_url`-style reference
-   matching `client:capture-frame`, or a new return shape?
-2. Topic naming — per-call vs single shared topic.
-3. Timeout scaling — 30s default is short for multi-MB transfers; need
-   a `metadata.expected_result_bytes` hint.
-4. Cancellation mid-transfer — close the reader, drop the buffer.
-
-This work uses RPC for invocation but still needs byte streams for the result
-payload (RPC payloads are strings).
+The bounded version 1 reference, identity binding, per-stream topic, size and
+timeout limits, cancellation rules, Hermes image mapping, and non-image
+fallback are defined in `docs/remote-tools-design.md` and the executable
+`tool_result_protocol` fixtures. The adapter receiver and camera example remain
+separate phases. RPC still carries invocation and the small stream reference;
+the byte stream carries the payload.
 
 ## Deferred indefinitely
 

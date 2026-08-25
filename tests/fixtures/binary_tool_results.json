@@ -1,0 +1,77 @@
+{
+  "valid": [
+    {
+      "name": "small jpeg",
+      "rpc_owner_identity": "camera-client",
+      "configured_timeout_sec": 30,
+      "reference": {
+        "type": "livekit-byte-stream",
+        "version": 1,
+        "owner_identity": "camera-client",
+        "stream_id": "0123456789abcdef0123456789abcdef",
+        "topic": "hermes-tool-result/0123456789abcdef0123456789abcdef",
+        "mime_type": "image/jpeg",
+        "expected_size": 3,
+        "text_summary": "Camera snapshot."
+      },
+      "expected_timeout_sec": 30.0
+    },
+    {
+      "name": "large non-image scales timeout",
+      "rpc_owner_identity": "document-client",
+      "configured_timeout_sec": 20,
+      "reference": {
+        "type": "livekit-byte-stream",
+        "version": 1,
+        "owner_identity": "document-client",
+        "stream_id": "fedcba9876543210fedcba9876543210",
+        "topic": "hermes-tool-result/fedcba9876543210fedcba9876543210",
+        "mime_type": "application/pdf",
+        "expected_size": 12582912,
+        "text_summary": "The requested PDF was received."
+      },
+      "expected_timeout_sec": 63.0
+    }
+  ],
+  "invalid": [
+    {"name": "wrong owner", "change": ["owner_identity", "other-client"], "error": "owner_mismatch"},
+    {"name": "wrong topic", "change": ["topic", "hermes-tool-result/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"], "error": "invalid_reference"},
+    {"name": "noncanonical id", "change": ["stream_id", "ABC"], "error": "invalid_reference"},
+    {"name": "missing size", "remove": "expected_size", "error": "invalid_reference"},
+    {"name": "zero size", "change": ["expected_size", 0], "error": "invalid_reference"},
+    {"name": "oversize", "change": ["expected_size", 12582913], "error": "invalid_reference"},
+    {"name": "unsupported image", "change": ["mime_type", "image/tiff"], "error": "unsupported_image_type"},
+    {"name": "mime parameters", "change": ["mime_type", "application/pdf; charset=utf-8"], "error": "invalid_reference"},
+    {"name": "unknown field", "add": ["bytes", "secret"], "error": "invalid_reference"}
+  ],
+  "lifecycle_failures": [
+    "transfer_timeout",
+    "transfer_incomplete",
+    "owner_disconnected",
+    "transfer_cancelled",
+    "room_replaced"
+  ],
+  "control_messages": {
+    "ready": {
+      "type": "agent:tool-result-stream-ready",
+      "stream_id": "0123456789abcdef0123456789abcdef",
+      "topic": "hermes-tool-result/0123456789abcdef0123456789abcdef"
+    },
+    "cancel": {
+      "type": "agent:tool-result-stream-cancel",
+      "stream_id": "0123456789abcdef0123456789abcdef",
+      "topic": "hermes-tool-result/0123456789abcdef0123456789abcdef"
+    }
+  },
+  "reservation_collision_error": "stream_collision",
+  "adversarial_sender": {
+    "overlong_chunk_error": "transfer_incomplete",
+    "ignored_cancel_chunk_action": "discard",
+    "drain_timeout_sec": 5.0,
+    "no_trailer_deadline_action": "replace_room_generation",
+    "trailer_deadline_action": "release",
+    "coalesced_deadline_action": "no_op",
+    "stale_deadline_action": "no_op",
+    "old_generation_failure": "room_replaced"
+  }
+}
