@@ -122,9 +122,12 @@ Current compatibility assessment:
 - typed input, cancellation, base lifecycle events, audio, and late-agent tool
   registration share the Conference implementation. Session history/logging,
   broader tool invocation fixtures, and n:n semantics remain;
-- self-hosted LiveKit is exercised end to end. LiveKit Cloud qualification is
-  blocked because the approved secret stores and `lk` configuration contain no
-  Cloud project credentials; off-LAN relay parity is also not yet qualified.
+- self-hosted LiveKit and LiveKit Cloud are exercised end to end with the same
+  Conference smoke client. API Conference and Hermes Conference both pass
+  admission, `session.created`, reliable data, tool registration, forced full
+  reconnect, spoken ASR → LFM 8B A1B → TTS turns, a second independent call,
+  participant cleanup, and room cleanup on both targets. Model-initiated client
+  tool invocation/result and an explicitly forced TURN/relay route remain.
 
 New work units created from this stricter definition:
 
@@ -141,6 +144,8 @@ New work units created from this stricter definition:
 - [`api.server#47`](https://github.com/kortexa-ai/api.server/issues/47) — stable
   authenticated Conference participant identity for exact tool policy
   (completed).
+- [#29](https://github.com/kortexa-ai/hermes-livekit/issues/29) — preserve the
+  Hermes room and portable session across LiveKit full reconnects (completed).
 
 ### Architecture
 
@@ -176,17 +181,24 @@ Current implementation status (2026-08-27):
   provider/transport combinations. Hermes LiveKit iOS completed typed-turn,
   transcript, native audio, and idle-state validation against both Hermes
   transports; its signed build is installed on `francip-max`.
+- The shared Conference smoke harness now selects API/Hermes, endpoint, room,
+  stable client identity, local/Cloud target, full/transport mode, and forced
+  reconnect at runtime. Local and Cloud both pass the complete exercised matrix
+  without a code change. Hermes full reconnects use a bounded empty-room grace
+  so transient participant loss cannot abandon the active room; genuine empty
+  rooms still release after the grace period.
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
 - Remaining shared surfaces: complete cross-transport function tools in #22;
   expand current OpenAI wire parity in `api.server#46` and #23 to session
   updates plus cancellation, error, tool, and audio fixtures; finish portable
-  Conference tool invocation and history/logging coverage in #28; and run
-  Cloud/off-LAN smokes, release docs, and packaging under `api.server#45` and
-  #23. The clients are now interchangeable for the exercised setup, typed-turn,
-  cancellation implementation, spoken-turn, transcript, and base lifecycle
-  paths. Function tools and the unexercised fixture matrix are the main parity
-  boundary.
+  Conference tool invocation and history/logging coverage in #28; and finish
+  forced TURN/off-LAN exercise, release docs, and packaging under
+  `api.server#45` and #23. The clients are now interchangeable for the exercised
+  setup, typed-turn, cancellation implementation, spoken-turn, transcript,
+  reliable-data, reconnect, repeat-call, and base lifecycle paths. Function
+  tools, session logging, forced relay, and the unexercised fixture matrix are
+  the main parity boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
