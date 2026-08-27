@@ -127,7 +127,9 @@ Current compatibility assessment:
   admission, `session.created`, reliable data, tool registration, forced full
   reconnect, spoken ASR → LFM 8B A1B → TTS turns, a second independent call,
   participant cleanup, and room cleanup on both targets. Model-initiated client
-  tool invocation/result and an explicitly forced TURN/relay route remain.
+  tool invocation, returned result, and post-tool response now also pass in all
+  four local/Cloud × API/Hermes Conference cells. An explicitly forced
+  TURN/relay route remains.
 
 New work units created from this stricter definition:
 
@@ -182,23 +184,29 @@ Current implementation status (2026-08-27):
   transcript, native audio, and idle-state validation against both Hermes
   transports; its signed build is installed on `francip-max`.
 - The shared Conference smoke harness now selects API/Hermes, endpoint, room,
-  stable client identity, local/Cloud target, full/transport mode, and forced
-  reconnect at runtime. Local and Cloud both pass the complete exercised matrix
-  without a code change. Hermes full reconnects use a bounded empty-room grace
-  so transient participant loss cannot abandon the active room; genuine empty
-  rooms still release after the grace period.
+  stable client identity, local/Cloud target, full/tool/transport mode, and
+  forced reconnect at runtime. Local and Cloud both pass the complete exercised
+  matrix without a code change. The tool mode requires model invocation,
+  accepted client result, and a post-tool response. Hermes full reconnects use
+  a bounded empty-room grace so transient participant loss cannot abandon the
+  active room; genuine empty rooms still release after the grace period.
+- API Conference now accepts initial OpenAI-shaped `session.instructions` and
+  `session.tool_choice`, routes typed input and cancellation through the shared
+  Realtime agent, and keeps the base tool catalog client-owned like direct
+  Realtime. Hermes native RPC results are serialized as validated JSON text for
+  the current Hermes tool contract; verified image envelopes remain structured.
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
-- Remaining shared surfaces: complete cross-transport function tools in #22;
-  expand current OpenAI wire parity in `api.server#46` and #23 to session
+- Remaining shared surfaces: expand current OpenAI wire parity in
+  `api.server#46` and #23 to session
   updates plus cancellation, error, tool, and audio fixtures; finish portable
-  Conference tool invocation and history/logging coverage in #28; and finish
+  session history/logging coverage in #28; and finish
   forced TURN/off-LAN exercise, release docs, and packaging under
   `api.server#45` and #23. The clients are now interchangeable for the exercised
   setup, typed-turn, cancellation implementation, spoken-turn, transcript,
-  reliable-data, reconnect, repeat-call, and base lifecycle paths. Function
-  tools, session logging, forced relay, and the unexercised fixture matrix are
-  the main parity boundary.
+  reliable-data, reconnect, repeat-call, base lifecycle, and model-initiated
+  client-tool paths. Session logging, forced relay, and the unexercised fixture
+  matrix are the main parity boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
