@@ -663,6 +663,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             voice="hermes",
             publish=self._publish_realtime_event,
             on_text_input=self._handle_realtime_text_input,
+            on_response_requested=self._handle_realtime_response_requested,
             on_response_cancelled=self._cancel_realtime_response,
         )
 
@@ -682,6 +683,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             {"text": text},
             identity,
             publish_transcript=False,
+        )
+
+    async def _handle_realtime_response_requested(self, identity: str) -> None:
+        await self._handle_realtime_text_input(
+            "Follow the session instructions and respond now.",
+            identity,
         )
 
     async def _cancel_realtime_response(self, identity: str) -> None:

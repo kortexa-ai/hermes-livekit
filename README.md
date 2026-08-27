@@ -192,9 +192,11 @@ The agent sends a targeted `session.created` snapshot when each participant
 joins. Room lifecycle events are broadcast:
 
 - `input_audio_buffer.speech_started` / `speech_stopped`
-- `conversation.item.created`
+- `conversation.item.added` / `conversation.item.done`
 - `conversation.item.input_audio_transcription.completed`
 - `response.created` / `response.done`
+- `response.output_item.added` / `response.output_item.done`
+- `response.content_part.added` / `response.content_part.done`
 - `response.output_audio_transcript.done`
 - `output_audio_buffer.started` / `stopped` / `cleared`
 - correlated `error` events
@@ -213,10 +215,12 @@ normal user conversation item:
 }
 ```
 
-`response.cancel` cancels the active Hermes room turn and clears queued output
-audio. Unsupported events receive an explicit error targeted to the sending
-participant. The old `hermes-chat` and raw conversation `agent:*` streams are
-not part of the new contract.
+`response.create` starts the pending typed turn or requests a new response
+through the normal Hermes message pipeline. `response.cancel` cancels the
+active Hermes room turn and clears queued output audio. Unsupported events
+receive an explicit error targeted to the sending participant. The old
+`hermes-chat` and raw conversation `agent:*` streams are not part of the new
+contract.
 
 ### Conference extensions
 

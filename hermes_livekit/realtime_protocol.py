@@ -59,6 +59,7 @@ class RealtimeProtocol:
         self._active_response_id: str | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
+        self._output_item_announced = False
         self._speaking = False
         self._closed = False
 
@@ -155,17 +156,18 @@ class RealtimeProtocol:
 
     async def user_transcript(self, transcript: str, identity: str) -> None:
         item_id = self._input_items.pop(identity, None) or self._new_item_id("input")
+        item = {
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "user",
+            "content": [{"type": "input_audio", "transcript": transcript}],
+        }
         await self._emit(
             {
-                "type": "conversation.item.created",
+                "type": "conversation.item.added",
                 "previous_item_id": None,
-                "item": {
-                    "id": item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "user",
-                    "content": [{"type": "input_audio", "transcript": transcript}],
-                },
+                "item": item,
             }
         )
         await self._emit(
@@ -183,6 +185,13 @@ class RealtimeProtocol:
                 },
             }
         )
+        await self._emit(
+            {
+                "type": "conversation.item.done",
+                "previous_item_id": None,
+                "item": item,
+            }
+        )
 
     async def response_started(self) -> None:
         if self._closed or self._active_response_id:
@@ -191,6 +200,7 @@ class RealtimeProtocol:
         self._active_response_id = f"resp_{self.session_id}_{self._response_sequence}"
         self._active_output_item_id = None
         self._active_transcript = None
+        self._output_item_announced = False
         await self._emit(
             {
                 "type": "response.created",
@@ -203,6 +213,7 @@ class RealtimeProtocol:
         self._speaking = True
         if self._active_response_id:
             self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
+            await self._announce_audio_output_item()
         await self._emit({"type": "output_audio_buffer.started", "response_id": self._active_response_id})
 
     async def assistant_transcript(self, transcript: str) -> None:
@@ -211,6 +222,7 @@ class RealtimeProtocol:
             return
         self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
         self._active_transcript = transcript
+        await self._announce_audio_output_item()
         await self._emit(
             {
                 "type": "response.output_audio_transcript.done",
@@ -224,12 +236,14 @@ class RealtimeProtocol:
 
     async def output_stopped(self) -> None:
         response_id = self._active_response_id
+        await self._finish_audio_output_item("completed")
         await self._complete_response("completed")
         if self._speaking:
             self._speaking = False
             await self._emit({"type": "output_audio_buffer.stopped", "response_id": response_id})
 
     async def response_failed(self) -> None:
+        await self._finish_audio_output_item("incomplete")
         await self._complete_response("failed")
 
     async def close(self) -> None:
@@ -240,6 +254,7 @@ class RealtimeProtocol:
         self._active_response_id = None
         self._active_output_item_id = None
         self._active_transcript = None
+        self._output_item_announced = False
         self._speaking = False
 
     async def _accept_conversation_item(
@@ -286,7 +301,7 @@ class RealtimeProtocol:
             "role": "user",
             "content": [{"type": "input_text", "text": text.strip()}],
         }
-        await self._emit({"type": "conversation.item.created", "previous_item_id": None, "item": normalized})
+        await self._emit_conversation_item(normalized, recipient=identity)
         self._pending_text_inputs[identity] = text.strip()
 
     async def _accept_response_create(self, identity: str, event_id: str | None) -> None:
@@ -298,7 +313,8 @@ class RealtimeProtocol:
             if not await _call(self._on_text_input, text, identity):
                 await self._error("text_input_unavailable", "Text input is unavailable", identity, triggering_event_id=event_id)
             return
-        await self._error("response_create_unsupported", "response.create requires conversation input", identity, param="response", triggering_event_id=event_id)
+        if not await _call(self._on_response_requested, identity):
+            await self._error("response_create_unsupported", "response.create is unavailable", identity, param="response", triggering_event_id=event_id)
 
     async def _accept_response_cancel(self, identity: str, event_id: str | None) -> None:
         if not self._active_response_id:
@@ -306,6 +322,7 @@ class RealtimeProtocol:
             return
         response_id = self._active_response_id
         await _call(self._on_response_cancelled, identity)
+        await self._finish_audio_output_item("incomplete")
         await self._complete_response("cancelled")
         if self._speaking:
             self._speaking = False
@@ -329,7 +346,80 @@ class RealtimeProtocol:
         self._active_response_id = None
         self._active_output_item_id = None
         self._active_transcript = None
+        self._output_item_announced = False
         await self._emit({"type": "response.done", "response": {"id": response_id, "status": status, "output": output}})
+
+    async def _emit_conversation_item(
+        self,
+        item: dict[str, Any],
+        *,
+        recipient: str | None = None,
+    ) -> None:
+        await self._emit(
+            {"type": "conversation.item.added", "previous_item_id": None, "item": item},
+            recipient=recipient,
+        )
+        await self._emit(
+            {"type": "conversation.item.done", "previous_item_id": None, "item": item},
+            recipient=recipient,
+        )
+
+    def _audio_output_item(self, status: str) -> dict[str, Any] | None:
+        if not self._active_response_id or not self._active_output_item_id:
+            return None
+        return {
+            "id": self._active_output_item_id,
+            "type": "message",
+            "status": status,
+            "role": "assistant",
+            "content": [{"type": "output_audio", "transcript": self._active_transcript or ""}],
+        }
+
+    async def _announce_audio_output_item(self) -> None:
+        if self._output_item_announced or not self._active_response_id:
+            return
+        item = self._audio_output_item("in_progress")
+        if item is None:
+            return
+        self._output_item_announced = True
+        await self._emit({
+            "type": "response.output_item.added",
+            "response_id": self._active_response_id,
+            "output_index": 0,
+            "item": item,
+        })
+        await self._emit({"type": "conversation.item.added", "previous_item_id": None, "item": item})
+        await self._emit({
+            "type": "response.content_part.added",
+            "response_id": self._active_response_id,
+            "item_id": self._active_output_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_audio", "transcript": ""},
+        })
+
+    async def _finish_audio_output_item(self, status: str) -> None:
+        if not self._output_item_announced or not self._active_response_id or not self._active_output_item_id:
+            return
+        item = self._audio_output_item(status)
+        if item is None:
+            return
+        await self._emit({
+            "type": "response.content_part.done",
+            "response_id": self._active_response_id,
+            "item_id": self._active_output_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_audio", "transcript": self._active_transcript or ""},
+        })
+        await self._emit({"type": "conversation.item.done", "previous_item_id": None, "item": item})
+        await self._emit({
+            "type": "response.output_item.done",
+            "response_id": self._active_response_id,
+            "output_index": 0,
+            "item": item,
+        })
+        self._output_item_announced = False
 
     async def _error(
         self,

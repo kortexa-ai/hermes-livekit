@@ -55,11 +55,18 @@ async def test_maps_audio_and_response_lifecycle_to_openai_events() -> None:
     assert [event["type"] for event, _ in sent] == [
         "input_audio_buffer.speech_started",
         "input_audio_buffer.speech_stopped",
-        "conversation.item.created",
+        "conversation.item.added",
         "conversation.item.input_audio_transcription.completed",
+        "conversation.item.done",
         "response.created",
+        "response.output_item.added",
+        "conversation.item.added",
+        "response.content_part.added",
         "output_audio_buffer.started",
         "response.output_audio_transcript.done",
+        "response.content_part.done",
+        "conversation.item.done",
+        "response.output_item.done",
         "response.done",
         "output_audio_buffer.stopped",
     ]
@@ -100,6 +107,11 @@ async def test_routes_typed_input_and_cancellation_to_transport_callbacks() -> N
         "client-a",
     )
     assert inputs == []
+    assert [event["type"] for event, _ in sent[:2]] == [
+        "conversation.item.added",
+        "conversation.item.done",
+    ]
+    assert all(recipient == "client-a" for _, recipient in sent[:2])
     await protocol.handle_client_message(
         json.dumps({"type": "response.create", "event_id": "response-1"}),
         "client-a",
@@ -143,6 +155,23 @@ async def test_response_create_requires_a_new_queued_input() -> None:
     assert inputs == [("one turn", "client-a")]
     assert sent[-1][0]["type"] == "error"
     assert sent[-1][0]["error"]["code"] == "response_create_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_response_create_without_new_input_uses_request_callback() -> None:
+    requested: list[str] = []
+
+    async def on_response(identity: str) -> None:
+        requested.append(identity)
+
+    protocol, sent = protocol_fixture(on_response_requested=on_response)
+    await protocol.handle_client_message(
+        json.dumps({"type": "response.create"}),
+        "client-a",
+    )
+
+    assert requested == ["client-a"]
+    assert sent == []
 
 
 @pytest.mark.asyncio
