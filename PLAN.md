@@ -105,26 +105,42 @@ and target selection remain secret-backed runtime configuration.
 
 Current compatibility assessment:
 
-- basic 1:1 spoken turns work in all four local backend cells;
-- direct setup, audio, and a small lifecycle subset align, but session updates,
-  current item events, typed input, cancellation, and tools still diverge;
-- Conference audio and `conference.events` align, but admission, tools, typed
-  input, cancellation, history, and lifecycle still require separate clients;
-- local LiveKit is exercised; LiveKit Cloud and off-LAN relay parity are not yet
-  qualified.
+- basic 1:1 spoken turns work in all four local backend cells, and real OpenAI
+  Realtime is exercised as a fifth reference provider;
+- one secret-safe typed-input WebRTC probe passes unchanged against OpenAI,
+  `api.server`, and Hermes Direct. The two local backends return the same
+  ordered event-type sequence, including current item, output-item, and
+  content-part lifecycle events;
+- Direct setup now aligns on optional multipart session data, HTTP 201, and a
+  call `Location`. Typed input and cancellation use the normal local agent
+  pipelines. Broader `session.update`, cancellation/error fixtures, audio
+  equivalence, and Hermes function tools remain;
+- API Conference and Hermes Conference use one authenticated
+  `/v1/conference/calls` setup message and one ConfCall LiveKit client. The
+  server derives a stable user-namespaced participant identity, and exact
+  default-deny Hermes tool registration is proven in the real desktop app;
+- typed input, cancellation, base lifecycle events, audio, and late-agent tool
+  registration share the Conference implementation. Session history/logging,
+  broader tool invocation fixtures, and n:n semantics remain;
+- self-hosted LiveKit is exercised end to end. LiveKit Cloud qualification is
+  blocked because the approved secret stores and `lk` configuration contain no
+  Cloud project credentials; off-LAN relay parity is also not yet qualified.
 
 New work units created from this stricter definition:
 
 - [`api.server#46`](https://github.com/kortexa-ai/api.server/issues/46) — current
   OpenAI Realtime WebRTC wire parity and real-API differential fixtures.
 - [`api.server#44`](https://github.com/kortexa-ai/api.server/issues/44) — make
-  Conference a transport adapter of the shared Realtime contract.
+  Conference a transport adapter of the shared Realtime contract (completed).
 - [#28](https://github.com/kortexa-ai/hermes-livekit/issues/28) — match the
   `api.server` Conference setup and portable base protocol.
 - [`confcall.desktop#8`](https://github.com/kortexa-ai/confcall.desktop/issues/8)
   — reduce four backend choices to one direct client and one Conference client.
 - [`api.server#45`](https://github.com/kortexa-ai/api.server/issues/45) — run the
   same Conference qualification against local LiveKit and LiveKit Cloud.
+- [`api.server#47`](https://github.com/kortexa-ai/api.server/issues/47) — stable
+  authenticated Conference participant identity for exact tool policy
+  (completed).
 
 ### Architecture
 
@@ -162,13 +178,15 @@ Current implementation status (2026-08-27):
   transports; its signed build is installed on `francip-max`.
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
-- Remaining shared surfaces: complete cross-transport function tools in #22,
-  current OpenAI wire parity in `api.server#46`, Conference base-contract and
-  admission parity in `api.server#44` and #28, and conformance fixtures,
-  local/Cloud/off-LAN smokes, release docs, and packaging in #23 and
-  `api.server#45`. The spoken-turn spine is exercised, but the clients are not
-  yet interchangeable for typed input, cancellation, tools, or all lifecycle
-  events.
+- Remaining shared surfaces: complete cross-transport function tools in #22;
+  expand current OpenAI wire parity in `api.server#46` and #23 to session
+  updates plus cancellation, error, tool, and audio fixtures; finish portable
+  Conference tool invocation and history/logging coverage in #28; and run
+  Cloud/off-LAN smokes, release docs, and packaging under `api.server#45` and
+  #23. The clients are now interchangeable for the exercised setup, typed-turn,
+  cancellation implementation, spoken-turn, transcript, and base lifecycle
+  paths. Function tools and the unexercised fixture matrix are the main parity
+  boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
