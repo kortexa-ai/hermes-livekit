@@ -197,6 +197,26 @@ async def test_success_maps_verified_image_and_releases_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_non_image_binary_result_returns_json_text() -> None:
+    mime_type = "application/pdf"
+    adapter, room = make_adapter(reference_payload(mime_type=mime_type))
+    task = await start_call(adapter)
+    room.deliver(FakeReader([b"pdf"], mime_type=mime_type))
+
+    result = await task
+
+    assert isinstance(result, str)
+    assert json.loads(result) == {
+        "binary_result": {
+            "mime_type": mime_type,
+            "size": 3,
+            "available_to_model": False,
+        },
+        "text_summary": "Camera snapshot.",
+    }
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "reader,identity,code",
     [

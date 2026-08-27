@@ -380,7 +380,7 @@ def test_scoped_name_is_deterministic_bounded_and_pair_specific() -> None:
 
 
 @pytest.mark.asyncio
-async def test_remote_tool_handler_performs_targeted_rpc_and_decodes_result() -> None:
+async def test_remote_tool_handler_performs_targeted_rpc_and_returns_json_text() -> None:
     participant = FakeLocalParticipant('{"shown":true,"count":2}')
     adapter = adapter_with_client(participant)
 
@@ -388,7 +388,7 @@ async def test_remote_tool_handler_performs_targeted_rpc_and_decodes_result() ->
         {"title": "Hello"}, ignored_framework_value=True
     )
 
-    assert result == {"shown": True, "count": 2}
+    assert result == '{"shown":true,"count":2}'
     assert participant.calls == [
         {
             "destination_identity": "client-1",

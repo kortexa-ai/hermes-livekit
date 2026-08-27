@@ -2148,7 +2148,16 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._audit_tool(
                 "invocation", owner_identity, registered_name, decision.tier, "success"
             )
-            return decoded
+            if (
+                isinstance(decoded, dict)
+                and decoded.get("_multimodal") is True
+                and isinstance(decoded.get("content"), list)
+            ):
+                return decoded
+            # Hermes accepts normal tool results as strings; keep the client
+            # result structured by returning validated JSON text. The only
+            # supported dictionary result is the multimodal envelope above.
+            return _json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
 
         return proxy
 

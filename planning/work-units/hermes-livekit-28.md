@@ -15,6 +15,9 @@ changing `hermes-agent`.
   pipeline through an adapter callback.
 - Keep LiveKit admission, participant identity, RPC tools, and binary transfer
   as explicit Conference extensions rather than base-protocol forks.
+- Return validated client RPC JSON as serialized text because current Hermes
+  accepts normal tool results only as strings. Preserve the supported
+  multimodal dictionary envelope for verified image byte streams.
 
 ## Validation
 
@@ -22,3 +25,8 @@ changing `hermes-agent`.
   cancellation, bounds, and event correlation.
 - Conference tests cover the same lifecycle over targeted and broadcast
   LiveKit data packets.
+- Live local and Cloud calls must prove model invocation, native RPC delivery,
+  accepted result, and a successful post-tool response without recording tool
+  arguments, results, or transcript content.
+- On 2026-08-27, the current adapter completed that model-initiated round trip
+  on both local LiveKit and LiveKit Cloud. The full suite passes 143 tests.
