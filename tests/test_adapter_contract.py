@@ -104,3 +104,18 @@ async def test_livekit_send_voice_uses_native_audio_track():
         reply_to="message",
         metadata={"turn": 1},
     )
+
+
+@pytest.mark.asyncio
+async def test_livekit_send_completes_transcript_response():
+    adapter = object.__new__(LiveKitAdapter)
+    adapter._room = object()
+    adapter._realtime_protocol = AsyncMock()
+    adapter._tts_completed = True
+
+    result = await adapter.send(chat_id="room", content="hello")
+
+    assert result.success is True
+    adapter._realtime_protocol.assistant_transcript.assert_awaited_once_with("hello")
+    adapter._realtime_protocol.output_stopped.assert_awaited_once_with()
+    assert adapter._tts_completed is False

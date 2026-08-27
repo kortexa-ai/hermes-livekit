@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -113,3 +114,18 @@ async def test_direct_send_voice_uses_native_audio_track() -> None:
         reply_to="message",
         metadata={"turn": 1},
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_send_completes_transcript_response() -> None:
+    protocol = AsyncMock()
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    call = SimpleNamespace(protocol=protocol, tts_completed=True)
+    adapter._calls = {"call": call}
+
+    result = await adapter.send(chat_id="call", content="hello")
+
+    assert result.success is True
+    protocol.assistant_transcript.assert_awaited_once_with("hello")
+    protocol.output_stopped.assert_awaited_once_with()
+    assert call.tts_completed is False

@@ -136,6 +136,7 @@ class RealtimeCall:
     last_speech_at: float | None = None
     speaking: bool = False
     paused: bool = False
+    tts_completed: bool = False
     closed: bool = False
 
     def spawn(self, coroutine: Any) -> None:
@@ -503,6 +504,9 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         if call is None:
             return SendResult(success=False, error="Realtime call is closed")
         await call.protocol.assistant_transcript(content)
+        if call.tts_completed:
+            call.tts_completed = False
+            await call.protocol.output_stopped()
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def play_tts(
@@ -525,10 +529,12 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Failed to decode audio")
         try:
             call.paused = True
+            call.tts_completed = False
             await call.protocol.output_started()
             await call.output_track.enqueue_pcm(pcm)
             await call.output_track.drained()
             await call.protocol.output_stopped()
+            call.tts_completed = True
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         finally:
             call.paused = False

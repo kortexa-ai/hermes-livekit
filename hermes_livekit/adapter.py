@@ -249,6 +249,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Pause audio capture during TTS playback
         self._paused = False
+        self._tts_completed = False
 
         # Throttle for presence-check failure warnings (see
         # _count_remote_participants).
@@ -701,6 +702,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         if self._audio_source and hasattr(self._audio_source, "clear_queue"):
             await self._audio_source.clear_queue()
         self._paused = False
+        self._tts_completed = False
 
     def _on_participant_connected(self, participant: "rtc.RemoteParticipant") -> None:
         protocol = getattr(self, "_realtime_protocol", None)
@@ -2292,6 +2294,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             await self._publish_agent_event(
                 "agent:agent-transcript", {"transcript": content, "final": True}
             )
+            if getattr(self, "_tts_completed", False):
+                self._tts_completed = False
+                await self._publish_agent_event("agent:speaking-stop")
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         except Exception as e:
             logger.debug("[%s] Data channel send failed (non-critical): %s", self.name, e)
@@ -2359,10 +2364,12 @@ class LiveKitAdapter(BasePlatformAdapter):
             await asyncio.sleep(0.3)
             self._paused = False
             await self._publish_agent_event("agent:speaking-stop")
+            self._tts_completed = True
 
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         except Exception as e:
             self._paused = False
+            self._tts_completed = False
             await self._publish_agent_event("agent:speaking-stop")
             logger.error("[%s] TTS playback error: %s", self.name, e)
             return SendResult(success=False, error=str(e))
