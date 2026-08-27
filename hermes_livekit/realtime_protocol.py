@@ -54,6 +54,7 @@ class RealtimeProtocol:
         self._input_sequence = 0
         self._response_sequence = 0
         self._input_items: dict[str, str] = {}
+        self._pending_text_inputs: dict[str, str] = {}
         self._clients: set[str] = set()
         self._active_response_id: str | None = None
         self._active_output_item_id: str | None = None
@@ -85,6 +86,7 @@ class RealtimeProtocol:
     def client_disconnected(self, identity: str) -> None:
         self._clients.discard(identity)
         self._input_items.pop(identity, None)
+        self._pending_text_inputs.pop(identity, None)
 
     async def handle_client_message(self, raw: bytes | str, identity: str) -> None:
         if self._closed:
@@ -234,6 +236,7 @@ class RealtimeProtocol:
         self._closed = True
         self._clients.clear()
         self._input_items.clear()
+        self._pending_text_inputs.clear()
         self._active_response_id = None
         self._active_output_item_id = None
         self._active_transcript = None
@@ -264,6 +267,15 @@ class RealtimeProtocol:
         if not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
             await self._error("invalid_conversation_item", "input_text is invalid", identity, param="item.content", triggering_event_id=event_id)
             return
+        if identity in self._pending_text_inputs:
+            await self._error(
+                "conversation_item_pending",
+                "Create a response for the pending input before adding another",
+                identity,
+                param="item",
+                triggering_event_id=event_id,
+            )
+            return
         item_id = item.get("id")
         if not isinstance(item_id, str) or not item_id or len(item_id.encode("utf-8")) > MAX_EVENT_ID_BYTES:
             item_id = self._new_item_id("input")
@@ -275,15 +287,18 @@ class RealtimeProtocol:
             "content": [{"type": "input_text", "text": text.strip()}],
         }
         await self._emit({"type": "conversation.item.created", "previous_item_id": None, "item": normalized})
-        if not await _call(self._on_text_input, text.strip(), identity):
-            await self._error("text_input_unavailable", "Text input is unavailable", identity, triggering_event_id=event_id)
+        self._pending_text_inputs[identity] = text.strip()
 
     async def _accept_response_create(self, identity: str, event_id: str | None) -> None:
         if self._active_response_id:
             await self._error("conversation_already_has_active_response", "The conversation already has an active response", identity, param="response", triggering_event_id=event_id)
             return
-        if not await _call(self._on_response_requested, identity):
-            await self._error("response_create_unsupported", "response.create requires conversation input", identity, param="response", triggering_event_id=event_id)
+        text = self._pending_text_inputs.pop(identity, None)
+        if text is not None:
+            if not await _call(self._on_text_input, text, identity):
+                await self._error("text_input_unavailable", "Text input is unavailable", identity, triggering_event_id=event_id)
+            return
+        await self._error("response_create_unsupported", "response.create requires conversation input", identity, param="response", triggering_event_id=event_id)
 
     async def _accept_response_cancel(self, identity: str, event_id: str | None) -> None:
         if not self._active_response_id:

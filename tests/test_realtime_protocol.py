@@ -99,6 +99,11 @@ async def test_routes_typed_input_and_cancellation_to_transport_callbacks() -> N
         ),
         "client-a",
     )
+    assert inputs == []
+    await protocol.handle_client_message(
+        json.dumps({"type": "response.create", "event_id": "response-1"}),
+        "client-a",
+    )
     await protocol.response_started()
     await protocol.output_started()
     await protocol.handle_client_message(
@@ -113,6 +118,52 @@ async def test_routes_typed_input_and_cancellation_to_transport_callbacks() -> N
         "output_audio_buffer.cleared",
     ]
     assert sent[-2][0]["response"]["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_response_create_requires_a_new_queued_input() -> None:
+    inputs: list[tuple[str, str]] = []
+
+    async def on_text(text: str, identity: str) -> None:
+        inputs.append((text, identity))
+
+    protocol, sent = protocol_fixture(on_text_input=on_text)
+    item = {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "one turn"}],
+        },
+    }
+    await protocol.handle_client_message(json.dumps(item), "client-a")
+    await protocol.handle_client_message(json.dumps({"type": "response.create"}), "client-a")
+    await protocol.handle_client_message(json.dumps({"type": "response.create"}), "client-a")
+
+    assert inputs == [("one turn", "client-a")]
+    assert sent[-1][0]["type"] == "error"
+    assert sent[-1][0]["error"]["code"] == "response_create_unsupported"
+
+
+@pytest.mark.asyncio
+async def test_does_not_replace_a_pending_typed_input() -> None:
+    protocol, sent = protocol_fixture()
+
+    def item(text: str) -> str:
+        return json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        })
+
+    await protocol.handle_client_message(item("first"), "client-a")
+    await protocol.handle_client_message(item("second"), "client-a")
+
+    assert sent[-1][0]["type"] == "error"
+    assert sent[-1][0]["error"]["code"] == "conversation_item_pending"
 
 
 @pytest.mark.asyncio
