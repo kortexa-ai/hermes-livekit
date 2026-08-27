@@ -1,5 +1,9 @@
 # hermes-livekit
 
+<p align="center">
+  <img src="docs/assets/hermes-gateway.png" width="220" alt="Hermes realtime gateway mark">
+</p>
+
 Realtime voice gateway plugin for [hermes-agent](https://github.com/NousResearch/hermes-agent).
 
 It serves an OpenAI-compatible direct WebRTC endpoint and can join a LiveKit
@@ -7,6 +11,12 @@ room as a Realtime Conference agent. Both transports transcribe speech through
 Hermes, run the same agent loop, return TTS audio, and share one conversation
 event contract. The name is now historically accurate in only one direction;
 the rename raccoon remains on the roadmap.
+
+The gateway mark combines a transport arch, messenger wings, and an audio
+pulse. `docs/assets/hermes-gateway-master.png` is the opaque lossless source;
+`./scripts/export-readme-mark.sh` regenerates the optimized README image. The
+original artwork was generated with OpenAI's built-in image generation tool on
+2026-08-27 with text, third-party marks, and transparency prohibited.
 
 ## Requirements
 
