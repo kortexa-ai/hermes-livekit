@@ -128,8 +128,9 @@ Current compatibility assessment:
   reconnect, spoken ASR → LFM 8B A1B → TTS turns, a second independent call,
   participant cleanup, and room cleanup on both targets. Model-initiated client
   tool invocation, returned result, and post-tool response now also pass in all
-  four local/Cloud × API/Hermes Conference cells. An explicitly forced
-  TURN/relay route remains.
+  four local/Cloud × API/Hermes Conference cells. Relay-only LiveKit Cloud runs
+  pass for both Conference backends with a verified relay candidate. Direct
+  WebRTC TURN/off-LAN qualification remains.
 
 New work units created from this stricter definition:
 
@@ -142,7 +143,8 @@ New work units created from this stricter definition:
 - [`confcall.desktop#8`](https://github.com/kortexa-ai/confcall.desktop/issues/8)
   — reduce four backend choices to one direct client and one Conference client.
 - [`api.server#45`](https://github.com/kortexa-ai/api.server/issues/45) — run the
-  same Conference qualification against local LiveKit and LiveKit Cloud.
+  same Conference qualification against local LiveKit and LiveKit Cloud
+  (completed).
 - [`api.server#47`](https://github.com/kortexa-ai/api.server/issues/47) — stable
   authenticated Conference participant identity for exact tool policy
   (completed).
@@ -201,12 +203,12 @@ Current implementation status (2026-08-27):
   `api.server#46` and #23 to session
   updates plus cancellation, error, tool, and audio fixtures; finish portable
   session history/logging coverage in #28; and finish
-  forced TURN/off-LAN exercise, release docs, and packaging under
-  `api.server#45` and #23. The clients are now interchangeable for the exercised
+  direct TURN/off-LAN exercise, release docs, and packaging under
+  `api.server#46` and #23. The clients are now interchangeable for the exercised
   setup, typed-turn, cancellation implementation, spoken-turn, transcript,
   reliable-data, reconnect, repeat-call, base lifecycle, and model-initiated
-  client-tool paths. Session logging, forced relay, and the unexercised fixture
-  matrix are the main parity boundary.
+  client-tool paths. Session logging, direct forced relay, and the unexercised
+  fixture matrix are the main parity boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
