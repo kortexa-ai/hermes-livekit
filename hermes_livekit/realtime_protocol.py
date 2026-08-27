@@ -54,6 +54,7 @@ class RealtimeProtocol:
         self._input_sequence = 0
         self._response_sequence = 0
         self._input_items: dict[str, str] = {}
+        self._clients: set[str] = set()
         self._active_response_id: str | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
@@ -65,8 +66,9 @@ class RealtimeProtocol:
         return self._active_response_id
 
     async def client_connected(self, identity: str) -> None:
-        if self._closed or not identity:
+        if self._closed or not identity or identity in self._clients:
             return
+        self._clients.add(identity)
         await self._emit(
             {
                 "type": "session.created",
@@ -79,6 +81,10 @@ class RealtimeProtocol:
             },
             recipient=identity,
         )
+
+    def client_disconnected(self, identity: str) -> None:
+        self._clients.discard(identity)
+        self._input_items.pop(identity, None)
 
     async def handle_client_message(self, raw: bytes | str, identity: str) -> None:
         if self._closed:
@@ -226,6 +232,7 @@ class RealtimeProtocol:
 
     async def close(self) -> None:
         self._closed = True
+        self._clients.clear()
         self._input_items.clear()
         self._active_response_id = None
         self._active_output_item_id = None

@@ -65,7 +65,9 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.session import build_session_key
 
+from .realtime_protocol import RealtimeProtocol
 from .tool_result_protocol import (
     DRAIN_TIMEOUT_SEC,
     REFERENCE_TYPE,
@@ -219,6 +221,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("livekit"))
 
         extra = config.extra or {}
+        self.config.extra = extra
+        # Realtime Conference owns one conversation per room. Participant
+        # identity remains available on MessageEvent for attribution and tool
+        # ownership, but it must not split the Hermes conversation history.
+        self.config.extra["group_sessions_per_user"] = False
         self._url: str = extra.get("url") or os.getenv("LIVEKIT_URL", "")
         self._api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
         self._api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
@@ -227,6 +234,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._agent_avatar: str = extra.get("agent_avatar") or os.getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
 
         self._room: Optional["rtc.Room"] = None
+        self._realtime_protocol: Optional[RealtimeProtocol] = None
         self._audio_source: Optional["rtc.AudioSource"] = None
         self._local_track: Optional["rtc.LocalAudioTrack"] = None
         self._silence_task: Optional[asyncio.Task] = None
@@ -487,8 +495,11 @@ class LiveKitAdapter(BasePlatformAdapter):
                 stale, self._room = self._room, None
                 self._fail_binary_generation(self._room_generation, "room_replaced")
                 await self._release_room(stale, why="stale-on-join")
+                if self._realtime_protocol:
+                    await self._realtime_protocol.close()
 
             self._room = rtc.Room()
+            self._realtime_protocol = self._new_realtime_protocol()
             self._room_generation += 1
             self._room_replacement_started = False
             self._binary_ignored_drains = set()
@@ -497,6 +508,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             # Register event handlers
             self._room.on("track_subscribed", self._on_track_subscribed)
             self._room.on("track_unsubscribed", self._on_track_unsubscribed)
+            self._room.on("participant_connected", self._on_participant_connected)
             self._room.on("participant_disconnected", self._on_participant_disconnected)
             self._room.on("disconnected", self._on_disconnected)
             # Inbound data-channel: clients send control messages (capture-frame,
@@ -547,6 +559,9 @@ class LiveKitAdapter(BasePlatformAdapter):
             options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
             await self._room.local_participant.publish_track(self._local_track, options)
 
+            for participant in self._room.remote_participants.values():
+                await self._realtime_protocol.client_connected(participant.identity)
+
             # Start silence detection loop
             self._silence_task = asyncio.create_task(self._check_silence_loop())
 
@@ -559,6 +574,9 @@ class LiveKitAdapter(BasePlatformAdapter):
 
             return True
         except Exception as e:
+            if self._realtime_protocol:
+                await self._realtime_protocol.close()
+                self._realtime_protocol = None
             logger.error("[%s] Failed to connect: %s", self.name, e)
             return False
 
@@ -609,6 +627,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             finally:
                 self._graceful_leave = False
 
+        if self._realtime_protocol:
+            await self._realtime_protocol.close()
+            self._realtime_protocol = None
+
         self._audio_source = None
         self._local_track = None
         self._audio_buffers.clear()
@@ -632,6 +654,62 @@ class LiveKitAdapter(BasePlatformAdapter):
         logger.info("[%s] Disconnected", self.name)
 
     # -- LiveKit event handlers ---------------------------------------------
+
+    def _new_realtime_protocol(self) -> RealtimeProtocol:
+        return RealtimeProtocol(
+            session_id=self._room_name,
+            model="hermes",
+            voice="hermes",
+            publish=self._publish_realtime_event,
+            on_text_input=self._handle_realtime_text_input,
+            on_response_cancelled=self._cancel_realtime_response,
+        )
+
+    async def _publish_realtime_event(
+        self,
+        event: Dict[str, Any],
+        recipient: Optional[str],
+    ) -> bool:
+        return await self._publish_typed(
+            event,
+            identity=recipient,
+            topic=self.DATA_CHANNEL_EVENTS_TOPIC,
+        )
+
+    async def _handle_realtime_text_input(self, text: str, identity: str) -> None:
+        await self._handle_client_message(
+            {"text": text},
+            identity,
+            publish_transcript=False,
+        )
+
+    async def _cancel_realtime_response(self, identity: str) -> None:
+        source = self.build_source(
+            chat_id=self._room_name,
+            chat_name=self._room_name,
+            chat_type="group",
+            user_id=identity,
+            user_name=identity,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+            profile=self._session_key_profile(source),
+        )
+        await self.cancel_session_processing(session_key)
+        if self._audio_source and hasattr(self._audio_source, "clear_queue"):
+            await self._audio_source.clear_queue()
+        self._paused = False
+
+    def _on_participant_connected(self, participant: "rtc.RemoteParticipant") -> None:
+        protocol = getattr(self, "_realtime_protocol", None)
+        if not protocol:
+            return
+        try:
+            asyncio.create_task(protocol.client_connected(participant.identity))
+        except RuntimeError:
+            pass
 
     def _on_track_subscribed(
         self,
@@ -718,6 +796,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         # Drop any tools this client had registered.
         self._cleanup_client_tools(identity)
         self._fail_binary_owner(identity)
+        protocol = getattr(self, "_realtime_protocol", None)
+        if protocol:
+            protocol.client_disconnected(identity)
 
         if self._room and not self._room.remote_participants:
             logger.info("[%s] Last participant left '%s', leaving room", self.name, self._room_name)
@@ -768,6 +849,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                 await self._release_room(room, why="leave")
             finally:
                 self._graceful_leave = False
+        if self._realtime_protocol:
+            await self._realtime_protocol.close()
+            self._realtime_protocol = None
         self._audio_source = None
         self._local_track = None
 
@@ -1106,8 +1190,10 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     # -- Inbound data channel + frame capture -------------------------------
 
-    # Topic clients send control messages on. Outbound topics (hermes-chat,
-    # untopic-ed agent:* lifecycle events) are unchanged.
+    # Realtime conversation events use the same topic as api.server
+    # Conference. Native RPC and binary tool discovery remain extensions on
+    # the legacy control topic until the shared tool work lands.
+    DATA_CHANNEL_EVENTS_TOPIC = "conference.events"
     DATA_CHANNEL_CONTROL_TOPIC = "hermes-control"
 
     def _on_data_received(
@@ -1125,14 +1211,24 @@ class LiveKitAdapter(BasePlatformAdapter):
         anything else is ignored (silently — keeps the protocol open for
         unrelated apps sharing the same data channel without spamming logs).
         """
-        topic = getattr(packet, "topic", None) or ""
-        if topic != self.DATA_CHANNEL_CONTROL_TOPIC:
-            return
-
         participant = getattr(packet, "participant", None)
         participant_identity = (
             getattr(participant, "identity", "") if participant is not None else ""
         )
+        topic = getattr(packet, "topic", None) or ""
+        if topic == self.DATA_CHANNEL_EVENTS_TOPIC:
+            protocol = getattr(self, "_realtime_protocol", None)
+            if not protocol or not participant_identity:
+                return
+            try:
+                asyncio.create_task(
+                    protocol.handle_client_message(packet.data, participant_identity)
+                )
+            except RuntimeError:
+                pass
+            return
+        if topic != self.DATA_CHANNEL_CONTROL_TOPIC:
+            return
         if receiving_room is None:
             receiving_room = self._room
         if receiving_generation is None:
@@ -1261,7 +1357,13 @@ class LiveKitAdapter(BasePlatformAdapter):
             },
         )
 
-    async def _handle_client_message(self, msg: Dict[str, Any], identity: str) -> None:
+    async def _handle_client_message(
+        self,
+        msg: Dict[str, Any],
+        identity: str,
+        *,
+        publish_transcript: bool = True,
+    ) -> None:
         """Inject a typed text message as if it were a transcribed voice utterance.
 
         Useful for clients that want to text-chat with the agent over the
@@ -1291,10 +1393,11 @@ class LiveKitAdapter(BasePlatformAdapter):
             timestamp=datetime.now(tz=timezone.utc),
         )
 
-        await self._publish_agent_event(
-            "agent:user-transcript",
-            {"transcript": text, "final": True, "identity": identity, "source": "text"},
-        )
+        if publish_transcript:
+            await self._publish_agent_event(
+                "agent:user-transcript",
+                {"transcript": text, "final": True, "identity": identity, "source": "text"},
+            )
         await self._publish_agent_event("agent:thinking-start")
         await self.handle_message(event)
 
@@ -2131,24 +2234,47 @@ class LiveKitAdapter(BasePlatformAdapter):
     async def _publish_agent_event(
         self, event_type: str, payload: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Publish an agent:* lifecycle event as JSON on the default data topic.
-
-        Consumed by voice-agent.desktop (and any compatible client) to drive
-        UI state — listening/thinking/speaking indicators and live transcript
-        display. Topic is deliberately unset: the desktop client routes
-        messages with no topic (or any topic other than "hermes-chat") to its
-        JSON/event handler.
-        """
+        """Translate Hermes lifecycle hooks into the shared Realtime contract."""
         if not self._room:
             return
+        protocol = getattr(self, "_realtime_protocol", None)
+        event_payload = payload or {}
+        if protocol:
+            identity = str(event_payload.get("identity") or "client")
+            if event_type == "agent:listening-start":
+                await protocol.speech_started(identity)
+                return
+            if event_type == "agent:listening-stop":
+                await protocol.speech_stopped(identity)
+                return
+            if event_type == "agent:user-transcript":
+                transcript = event_payload.get("transcript")
+                if event_payload.get("final") is True and isinstance(transcript, str):
+                    await protocol.user_transcript(transcript, identity)
+                return
+            if event_type == "agent:thinking-start":
+                await protocol.response_started()
+                return
+            if event_type == "agent:agent-transcript":
+                transcript = event_payload.get("transcript")
+                if isinstance(transcript, str):
+                    await protocol.assistant_transcript(transcript)
+                return
+            if event_type == "agent:speaking-start":
+                await protocol.output_started()
+                return
+            if event_type == "agent:speaking-stop":
+                await protocol.output_stopped()
+                return
+
+        # Video and native-tool lifecycle messages remain bounded Conference
+        # extensions. They no longer share the conversation event topic.
         try:
-            import json as _json
-            msg = {"type": event_type, "payload": payload or {}}
-            await self._room.local_participant.publish_data(
-                _json.dumps(msg).encode("utf-8"), reliable=True
+            await self._publish_typed(
+                {"type": event_type, "payload": event_payload},
+                topic=self.DATA_CHANNEL_CONTROL_TOPIC,
             )
         except Exception as e:
-            # Never let UI telemetry break the voice flow.
             logger.debug("[%s] agent event publish failed (%s): %s", self.name, event_type, e)
 
     async def send(
@@ -2163,12 +2289,6 @@ class LiveKitAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected to room")
 
         try:
-            data = content.encode("utf-8")
-            await self._room.local_participant.publish_data(
-                data, reliable=True, topic="hermes-chat"
-            )
-            # Mirror the content as an agent-transcript event so clients that
-            # render a conversation log can add an assistant message.
             await self._publish_agent_event(
                 "agent:agent-transcript", {"transcript": content, "final": True}
             )
@@ -2191,7 +2311,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         ``caption`` is the Telegram-style "attach the text to the voice message"
         hook; the gateway passes it on every platform. LiveKit delivers reply
-        text separately on ``hermes-chat``, so it is accepted and ignored —
+        text through Realtime transcript events, so it is accepted and ignored —
         returning without consuming it leaves the caller's
         ``_tts_caption_delivered`` False, which is what sends the text. The
         ``**kwargs`` keeps this override compatible with the base signature,

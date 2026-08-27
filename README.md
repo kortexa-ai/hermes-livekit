@@ -133,27 +133,48 @@ participant arrives, then transcribes incoming audio and replies via TTS.
 
 ## Data channel protocol
 
-Outbound (agent → client) is unchanged from earlier voice-only versions —
-final text replies on topic `hermes-chat`, `agent:*` lifecycle events with
-no topic. The 0.2.0 release adds an **inbound** channel for client-driven
-control + camera snapshots.
+Reliable JSON messages on `conference.events` use the same OpenAI-compatible
+session and conversation contract as `api.server` Conference calls. Audio
+stays on LiveKit tracks. Every participant in the room shares one Hermes
+conversation session; participant identity still scopes errors and tools.
 
-### Outbound (agent → client)
+The agent sends a targeted `session.created` snapshot when each participant
+joins. Room lifecycle events are broadcast:
 
-| Topic | Payload | When |
-|---|---|---|
-| `hermes-chat` | UTF-8 text | After agent generates a reply |
-| _(no topic)_ | JSON `{"type": "agent:<...>", "payload": {...}}` | Lifecycle events (see below) |
+- `input_audio_buffer.speech_started` / `speech_stopped`
+- `conversation.item.created`
+- `conversation.item.input_audio_transcription.completed`
+- `response.created` / `response.done`
+- `response.output_audio_transcript.done`
+- `output_audio_buffer.started` / `stopped` / `cleared`
+- correlated `error` events
 
-Agent lifecycle event types:
+Clients send supported Realtime events on the same topic. Typed input uses a
+normal user conversation item:
 
-- `agent:listening-start` / `agent:listening-stop` — VAD detected speech start/end
-- `agent:user-transcript` — STT (or typed message) finalized; payload `{transcript, final, identity, source?}`
-- `agent:thinking-start` — agent about to invoke the LLM
-- `agent:speaking-start` / `agent:speaking-stop` — TTS playback boundary
-- `agent:agent-transcript` — assistant reply text mirrored on data channel
-- `agent:frame-captured` — a video frame was sampled and queued; payload `{identity, width, height, bytes, timestamp}`
-- `agent:frame-capture-failed` — `client:capture-frame` could not be honored; payload `{reason, identity?, detail?}`
+```json
+{
+  "type": "conversation.item.create",
+  "item": {
+    "type": "message",
+    "role": "user",
+    "content": [{"type": "input_text", "text": "Hello"}]
+  }
+}
+```
+
+`response.cancel` cancels the active Hermes room turn and clears queued output
+audio. Unsupported events receive an explicit error targeted to the sending
+participant. The old `hermes-chat` and raw conversation `agent:*` streams are
+not part of the new contract.
+
+### Conference extensions
+
+Triggered camera capture and native tool discovery remain on
+`hermes-control`. Frame status messages also use that extension topic:
+
+- `agent:frame-captured`
+- `agent:frame-capture-failed`
 
 Remote-tool events (0.3.0+, flat envelope — no `payload` wrapper, sent
 only to the owning participant via `destination_identities`):
@@ -165,16 +186,13 @@ only to the owning participant via `destination_identities`):
 - `agent:tool-result-stream-cancel` — stop and close that targeted binary
   stream; `{stream_id, topic}`
 
-### Inbound (client → agent), topic `hermes-control`
+#### Inbound extension controls
 
 JSON payloads of the form `{"type": "client:<...>", ...}`:
 
 ```jsonc
 // sample the next frame from this client's published video track
 {"type": "client:capture-frame"}
-
-// inject a typed message (skips STT). Pending captures attach automatically.
-{"type": "client:message", "text": "what's in this picture?"}
 
 // runtime control hooks
 {"type": "client:control", "action": "pause"}    // stop sampling audio
