@@ -44,6 +44,100 @@ targets the invoking agent, and covers the ready/cancel/cleanup lifecycle with
 a camera-free PNG fixture. RPC still carries invocation and the small stream
 reference; the byte stream carries the payload.
 
+## OpenAI Realtime support
+
+The goal is to turn this project into a dual-transport realtime gateway for
+Hermes without changing `hermes-agent`. The gateway will support the OpenAI
+Realtime wire contract over direct WebRTC and the matching Kortexa Realtime
+Conference contract over LiveKit. The umbrella tracker is
+[#17](https://github.com/kortexa-ai/hermes-livekit/issues/17).
+
+### Four-backend client matrix
+
+`confcall.desktop` will use one conversation state machine with four connection
+choices:
+
+| Provider | Direct Realtime / WebRTC | Realtime Conference / LiveKit |
+| --- | --- | --- |
+| `api.server` | `POST /v1/realtime/calls` | `/v1/conference/calls` |
+| Hermes gateway | OpenAI-compatible endpoint | Conference-compatible endpoint |
+
+The client work is tracked in
+[`confcall.desktop#5`](https://github.com/kortexa-ai/confcall.desktop/issues/5).
+The existing proprietary Hermes topics are temporary compatibility code, not a
+fifth backend.
+
+### Architecture
+
+A shared `RealtimeSession` core will own protocol state, stable identifiers,
+validation, ordering, limits, errors, and lifecycle. Two thin media edges will
+connect it to direct WebRTC and LiveKit Conference sessions. A shared Hermes
+bridge will translate protocol actions to the public platform-adapter surface:
+`on_processing_start`, `on_processing_complete`,
+`cancel_session_processing`, `send`, and `play_tts`. The plugin will continue
+to own VAD, transcription, audio buffering, and transport cleanup. No
+`hermes-agent` change is required.
+
+The direct service will accept bounded authenticated multipart SDP and session
+configuration at `POST /v1/realtime/calls`, return an SDP answer, exchange RTP
+audio, and carry events on the `oai-events` data channel. It must define
+ICE/TURN behavior, admission and setup timeouts, idle and maximum duration
+limits, and deterministic cleanup. One direct call maps to one Hermes session.
+
+The Conference service will match `api.server` authentication and connection
+setup, including the returned LiveKit URL, token, room, and participant
+identity. Reliable data topics will carry the shared event contract. The room
+will have authoritative participant ownership, deterministic turn
+serialization, and last-member cleanup. One active room maps to one shared
+Hermes session.
+
+### Protocol surface
+
+Both transports will use the same session, conversation, item, response,
+content, audio, transcript, buffer, cancellation, tool-call, error, and usage
+model. IDs for events, sessions, items, responses, and calls must remain stable
+across asynchronous updates. The initial implementation must cover:
+
+- session creation and updates;
+- text, image, and audio conversation input;
+- VAD, transcription, response creation, streaming audio and transcripts;
+- response cancellation and output-audio buffer clearing;
+- function tools, tool results, structured errors, and usage events.
+
+"Full support" means that an OpenAI Realtime WebRTC client can use every
+feature Hermes can execute without a proprietary adapter. Provider-only
+behavior that Hermes cannot honor must return a correlated explicit error; it
+must never be silently ignored.
+
+Direct sessions will use OpenAI's flat function-tool and function-result flow.
+Conference sessions will match `api.server` participant tool registration,
+invocation, and result routing. Existing LiveKit native RPC and bounded binary
+byte streams remain supported Conference extensions, subject to the current
+deny-by-default policy, participant ownership, size limits, timeouts, and
+audit rules.
+
+### Migration and work units
+
+There are no third-party `hermes-livekit` clients to preserve, so this can be a
+clean breaking replacement of `agent:*`, `client:*`, `hermes-chat`, and
+`hermes-control`. Our applications will move to the shared contracts. A neutral
+project rename can follow after the new interfaces stabilize.
+
+- [#18](https://github.com/kortexa-ai/hermes-livekit/issues/18) — shared
+  Realtime protocol and session core.
+- [#19](https://github.com/kortexa-ai/hermes-livekit/issues/19) — Hermes bridge
+  implemented only through public adapter hooks.
+- [#20](https://github.com/kortexa-ai/hermes-livekit/issues/20) — direct OpenAI
+  Realtime-compatible WebRTC service.
+- [#21](https://github.com/kortexa-ai/hermes-livekit/issues/21) — Kortexa
+  Realtime Conference-compatible LiveKit service.
+- [#22](https://github.com/kortexa-ai/hermes-livekit/issues/22) — shared
+  function tools plus bounded Conference extensions.
+- [#23](https://github.com/kortexa-ai/hermes-livekit/issues/23) — four-backend
+  conformance tests, examples, migration notes, and release documentation.
+- [#24](https://github.com/kortexa-ai/hermes-livekit/issues/24) — neutral rename
+  after the dual-transport gateway stabilizes.
+
 ## Deferred indefinitely
 
 Documented in `docs/remote-tools-design.md` "Deferred for future":
