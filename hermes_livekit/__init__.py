@@ -10,10 +10,20 @@ import os
 from typing import Optional
 
 from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
+from .realtime_webrtc import (
+    RealtimeWebRTCAdapter,
+    check_realtime_requirements,
+)
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
-__all__ = ["register", "LiveKitAdapter", "check_livekit_requirements"]
+__all__ = [
+    "register",
+    "LiveKitAdapter",
+    "RealtimeWebRTCAdapter",
+    "check_livekit_requirements",
+    "check_realtime_requirements",
+]
 
 
 _LIVEKIT_PLATFORM_HINT = (
@@ -106,6 +116,50 @@ def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
     return seeded or None
 
 
+def _realtime_env_enablement() -> Optional[dict]:
+    """Enable the direct listener only when the operator opts in."""
+    enabled = os.getenv("HERMES_REALTIME_ENABLED", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return None
+    token = os.getenv("HERMES_REALTIME_API_KEY", "").strip()
+    if not token:
+        return None
+    raw_port = os.getenv("HERMES_REALTIME_PORT", "8091")
+    try:
+        port = int(raw_port)
+    except ValueError:
+        return None
+    if not 0 < port < 65536:
+        return None
+    return {
+        "host": os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"),
+        "port": port,
+        "api_key": token,
+    }
+
+
+def _apply_realtime_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
+    nested = platform_cfg.get("extra")
+    nested = nested if isinstance(nested, dict) else {}
+    seeded: dict = {}
+    for key in ("host", "port", "api_key", "max_calls", "max_call_seconds"):
+        if key in nested:
+            seeded[key] = nested[key]
+        elif key in platform_cfg:
+            seeded[key] = platform_cfg[key]
+    return seeded or None
+
+
+def _validate_realtime_config(cfg) -> bool:
+    try:
+        extra = cfg.extra or {}
+        token = str(extra.get("api_key") or os.getenv("HERMES_REALTIME_API_KEY", ""))
+        port = int(extra.get("port") or os.getenv("HERMES_REALTIME_PORT", "8091"))
+        return 0 < port < 65536 and bool(token)
+    except (TypeError, ValueError):
+        return False
+
+
 def _interactive_setup() -> None:
     """Prompt the user for LiveKit credentials and persist to .env.
 
@@ -176,6 +230,25 @@ def register(ctx) -> None:
         allow_update_command=False,
         # LLM guidance — delivered to run_agent.py via PlatformEntry.platform_hint
         platform_hint=_LIVEKIT_PLATFORM_HINT,
+    )
+
+    ctx.register_platform(
+        name="realtime",
+        label="Realtime WebRTC",
+        adapter_factory=lambda cfg: RealtimeWebRTCAdapter(cfg),
+        check_fn=check_realtime_requirements,
+        validate_config=_validate_realtime_config,
+        is_connected=_validate_realtime_config,
+        required_env=[],
+        install_hint="pip install hermes-livekit  # adds aiortc + aiohttp",
+        env_enablement_fn=_realtime_env_enablement,
+        apply_yaml_config_fn=_apply_realtime_yaml_config,
+        allowed_users_env="HERMES_REALTIME_ALLOWED_USERS",
+        allow_all_env="HERMES_REALTIME_ALLOW_ALL_USERS",
+        emoji="⚡",
+        pii_safe=False,
+        allow_update_command=False,
+        platform_hint=_LIVEKIT_PLATFORM_HINT.replace("LiveKit voice channel", "direct WebRTC voice call"),
     )
 
     # Declare both the platform bundle and the late-bound remote-tool toolset.

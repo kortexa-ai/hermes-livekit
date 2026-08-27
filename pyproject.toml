@@ -25,6 +25,11 @@ dependencies = [
   "livekit==1.1.14",
   "livekit-api==1.2.0",
   "Pillow==12.3.0",
+  # Direct OpenAI-compatible WebRTC signalling and media. aiortc 1.15.0
+  # requires av>=14,<18; pinning the selected wheel keeps installs deliberate.
+  "aiohttp==3.14.3",
+  "aiortc==1.15.0",
+  "av==17.0.0",
 ]
 
 [project.optional-dependencies]

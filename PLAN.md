@@ -84,6 +84,20 @@ audio, and carry events on the `oai-events` data channel. It must define
 ICE/TURN behavior, admission and setup timeouts, idle and maximum duration
 limits, and deterministic cleanup. One direct call maps to one Hermes session.
 
+Current implementation status (2026-08-26):
+
+- Shared transport-neutral session protocol: landed in `realtime_protocol.py`.
+- Conference/LiveKit edge: aligned on `conference.events`; one shared Hermes
+  session per room; typed input and cancellation use public adapter hooks.
+- Direct WebRTC edge: landed as the separately registered `realtime` platform.
+  It serves `/v1/realtime/calls`, negotiates real aiortc peers, carries events
+  on `oai-events`, consumes RTP audio through VAD/STT, queues TTS audio as RTP,
+  and bounds concurrent and maximum-duration calls.
+- Remaining direct-production gap: configurable ICE/TURN for calls that cross
+  NAT. Loopback/LAN exercise on snappy does not require it.
+- Remaining shared surface: function tools and richer input types tracked by
+  #22; the initial voice/text/session/response/cancellation spine is complete.
+
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
 identity. Reliable data topics will carry the shared event contract. The room

@@ -1,10 +1,12 @@
 # hermes-livekit
 
-LiveKit WebRTC voice gateway plugin for [hermes-agent](https://github.com/NousResearch/hermes-agent).
+Realtime voice gateway plugin for [hermes-agent](https://github.com/NousResearch/hermes-agent).
 
-Lets a Hermes gateway join a LiveKit room as an agent participant, transcribe
-participant speech via Hermes's STT pipeline, run the agent loop, and publish
-TTS replies back to the room as audio.
+It serves an OpenAI-compatible direct WebRTC endpoint and can join a LiveKit
+room as a Realtime Conference agent. Both transports transcribe speech through
+Hermes, run the same agent loop, return TTS audio, and share one conversation
+event contract. The name is now historically accurate in only one direction;
+the rename raccoon remains on the roadmap.
 
 ## Requirements
 
@@ -13,8 +15,8 @@ TTS replies back to the room as audio.
 - `ffmpeg` on `PATH` — used to decode TTS audio for the WebRTC publish path.
   - macOS: `brew install ffmpeg`
   - Debian / Ubuntu: `sudo apt install ffmpeg`
-- A reachable LiveKit server (LiveKit Cloud or self-hosted) with an API key /
-  secret pair.
+- A reachable LiveKit server and API key/secret pair only when using the
+  Conference transport. Direct WebRTC has no LiveKit dependency at runtime.
 
 ## Install
 
@@ -73,11 +75,13 @@ hermes plugins enable livekit
 
 (Or edit `~/.hermes/config.yaml` and add `livekit` to `plugins.enabled`.)
 
-Then enable the platform in the same config:
+Then enable either or both platforms in the same config:
 
 ```yaml
 platforms:
   livekit:
+    enabled: true
+  realtime:
     enabled: true
 plugins:
   enabled:
@@ -85,6 +89,39 @@ plugins:
 ```
 
 ## Configure
+
+### Direct Realtime / WebRTC
+
+The direct adapter implements OpenAI-style SDP signalling at
+`POST /v1/realtime/calls` (with `/realtime/calls` as an alias), RTP audio, and
+the `oai-events` data channel. Every listener requires a Bearer token:
+
+```yaml
+platforms:
+  realtime:
+    enabled: true
+    host: 127.0.0.1
+    port: 8091
+    api_key: ${HERMES_REALTIME_API_KEY}
+```
+
+The equivalent environment-only setup is:
+
+```bash
+HERMES_REALTIME_ENABLED=true
+HERMES_REALTIME_HOST=127.0.0.1
+HERMES_REALTIME_PORT=8091
+HERMES_REALTIME_API_KEY=choose-a-long-random-token
+HERMES_REALTIME_ALLOW_ALL_USERS=true
+```
+
+Send `HERMES_REALTIME_API_KEY` as a Bearer token. Startup fails closed if it is
+missing. `HERMES_REALTIME_MAX_CALLS` defaults to 8 and
+`HERMES_REALTIME_MAX_CALL_SECONDS` defaults to 7200. The current direct edge
+advertises host ICE candidates; deployments across NAT still need a TURN-aware
+front door before they are internet-ready.
+
+### Realtime Conference / LiveKit
 
 Set these env vars. Current Hermes also accepts the matching lowercase keys
 either directly under `platforms.livekit` or inside `platforms.livekit.extra`:
@@ -126,6 +163,9 @@ hermes config
 hermes gateway restart
 hermes gateway status      # should show 🎙️ LiveKit as connected
 ```
+
+For direct WebRTC, status also shows `⚡ Realtime` and the signalling endpoint
+is `http://127.0.0.1:8091/v1/realtime/calls` with the defaults above.
 
 Join the configured room from any LiveKit client (web, mobile, voice-agent
 desktop). The agent watches the room when empty and joins as soon as a real

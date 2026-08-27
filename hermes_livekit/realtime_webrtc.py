@@ -1,0 +1,550 @@
+"""OpenAI-compatible direct WebRTC transport for Hermes.
+
+This module is a second Hermes platform adapter.  It deliberately uses only
+the public platform-adapter API, so installing it does not require a patched
+``hermes-agent``.  Signalling is compatible with ``POST /v1/realtime/calls``;
+audio uses RTP and protocol events use the ``oai-events`` data channel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import json
+import logging
+import os
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from fractions import Fraction
+from typing import Any, Optional
+
+try:
+    from aiohttp import web
+    from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
+    from av import AudioFrame, AudioResampler
+
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    web = None  # type: ignore[assignment]
+    MediaStreamTrack = object  # type: ignore[assignment,misc]
+    RTCPeerConnection = None  # type: ignore[assignment,misc]
+    RTCSessionDescription = None  # type: ignore[assignment,misc]
+    AudioFrame = None  # type: ignore[assignment,misc]
+    AudioResampler = None  # type: ignore[assignment,misc]
+    WEBRTC_AVAILABLE = False
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+)
+from gateway.session import build_session_key
+
+from .adapter import (
+    MIN_SPEECH_DURATION,
+    NUM_CHANNELS,
+    RMS_SILENCE_FLOOR,
+    SAMPLE_RATE,
+    SILENCE_THRESHOLD_SECONDS,
+    _compute_rms,
+)
+from .realtime_protocol import RealtimeProtocol
+
+
+logger = logging.getLogger("gateway.platforms.realtime")
+CLIENT_IDENTITY = "webrtc-client"
+MAX_SDP_BYTES = 256 * 1024
+MAX_SESSION_BYTES = 64 * 1024
+DEFAULT_MAX_CALLS = 8
+DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
+
+
+def _configured_int(value: Any, default: int, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
+
+
+def check_realtime_requirements() -> bool:
+    """Return whether the pinned HTTP, WebRTC, and media dependencies load."""
+    return WEBRTC_AVAILABLE
+
+
+class QueuedAudioTrack(MediaStreamTrack):
+    """A paced aiortc audio track fed with 48 kHz mono signed PCM."""
+
+    kind = "audio"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self._timestamp = 0
+
+    async def recv(self) -> Any:
+        chunk = await self._queue.get()
+        try:
+            samples = len(chunk) // 2
+            frame = AudioFrame(format="s16", layout="mono", samples=samples)
+            frame.planes[0].update(chunk)
+            frame.sample_rate = SAMPLE_RATE
+            frame.pts = self._timestamp
+            frame.time_base = Fraction(1, SAMPLE_RATE)
+            self._timestamp += samples
+            return frame
+        finally:
+            self._queue.task_done()
+
+    async def enqueue_pcm(self, pcm: bytes) -> None:
+        samples_per_frame = SAMPLE_RATE // 50
+        bytes_per_frame = samples_per_frame * 2
+        for offset in range(0, len(pcm), bytes_per_frame):
+            chunk = pcm[offset : offset + bytes_per_frame]
+            if len(chunk) < bytes_per_frame:
+                chunk += b"\x00" * (bytes_per_frame - len(chunk))
+            await self._queue.put(chunk)
+
+    async def drained(self) -> None:
+        await self._queue.join()
+
+    def clear(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            else:
+                self._queue.task_done()
+
+
+@dataclass
+class RealtimeCall:
+    adapter: "RealtimeWebRTCAdapter"
+    call_id: str
+    peer: Any
+    output_track: QueuedAudioTrack
+    protocol: RealtimeProtocol
+    data_channel: Any = None
+    tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    audio_buffer: bytearray = field(default_factory=bytearray)
+    last_speech_at: float | None = None
+    speaking: bool = False
+    paused: bool = False
+    closed: bool = False
+
+    def spawn(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def publish(self, event: dict[str, Any], _recipient: str | None) -> bool:
+        channel = self.data_channel
+        if channel is None or getattr(channel, "readyState", "") != "open":
+            return False
+        channel.send(json.dumps(event, separators=(",", ":")))
+        return True
+
+    def attach_data_channel(self, channel: Any) -> None:
+        if getattr(channel, "label", "") != "oai-events":
+            logger.debug("[%s] ignoring unexpected data channel %r", self.call_id, channel.label)
+            return
+        self.data_channel = channel
+
+        @channel.on("open")
+        def on_open() -> None:
+            self.spawn(self.protocol.client_connected(CLIENT_IDENTITY))
+
+        @channel.on("message")
+        def on_message(message: Any) -> None:
+            if isinstance(message, (str, bytes)):
+                self.spawn(self.protocol.handle_client_message(message, CLIENT_IDENTITY))
+
+        @channel.on("close")
+        def on_close() -> None:
+            self.protocol.client_disconnected(CLIENT_IDENTITY)
+
+        if getattr(channel, "readyState", "") == "open":
+            self.spawn(self.protocol.client_connected(CLIENT_IDENTITY))
+
+    async def consume_audio(self, track: Any) -> None:
+        resampler = AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+        try:
+            while not self.closed:
+                frame = await track.recv()
+                if self.paused:
+                    continue
+                for converted in resampler.resample(frame):
+                    size = converted.samples * NUM_CHANNELS * 2
+                    pcm = bytes(converted.planes[0])[:size]
+                    await self.accept_pcm(pcm)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            if not self.closed:
+                logger.debug("[%s] inbound audio ended: %s", self.call_id, exc)
+        finally:
+            if self.speaking and self.audio_buffer:
+                await self.finish_utterance()
+
+    async def accept_pcm(self, pcm: bytes) -> None:
+        now = time.monotonic()
+        rms = _compute_rms(pcm)
+        if rms > RMS_SILENCE_FLOOR:
+            if not self.speaking:
+                self.audio_buffer.clear()
+                self.speaking = True
+                await self.protocol.speech_started(CLIENT_IDENTITY)
+            self.last_speech_at = now
+            self.audio_buffer.extend(pcm)
+            return
+        if not self.speaking:
+            return
+        self.audio_buffer.extend(pcm)
+        if self.last_speech_at is not None and now - self.last_speech_at >= SILENCE_THRESHOLD_SECONDS:
+            await self.finish_utterance()
+
+    async def finish_utterance(self) -> None:
+        pcm = bytes(self.audio_buffer)
+        self.audio_buffer.clear()
+        self.last_speech_at = None
+        was_speaking, self.speaking = self.speaking, False
+        if was_speaking:
+            await self.protocol.speech_stopped(CLIENT_IDENTITY)
+        duration = len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)
+        if duration >= MIN_SPEECH_DURATION:
+            self.spawn(self.adapter.process_voice(self, pcm))
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        current = asyncio.current_task()
+        for task in list(self.tasks):
+            if task is not current:
+                task.cancel()
+        self.output_track.clear()
+        await self.protocol.close()
+        try:
+            await self.peer.close()
+        except Exception:
+            pass
+
+
+class RealtimeWebRTCAdapter(BasePlatformAdapter):
+    """Hermes platform serving direct OpenAI-compatible WebRTC calls."""
+
+    supports_async_delivery = False
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config, Platform("realtime"))
+        extra = config.extra or {}
+        self.config.extra = extra
+        self.config.extra["group_sessions_per_user"] = False
+        self._host = str(extra.get("host") or os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"))
+        self._port = _configured_int(
+            extra.get("port", os.getenv("HERMES_REALTIME_PORT", "8091")),
+            8091,
+            minimum=0,
+        )
+        self._api_key = str(extra.get("api_key") or os.getenv("HERMES_REALTIME_API_KEY", ""))
+        self._max_calls = _configured_int(
+            extra.get("max_calls", os.getenv("HERMES_REALTIME_MAX_CALLS")),
+            DEFAULT_MAX_CALLS,
+        )
+        self._max_call_seconds = _configured_int(
+            extra.get("max_call_seconds", os.getenv("HERMES_REALTIME_MAX_CALL_SECONDS")),
+            DEFAULT_MAX_CALL_SECONDS,
+        )
+        self._calls: dict[str, RealtimeCall] = {}
+        self._runner: Any = None
+        self._site: Any = None
+
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        return chat_id not in self._auto_tts_disabled_chats
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if not WEBRTC_AVAILABLE:
+            logger.warning("[%s] direct WebRTC dependencies are not installed", self.name)
+            return False
+        if not self._api_key:
+            logger.error("[%s] HERMES_REALTIME_API_KEY is required", self.name)
+            return False
+        try:
+            application = web.Application(client_max_size=MAX_SDP_BYTES + MAX_SESSION_BYTES)
+            application.router.add_route("OPTIONS", "/v1/realtime/calls", self._options)
+            application.router.add_post("/v1/realtime/calls", self._create_call)
+            application.router.add_route("OPTIONS", "/realtime/calls", self._options)
+            application.router.add_post("/realtime/calls", self._create_call)
+            self._runner = web.AppRunner(application, access_log=None)
+            await self._runner.setup()
+            self._site = web.TCPSite(self._runner, self._host, self._port)
+            await self._site.start()
+            self._mark_connected()
+            logger.info("[%s] listening on http://%s:%d/v1/realtime/calls", self.name, self._host, self._port)
+            return True
+        except Exception as exc:
+            logger.error("[%s] failed to start direct WebRTC listener: %s", self.name, exc)
+            await self.disconnect()
+            return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+        calls, self._calls = list(self._calls.values()), {}
+        for call in calls:
+            await call.close()
+        if self._runner is not None:
+            await self._runner.cleanup()
+        self._runner = None
+        self._site = None
+
+    @staticmethod
+    def _cors_headers() -> dict[str, str]:
+        return {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+        }
+
+    async def _options(self, _request: Any) -> Any:
+        return web.Response(status=204, headers=self._cors_headers())
+
+    def _authorized(self, request: Any) -> bool:
+        if not self._api_key:
+            return True
+        header = request.headers.get("Authorization", "")
+        prefix = "Bearer "
+        return header.startswith(prefix) and hmac.compare_digest(header[len(prefix) :], self._api_key)
+
+    async def _read_offer(self, request: Any) -> tuple[str, dict[str, Any]]:
+        content_type = request.content_type.lower()
+        if content_type == "application/sdp":
+            raw = await request.read()
+            if len(raw) > MAX_SDP_BYTES:
+                raise web.HTTPRequestEntityTooLarge(max_size=MAX_SDP_BYTES, actual_size=len(raw))
+            return raw.decode("utf-8"), {}
+        if not content_type.startswith("multipart/"):
+            raise web.HTTPUnsupportedMediaType(text="expected multipart/form-data or application/sdp")
+        reader = await request.multipart()
+        sdp = ""
+        session: dict[str, Any] = {}
+        async for part in reader:
+            if part.name == "sdp":
+                raw = await part.read(decode=False)
+                if len(raw) > MAX_SDP_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(max_size=MAX_SDP_BYTES, actual_size=len(raw))
+                sdp = raw.decode("utf-8")
+            elif part.name == "session":
+                raw = await part.read(decode=False)
+                if len(raw) > MAX_SESSION_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(max_size=MAX_SESSION_BYTES, actual_size=len(raw))
+                try:
+                    decoded = json.loads(raw)
+                except (TypeError, ValueError):
+                    raise web.HTTPBadRequest(text="session must be a JSON object") from None
+                if not isinstance(decoded, dict):
+                    raise web.HTTPBadRequest(text="session must be a JSON object")
+                session = decoded
+            else:
+                await part.release()
+        if not sdp.strip():
+            raise web.HTTPBadRequest(text="missing sdp")
+        return sdp, session
+
+    async def _create_call(self, request: Any) -> Any:
+        headers = self._cors_headers()
+        if not self._authorized(request):
+            return web.Response(status=401, text="unauthorized", headers=headers)
+        if len(self._calls) >= self._max_calls:
+            return web.Response(status=429, text="too many active calls", headers=headers)
+        try:
+            sdp, _session = await self._read_offer(request)
+            call_id = f"call_{uuid.uuid4().hex}"
+            peer = RTCPeerConnection()
+            output_track = QueuedAudioTrack()
+            call: RealtimeCall
+
+            async def publish(event: dict[str, Any], recipient: str | None) -> bool:
+                return await call.publish(event, recipient)
+
+            protocol = RealtimeProtocol(
+                session_id=call_id,
+                model="hermes",
+                voice="hermes",
+                publish=publish,
+                on_text_input=lambda text, _identity: self.process_text(call, text),
+                on_response_requested=lambda _identity: None,
+                on_response_cancelled=lambda _identity: self.cancel_call_response(call),
+            )
+            call = RealtimeCall(self, call_id, peer, output_track, protocol)
+            self._calls[call_id] = call
+            peer.addTrack(output_track)
+
+            @peer.on("datachannel")
+            def on_datachannel(channel: Any) -> None:
+                call.attach_data_channel(channel)
+
+            @peer.on("track")
+            def on_track(track: Any) -> None:
+                if getattr(track, "kind", "") == "audio":
+                    call.spawn(call.consume_audio(track))
+
+            @peer.on("connectionstatechange")
+            async def on_connectionstatechange() -> None:
+                if peer.connectionState in {"failed", "closed", "disconnected"}:
+                    self._calls.pop(call_id, None)
+                    await call.close()
+
+            call.spawn(self._expire_call(call))
+            await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+            await peer.setLocalDescription(await peer.createAnswer())
+            return web.Response(
+                text=peer.localDescription.sdp,
+                content_type="application/sdp",
+                headers=headers,
+            )
+        except web.HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("[%s] rejected WebRTC offer: %s", self.name, exc)
+            if "call_id" in locals():
+                failed = self._calls.pop(call_id, None)
+                if failed is not None:
+                    await failed.close()
+            return web.Response(status=400, text="invalid WebRTC offer", headers=headers)
+
+    async def _expire_call(self, call: RealtimeCall) -> None:
+        await asyncio.sleep(self._max_call_seconds)
+        self._calls.pop(call.call_id, None)
+        await call.close()
+
+    async def process_voice(self, call: RealtimeCall, pcm: bytes) -> None:
+        path = ""
+        try:
+            from .adapter import _pcm_to_wav
+            from tools.transcription_tools import transcribe_audio
+
+            directory = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, f"utterance_{uuid.uuid4().hex[:12]}.wav")
+            with open(path, "wb") as file:
+                file.write(_pcm_to_wav(pcm, SAMPLE_RATE, NUM_CHANNELS))
+            result = await asyncio.to_thread(transcribe_audio, path)
+            transcript = (
+                (result.get("transcript") or result.get("text") or "").strip()
+                if isinstance(result, dict)
+                else ""
+            )
+            if transcript:
+                await call.protocol.user_transcript(transcript, CLIENT_IDENTITY)
+                await self._dispatch_text(call, transcript, MessageType.VOICE)
+        except Exception as exc:
+            logger.error("[%s] voice processing failed: %s", call.call_id, exc)
+            await call.protocol.response_failed()
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    async def process_text(self, call: RealtimeCall, text: str) -> None:
+        await self._dispatch_text(call, text, MessageType.TEXT)
+
+    async def _dispatch_text(self, call: RealtimeCall, text: str, kind: MessageType) -> None:
+        source = self.build_source(
+            chat_id=call.call_id,
+            chat_name=call.call_id,
+            chat_type="dm",
+            user_id=CLIENT_IDENTITY,
+            user_name=CLIENT_IDENTITY,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=kind,
+            source=source,
+            message_id=uuid.uuid4().hex[:12],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        await call.protocol.response_started()
+        await self.handle_message(event)
+
+    async def cancel_call_response(self, call: RealtimeCall) -> None:
+        source = self.build_source(
+            chat_id=call.call_id,
+            chat_name=call.call_id,
+            chat_type="dm",
+            user_id=CLIENT_IDENTITY,
+            user_name=CLIENT_IDENTITY,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+            profile=self._session_key_profile(source),
+        )
+        await self.cancel_session_processing(session_key)
+        call.output_track.clear()
+        call.paused = False
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        call = self._calls.get(chat_id)
+        if call is None:
+            return SendResult(success=False, error="Realtime call is closed")
+        await call.protocol.assistant_transcript(content)
+        return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+
+    async def play_tts(
+        self,
+        chat_id: str,
+        audio_path: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        caption: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        call = self._calls.get(chat_id)
+        if call is None:
+            return SendResult(success=False, error="Realtime call is closed")
+        from .adapter import LiveKitAdapter
+
+        pcm = await asyncio.to_thread(LiveKitAdapter._decode_audio_to_pcm, audio_path)
+        if not pcm:
+            await call.protocol.response_failed()
+            return SendResult(success=False, error="Failed to decode audio")
+        try:
+            call.paused = True
+            await call.protocol.output_started()
+            await call.output_track.enqueue_pcm(pcm)
+            await call.output_track.drained()
+            await call.protocol.output_stopped()
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+        finally:
+            call.paused = False
+
+    def prepare_tts_text(self, text: str) -> str:
+        from .adapter import LiveKitAdapter
+
+        return LiveKitAdapter.prepare_tts_text(self, text)
+
+    async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        return {
+            "name": chat_id,
+            "type": "dm",
+            "chat_id": chat_id,
+            "participants": [CLIENT_IDENTITY] if chat_id in self._calls else [],
+        }
