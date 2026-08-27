@@ -533,6 +533,25 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         finally:
             call.paused = False
 
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Deliver voice attachments on the call's native audio track."""
+        return await self.play_tts(
+            chat_id=chat_id,
+            audio_path=audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
+
     def prepare_tts_text(self, text: str) -> str:
         from .adapter import LiveKitAdapter
 

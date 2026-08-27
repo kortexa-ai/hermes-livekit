@@ -2367,6 +2367,25 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.error("[%s] TTS playback error: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """Deliver voice attachments on the room's native audio track."""
+        return await self.play_tts(
+            chat_id=chat_id,
+            audio_path=audio_path,
+            caption=caption,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
+
     @staticmethod
     def _decode_audio_to_pcm(audio_path: str) -> Optional[bytes]:
         """Decode an audio file to raw 16-bit PCM using ffmpeg."""

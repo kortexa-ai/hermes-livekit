@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import ClientSession
@@ -89,3 +90,26 @@ async def test_listener_requires_api_key(realtime_platform: None) -> None:
     )
 
     assert await adapter.connect() is False
+
+
+@pytest.mark.asyncio
+async def test_direct_send_voice_uses_native_audio_track() -> None:
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter.play_tts = AsyncMock(return_value="delivered")
+
+    result = await adapter.send_voice(
+        chat_id="call",
+        audio_path="reply.wav",
+        caption="caption",
+        reply_to="message",
+        metadata={"turn": 1},
+    )
+
+    assert result == "delivered"
+    adapter.play_tts.assert_awaited_once_with(
+        chat_id="call",
+        audio_path="reply.wav",
+        caption="caption",
+        reply_to="message",
+        metadata={"turn": 1},
+    )

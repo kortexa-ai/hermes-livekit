@@ -17,6 +17,9 @@ tests make them fail here instead.
 from __future__ import annotations
 
 import inspect
+from unittest.mock import AsyncMock
+
+import pytest
 
 from gateway.platforms.base import BasePlatformAdapter
 from hermes_livekit.adapter import LiveKitAdapter
@@ -78,3 +81,26 @@ def test_overrides_accept_every_base_parameter():
             problems.append(f"{name}(): base parameter(s) {missing} missing from override")
 
     assert not problems, "adapter overrides drifted from the base contract:\n  " + "\n  ".join(problems)
+
+
+@pytest.mark.asyncio
+async def test_livekit_send_voice_uses_native_audio_track():
+    adapter = object.__new__(LiveKitAdapter)
+    adapter.play_tts = AsyncMock(return_value="delivered")
+
+    result = await adapter.send_voice(
+        chat_id="room",
+        audio_path="reply.wav",
+        caption="caption",
+        reply_to="message",
+        metadata={"turn": 1},
+    )
+
+    assert result == "delivered"
+    adapter.play_tts.assert_awaited_once_with(
+        chat_id="room",
+        audio_path="reply.wav",
+        caption="caption",
+        reply_to="message",
+        metadata={"turn": 1},
+    )
