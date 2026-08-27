@@ -104,7 +104,11 @@ plugins:
 
 The direct adapter implements OpenAI-style SDP signalling at
 `POST /v1/realtime/calls` (with `/realtime/calls` as an alias), RTP audio, and
-the `oai-events` data channel. Every listener requires a Bearer token:
+the `oai-events` data channel. The preferred setup request is multipart with a
+required `sdp` field and optional `session` field. It returns `201
+application/sdp` with the call resource in `Location`; raw `application/sdp`
+offers remain accepted for older clients. Every listener requires a Bearer
+token:
 
 ```yaml
 platforms:

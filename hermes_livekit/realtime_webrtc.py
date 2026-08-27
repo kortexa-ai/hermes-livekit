@@ -379,7 +379,10 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 voice="hermes",
                 publish=publish,
                 on_text_input=lambda text, _identity: self.process_text(call, text),
-                on_response_requested=lambda _identity: None,
+                on_response_requested=lambda _identity: self.process_text(
+                    call,
+                    "Follow the session instructions and respond now.",
+                ),
                 on_response_cancelled=lambda _identity: self.cancel_call_response(call),
             )
             call = RealtimeCall(self, call_id, peer, output_track, protocol)
@@ -404,10 +407,15 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             call.spawn(self._expire_call(call))
             await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
             await peer.setLocalDescription(await peer.createAnswer())
+            response_headers = {
+                **headers,
+                "Location": f"/v1/realtime/calls/{call_id}",
+            }
             return web.Response(
+                status=201,
                 text=peer.localDescription.sdp,
                 content_type="application/sdp",
-                headers=headers,
+                headers=response_headers,
             )
         except web.HTTPException:
             raise

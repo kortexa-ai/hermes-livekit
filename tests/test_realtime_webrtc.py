@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from aiohttp import ClientSession
+from aiohttp import ClientSession, FormData
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from gateway.config import PlatformConfig
@@ -49,6 +49,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
     received: list[dict[str, object]] = []
     channel = peer.createDataChannel("oai-events")
     peer.addTransceiver("audio", direction="recvonly")
+    adapter.process_text = AsyncMock()
 
     @channel.on("message")
     def on_message(raw: str) -> None:
@@ -61,17 +62,19 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         assert await adapter.connect() is True
         port = adapter._site._server.sockets[0].getsockname()[1]
         await peer.setLocalDescription(await peer.createOffer())
+        form = FormData(default_to_multipart=True)
+        form.add_field("sdp", peer.localDescription.sdp)
         async with ClientSession() as client:
             async with client.post(
                 f"http://127.0.0.1:{port}/v1/realtime/calls",
-                data=peer.localDescription.sdp,
+                data=form,
                 headers={
                     "Authorization": "Bearer test-token",
-                    "Content-Type": "application/sdp",
                 },
             ) as response:
-                assert response.status == 200
+                assert response.status == 201
                 assert response.content_type == "application/sdp"
+                assert response.headers["Location"].startswith("/v1/realtime/calls/call_")
                 answer = await response.text()
         await peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type="answer"))
         await asyncio.wait_for(created.wait(), timeout=10)
@@ -79,9 +82,22 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         assert received[0]["type"] == "session.created"
         assert received[0]["session"]["model"] == "hermes"
         assert len(adapter._calls) == 1
+        channel.send(json.dumps({"type": "response.create"}))
+        await asyncio.wait_for(
+            _wait_until(lambda: adapter.process_text.await_count == 1),
+            timeout=5,
+        )
+        requested_call, prompt = adapter.process_text.await_args.args
+        assert requested_call.call_id.startswith("call_")
+        assert prompt == "Follow the session instructions and respond now."
     finally:
         await peer.close()
         await adapter.disconnect()
+
+
+async def _wait_until(predicate, interval: float = 0.01) -> None:
+    while not predicate():
+        await asyncio.sleep(interval)
 
 
 @pytest.mark.asyncio
