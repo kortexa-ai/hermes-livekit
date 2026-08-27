@@ -69,6 +69,63 @@ and
 The existing proprietary Hermes topics are temporary compatibility code, not a
 fifth backend.
 
+### Interchangeability target
+
+The compatibility boundary is the transport, not the backend. Direct clients
+must be able to switch among OpenAI Realtime, `api.server` Realtime, and Hermes
+Realtime by changing only endpoint, credentials, and provider selections.
+Conference clients must be able to switch between `api.server` and the Hermes
+gateway the same way.
+
+The base contract is the current OpenAI Realtime session, conversation, item,
+response, audio, cancellation, function-tool, error, and identifier model. We
+implement the largest practical common subset that the local AgentPeer and
+Hermes pipelines can execute. A valid but unsupported provider feature receives
+a bounded correlated error; it is not silently accepted or translated into a
+different behavior.
+
+Realtime Conference carries that base contract over LiveKit. For a 1:1 call it
+is primarily a transport upgrade. Its explicit extensions are:
+
+- authenticated room admission and returned LiveKit connection credentials;
+- authoritative participant identity and room membership;
+- deterministic n:1 turn serialization, with a future path to n:n;
+- participant-owned and trusted server tools;
+- targeted LiveKit native RPC and bounded binary byte streams when negotiated;
+- room history, reconnect, and last-member lifecycle.
+
+Those extensions do not replace or rename the shared conversation events.
+`conference.events` carries the base protocol and `conference.tools` carries
+the portable Conference tool contract. Native RPC and binary streams are
+optional capabilities layered on top.
+
+The same Conference implementation must run without code changes against the
+Kortexa self-hosted LiveKit deployment and LiveKit Cloud. URLs, keys, secrets,
+and target selection remain secret-backed runtime configuration.
+
+Current compatibility assessment:
+
+- basic 1:1 spoken turns work in all four local backend cells;
+- direct setup, audio, and a small lifecycle subset align, but session updates,
+  current item events, typed input, cancellation, and tools still diverge;
+- Conference audio and `conference.events` align, but admission, tools, typed
+  input, cancellation, history, and lifecycle still require separate clients;
+- local LiveKit is exercised; LiveKit Cloud and off-LAN relay parity are not yet
+  qualified.
+
+New work units created from this stricter definition:
+
+- [`api.server#46`](https://github.com/kortexa-ai/api.server/issues/46) — current
+  OpenAI Realtime WebRTC wire parity and real-API differential fixtures.
+- [`api.server#44`](https://github.com/kortexa-ai/api.server/issues/44) — make
+  Conference a transport adapter of the shared Realtime contract.
+- [#28](https://github.com/kortexa-ai/hermes-livekit/issues/28) — match the
+  `api.server` Conference setup and portable base protocol.
+- [`confcall.desktop#8`](https://github.com/kortexa-ai/confcall.desktop/issues/8)
+  — reduce four backend choices to one direct client and one Conference client.
+- [`api.server#45`](https://github.com/kortexa-ai/api.server/issues/45) — run the
+  same Conference qualification against local LiveKit and LiveKit Cloud.
+
 ### Architecture
 
 A shared `RealtimeSession` core will own protocol state, stable identifiers,
@@ -106,9 +163,12 @@ Current implementation status (2026-08-27):
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
 - Remaining shared surfaces: complete cross-transport function tools in #22,
-  and finish conformance fixtures, off-LAN smoke procedures, release docs, and
-  packaging in #23. The voice/text/session/response/cancellation spine is
-  complete and exercised in the shipped clients.
+  current OpenAI wire parity in `api.server#46`, Conference base-contract and
+  admission parity in `api.server#44` and #28, and conformance fixtures,
+  local/Cloud/off-LAN smokes, release docs, and packaging in #23 and
+  `api.server#45`. The spoken-turn spine is exercised, but the clients are not
+  yet interchangeable for typed input, cancellation, tools, or all lifecycle
+  events.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
