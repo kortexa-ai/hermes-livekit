@@ -140,6 +140,7 @@ NUM_CHANNELS = 1
 # Reconnection
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 10       # give up after this many consecutive failures
+EMPTY_ROOM_GRACE_SECONDS = 2.0    # tolerate transient participant loss during reconnect
 
 # Presence polling (when no humans in room, we stay out and poll).
 # Defaults differ by deployment:
@@ -240,6 +241,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._silence_task: Optional[asyncio.Task] = None
         self._connect_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
+        self._empty_room_task: Optional[asyncio.Task] = None
         self._graceful_leave: bool = False  # set while intentionally leaving
 
         # Per-participant audio buffers: identity -> (pcm bytearray, last_audio_time)
@@ -594,6 +596,14 @@ class LiveKitAdapter(BasePlatformAdapter):
                 pass
             self._presence_task = None
 
+        if self._empty_room_task:
+            self._empty_room_task.cancel()
+            try:
+                await self._empty_room_task
+            except asyncio.CancelledError:
+                pass
+            self._empty_room_task = None
+
         if self._silence_task:
             self._silence_task.cancel()
             try:
@@ -712,6 +722,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._tts_completed = False
 
     def _on_participant_connected(self, participant: "rtc.RemoteParticipant") -> None:
+        empty_room_task = getattr(self, "_empty_room_task", None)
+        if empty_room_task and not empty_room_task.done():
+            empty_room_task.cancel()
+        self._empty_room_task = None
         protocol = getattr(self, "_realtime_protocol", None)
         if not protocol:
             return
@@ -810,8 +824,40 @@ class LiveKitAdapter(BasePlatformAdapter):
             protocol.client_disconnected(identity)
 
         if self._room and not self._room.remote_participants:
-            logger.info("[%s] Last participant left '%s', leaving room", self.name, self._room_name)
-            asyncio.create_task(self._leave_and_watch())
+            logger.info(
+                "[%s] Last participant left '%s', waiting %.1fs for reconnect",
+                self.name,
+                self._room_name,
+                EMPTY_ROOM_GRACE_SECONDS,
+            )
+            pending = getattr(self, "_empty_room_task", None)
+            if pending is None or pending.done():
+                room = self._room
+                generation = self._room_generation
+                self._empty_room_task = asyncio.create_task(
+                    self._leave_after_empty_grace(room, generation)
+                )
+
+    async def _leave_after_empty_grace(self, room: "rtc.Room", generation: int) -> None:
+        """Leave only when a room stays empty through the reconnect window."""
+        try:
+            await asyncio.sleep(EMPTY_ROOM_GRACE_SECONDS)
+            if (
+                self._room is room
+                and self._room_generation == generation
+                and not room.remote_participants
+            ):
+                logger.info(
+                    "[%s] Room '%s' remained empty, leaving",
+                    self.name,
+                    self._room_name,
+                )
+                await self._leave_and_watch()
+        except asyncio.CancelledError:
+            return
+        finally:
+            if getattr(self, "_empty_room_task", None) is asyncio.current_task():
+                self._empty_room_task = None
 
     async def _release_room(self, room: Optional["rtc.Room"], *, why: str) -> None:
         """Disconnect through LiveKit's public API and let the SDK own FFI cleanup.
