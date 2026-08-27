@@ -54,7 +54,7 @@ Conference contract over LiveKit. The umbrella tracker is
 
 ### Four-backend client matrix
 
-`confcall.desktop` will use one conversation state machine with four connection
+`confcall.desktop` uses one conversation state machine with four connection
 choices:
 
 | Provider | Direct Realtime / WebRTC | Realtime Conference / LiveKit |
@@ -62,8 +62,10 @@ choices:
 | `api.server` | `POST /v1/realtime/calls` | `/v1/conference/calls` |
 | Hermes gateway | OpenAI-compatible endpoint | Conference-compatible endpoint |
 
-The client work is tracked in
-[`confcall.desktop#5`](https://github.com/kortexa-ai/confcall.desktop/issues/5).
+The client implementation and native four-mode validation landed through
+[`confcall.desktop#5`](https://github.com/kortexa-ai/confcall.desktop/issues/5)
+and
+[`confcall.desktop#6`](https://github.com/kortexa-ai/confcall.desktop/issues/6).
 The existing proprietary Hermes topics are temporary compatibility code, not a
 fifth backend.
 
@@ -84,7 +86,7 @@ audio, and carry events on the `oai-events` data channel. It must define
 ICE/TURN behavior, admission and setup timeouts, idle and maximum duration
 limits, and deterministic cleanup. One direct call maps to one Hermes session.
 
-Current implementation status (2026-08-26):
+Current implementation status (2026-08-27):
 
 - Shared transport-neutral session protocol: landed in `realtime_protocol.py`.
 - Conference/LiveKit edge: aligned on `conference.events`; one shared Hermes
@@ -93,10 +95,20 @@ Current implementation status (2026-08-26):
   It serves `/v1/realtime/calls`, negotiates real aiortc peers, carries events
   on `oai-events`, consumes RTP audio through VAD/STT, queues TTS audio as RTP,
   and bounds concurrent and maximum-duration calls.
+- Standard typed turns now queue `conversation.item.create` and begin exactly
+  once on `response.create` on both transports.
+- Hermes TTS now reaches native WebRTC and LiveKit audio output with matched
+  `output_audio_buffer.started` / `stopped` lifecycle events.
+- ConfCall Desktop completed native spoken-turn validation against all four
+  provider/transport combinations. Hermes LiveKit iOS completed typed-turn,
+  transcript, native audio, and idle-state validation against both Hermes
+  transports; its signed build is installed on `francip-max`.
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
-- Remaining shared surface: function tools and richer input types tracked by
-  #22; the initial voice/text/session/response/cancellation spine is complete.
+- Remaining shared surfaces: complete cross-transport function tools in #22,
+  and finish conformance fixtures, off-LAN smoke procedures, release docs, and
+  packaging in #23. The voice/text/session/response/cancellation spine is
+  complete and exercised in the shipped clients.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
