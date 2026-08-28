@@ -7,9 +7,10 @@ Operational state of the plugin and dependencies that don't show up in
 ## Where we are
 
 - **v0.4.0** is the latest tagged release.
-- Client tools use JSON `client:tool-register` / `client:tool-unregister`
-  messages for discovery and LiveKit native RPC for invocation. The SDK owns
-  correlation, response timeouts, and error transport.
+- Conference clients register one portable catalog with
+  `conference.tools.register` on `conference.tools`. Small Hermes tool calls
+  use LiveKit native RPC; bounded binary results use byte streams after the
+  portable ready handshake. The SDK owns RPC correlation and timeouts.
 - Remote tools are scoped by participant identity and operator policy.
   Multiple clients can advertise the same RPC method without replacing each
   other. Results can be small JSON values or bounded byte streams.
@@ -66,8 +67,9 @@ The client implementation and native four-mode validation landed through
 [`confcall.desktop#5`](https://github.com/kortexa-ai/confcall.desktop/issues/5)
 and
 [`confcall.desktop#6`](https://github.com/kortexa-ai/confcall.desktop/issues/6).
-The existing proprietary Hermes topics are temporary compatibility code, not a
-fifth backend.
+The legacy `hermes-chat`, `hermes-control`, and `client:*` client topics have
+been removed. Hermes-internal `agent:*` events stay behind the gateway bridge
+and are not part of the client protocol.
 
 ### Interchangeability target
 
@@ -108,13 +110,18 @@ Current compatibility assessment:
 - basic 1:1 spoken turns work in all four local backend cells, and real OpenAI
   Realtime is exercised as a fifth reference provider;
 - one secret-safe typed-input WebRTC probe passes unchanged against OpenAI,
-  `api.server`, and Hermes Direct. The two local backends return the same
-  ordered event-type sequence, including current item, output-item, and
-  content-part lifecycle events;
+  `api.server`, and Hermes Direct. The broader differential suite now covers
+  typed response, `session.update`, correlated invalid-event errors, idle
+  cancellation, and the complete function-call/result/continuation loop;
+- all five broader fixtures pass against real OpenAI and production
+  `api.server` on LFM2.5 8B A1B. Each api.server setup returns HTTP 201 with a
+  call Location. The same suite still needs to run against Hermes Direct;
 - Direct setup now aligns on optional multipart session data, HTTP 201, and a
   call `Location`. Typed input and cancellation use the normal local agent
-  pipelines. Broader `session.update`, cancellation/error fixtures, audio
-  equivalence, and Hermes function tools remain;
+  pipelines. api.server Direct and Conference now support the safe mutable
+  `session.update` subset (`instructions`, `tool_choice`) and reject other
+  mutable fields explicitly. Audio equivalence, the remaining session fields,
+  and Hermes Direct function tools remain;
 - API Conference and Hermes Conference use one authenticated
   `/v1/conference/calls` setup message and one ConfCall LiveKit client. The
   server derives a stable user-namespaced participant identity, and exact
@@ -199,16 +206,17 @@ Current implementation status (2026-08-27):
   the current Hermes tool contract; verified image envelopes remain structured.
 - Remaining direct-production gap: configurable ICE/TURN for calls that cross
   NAT. Loopback/LAN exercise on snappy does not require it.
-- Remaining shared surfaces: expand current OpenAI wire parity in
-  `api.server#46` and #23 to session
-  updates plus cancellation, error, tool, and audio fixtures; finish portable
-  session history/logging coverage in #28; and finish
+- Remaining shared surfaces: run the broader differential suite against Hermes
+  Direct under #23, extend parity to audio and the deliberately unsupported
+  mutable session fields in `api.server#46` and #23, finish portable session
+  history/logging coverage in #28, and finish
   direct TURN/off-LAN exercise, release docs, and packaging under
   `api.server#46` and #23. The clients are now interchangeable for the exercised
   setup, typed-turn, cancellation implementation, spoken-turn, transcript,
   reliable-data, reconnect, repeat-call, base lifecycle, and model-initiated
-  client-tool paths. Session logging, direct forced relay, and the unexercised
-  fixture matrix are the main parity boundary.
+  client-tool paths. Session logging, direct forced relay, audio differential
+  fixtures, and the Hermes Direct function-tool fixture are the main parity
+  boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
@@ -244,10 +252,11 @@ audit rules.
 
 ### Migration and work units
 
-There are no third-party `hermes-livekit` clients to preserve, so this can be a
-clean breaking replacement of `agent:*`, `client:*`, `hermes-chat`, and
-`hermes-control`. Our applications will move to the shared contracts. A neutral
-project rename can follow after the new interfaces stabilize.
+There are no third-party `hermes-livekit` clients to preserve. The breaking
+replacement of client-facing `client:*`, `hermes-chat`, and `hermes-control`
+topics is complete; applications use the shared Conference topics. Internal
+`agent:*` bridge events are implementation details. A neutral project rename
+can follow after the new interfaces stabilize.
 
 - [#18](https://github.com/kortexa-ai/hermes-livekit/issues/18) — shared
   Realtime protocol and session core.
