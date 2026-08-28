@@ -36,4 +36,6 @@ OpenAI Realtime multipart or data-channel contract.
   correlation, idle cancellation, and function-tool continuation. LFM skipped
   the optional tool once under `tool_choice=auto`; the isolated rerun completed
   the function call, client output, and continued response.
+- Hermes Direct now uses the self-hosted LiveKit UDP endpoint as STUN. A public
+  setup answer contains both host and server-reflexive ICE candidates.
 - Production off-LAN/TURN validation remains pending.
