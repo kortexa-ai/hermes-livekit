@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 
 import pytest
 
@@ -207,3 +208,74 @@ async def test_rejects_oversized_and_non_object_client_events() -> None:
         "invalid_event_json",
     ]
     assert all(recipient == "client-a" for _, recipient in sent)
+
+
+@pytest.mark.asyncio
+async def test_function_call_waits_for_output_and_response_create() -> None:
+    protocol, sent = protocol_fixture()
+    await protocol.client_connected("client-a")
+    await protocol.response_started()
+
+    result = asyncio.create_task(
+        protocol.request_client_tool("fixture_echo", {"value": "ready"})
+    )
+    await asyncio.sleep(0)
+    argument_event = next(
+        event for event, _ in sent
+        if event["type"] == "response.function_call_arguments.done"
+    )
+    call_id = argument_event["call_id"]
+
+    assert argument_event["name"] == "fixture_echo"
+    assert json.loads(argument_event["arguments"]) == {"value": "ready"}
+    assert [
+        event["response"]["status"] for event, _ in sent
+        if event["type"] == "response.done"
+    ] == ["completed"]
+
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "conversation.item.create",
+            "event_id": "tool-output",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "client-result",
+            },
+        }),
+        "client-a",
+    )
+    assert result.done() is False
+    assert any(
+        event["type"] == "conversation.item.done"
+        and event["item"]["type"] == "function_call_output"
+        for event, _ in sent
+    )
+
+    await protocol.handle_client_message(
+        json.dumps({"type": "response.create", "event_id": "tool-continue"}),
+        "client-a",
+    )
+
+    assert await result == "client-result"
+    assert sent[-1][0]["type"] == "response.created"
+
+
+@pytest.mark.asyncio
+async def test_function_output_rejects_unknown_call_ids() -> None:
+    protocol, sent = protocol_fixture()
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "conversation.item.create",
+            "event_id": "unknown-output",
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_unknown",
+                "output": "nope",
+            },
+        }),
+        "client-a",
+    )
+
+    assert sent[-1][0]["error"]["code"] == "unknown_tool_call"
+    assert sent[-1][0]["error"]["event_id"] == "unknown-output"

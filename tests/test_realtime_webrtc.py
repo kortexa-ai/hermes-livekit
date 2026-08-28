@@ -17,6 +17,7 @@ from hermes_livekit.realtime_webrtc import (
     RealtimeWebRTCAdapter,
     check_realtime_requirements,
 )
+from tools.registry import registry
 
 
 @pytest.fixture
@@ -50,6 +51,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
     channel = peer.createDataChannel("oai-events")
     peer.addTransceiver("audio", direction="recvonly")
     adapter.process_text = AsyncMock()
+    registered_name: str | None = None
 
     @channel.on("message")
     def on_message(raw: str) -> None:
@@ -64,6 +66,19 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         await peer.setLocalDescription(await peer.createOffer())
         form = FormData(default_to_multipart=True)
         form.add_field("sdp", peer.localDescription.sdp)
+        form.add_field(
+            "session",
+            json.dumps({
+                "type": "realtime",
+                "tools": [{
+                    "type": "function",
+                    "name": "fixture_echo",
+                    "description": "Return a value.",
+                    "parameters": {"type": "object", "properties": {}},
+                }],
+                "tool_choice": "auto",
+            }),
+        )
         async with ClientSession() as client:
             async with client.post(
                 f"http://127.0.0.1:{port}/v1/realtime/calls",
@@ -81,7 +96,12 @@ async def test_direct_listener_negotiates_and_sends_session_created(
 
         assert received[0]["type"] == "session.created"
         assert received[0]["session"]["model"] == "hermes"
+        assert received[0]["session"]["tool_choice"] == "auto"
         assert len(adapter._calls) == 1
+        active_call = next(iter(adapter._calls.values()))
+        assert active_call.tool_bridge is not None
+        registered_name = next(iter(active_call.tool_bridge._registered))
+        assert registry.get_entry(registered_name) is not None
         channel.send(json.dumps({"type": "response.create"}))
         await asyncio.wait_for(
             _wait_until(lambda: adapter.process_text.await_count == 1),
@@ -93,6 +113,8 @@ async def test_direct_listener_negotiates_and_sends_session_created(
     finally:
         await peer.close()
         await adapter.disconnect()
+    if registered_name is not None:
+        assert registry.get_entry(registered_name) is None
 
 
 async def _wait_until(predicate, interval: float = 0.01) -> None:
@@ -107,6 +129,45 @@ async def test_listener_requires_api_key(realtime_platform: None) -> None:
     )
 
     assert await adapter.connect() is False
+
+
+@pytest.mark.asyncio
+async def test_listener_rejects_required_tool_choice_explicitly(
+    realtime_platform: None,
+) -> None:
+    adapter = RealtimeWebRTCAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"host": "127.0.0.1", "port": 0, "api_key": "test-token"},
+        )
+    )
+    try:
+        assert await adapter.connect() is True
+        port = adapter._site._server.sockets[0].getsockname()[1]
+        form = FormData(default_to_multipart=True)
+        form.add_field("sdp", "v=0\r\n")
+        form.add_field(
+            "session",
+            json.dumps({
+                "type": "realtime",
+                "tools": [{
+                    "type": "function",
+                    "name": "fixture_echo",
+                    "parameters": {"type": "object", "properties": {}},
+                }],
+                "tool_choice": "required",
+            }),
+        )
+        async with ClientSession() as client:
+            async with client.post(
+                f"http://127.0.0.1:{port}/v1/realtime/calls",
+                data=form,
+                headers={"Authorization": "Bearer test-token"},
+            ) as response:
+                assert response.status == 400
+                assert "required is not supported" in await response.text()
+    finally:
+        await adapter.disconnect()
 
 
 @pytest.mark.asyncio

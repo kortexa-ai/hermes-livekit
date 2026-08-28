@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
@@ -13,6 +14,9 @@ from typing import Any, Optional
 MAX_EVENT_BYTES = 256 * 1024
 MAX_TEXT_BYTES = 64 * 1024
 MAX_EVENT_ID_BYTES = 128
+MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
+MAX_TOOL_OUTPUT_BYTES = 64 * 1024
+DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 
 Publish = Callable[[dict[str, Any], Optional[str]], Awaitable[bool]]
 ClientCallback = Callable[[str], Awaitable[None] | None]
@@ -41,6 +45,8 @@ class RealtimeProtocol:
         on_text_input: TextCallback | None = None,
         on_response_requested: ClientCallback | None = None,
         on_response_cancelled: ClientCallback | None = None,
+        tool_choice: str = "auto",
+        tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> None:
         self.session_id = session_id
         self.model = model
@@ -49,6 +55,8 @@ class RealtimeProtocol:
         self._on_text_input = on_text_input
         self._on_response_requested = on_response_requested
         self._on_response_cancelled = on_response_cancelled
+        self.tool_choice = tool_choice
+        self._tool_timeout_seconds = tool_timeout_seconds
         self._started_at = time.monotonic()
         self._event_sequence = 0
         self._input_sequence = 0
@@ -61,6 +69,7 @@ class RealtimeProtocol:
         self._active_transcript: str | None = None
         self._output_item_announced = False
         self._speaking = False
+        self._pending_tool: dict[str, Any] | None = None
         self._closed = False
 
     @property
@@ -78,6 +87,7 @@ class RealtimeProtocol:
                     "id": self.session_id,
                     "type": "realtime",
                     "model": self.model,
+                    "tool_choice": self.tool_choice,
                     "audio": {"output": {"voice": self.voice}},
                 },
             },
@@ -246,8 +256,101 @@ class RealtimeProtocol:
         await self._finish_audio_output_item("incomplete")
         await self._complete_response("failed")
 
+    async def request_client_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        """Emit one OpenAI function call and await its client-owned result."""
+        if self._closed:
+            raise RuntimeError("Realtime session is closed")
+        if self._pending_tool is not None:
+            raise RuntimeError("A client tool call is already pending")
+        try:
+            encoded_arguments = json.dumps(
+                arguments, ensure_ascii=False, separators=(",", ":")
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Tool arguments are not valid JSON") from exc
+        if len(encoded_arguments.encode("utf-8")) > MAX_TOOL_ARGUMENT_BYTES:
+            raise RuntimeError("Tool arguments are too large")
+
+        await self.response_started()
+        response_id = self._active_response_id
+        if not response_id:
+            raise RuntimeError("Could not start a function-call response")
+        wire_call_id = f"call_{uuid.uuid4().hex}"
+        item_id = f"item_{wire_call_id}"
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        pending = {
+            "call_id": wire_call_id,
+            "name": name,
+            "future": future,
+            "output": None,
+        }
+        self._pending_tool = pending
+        item = {
+            "id": item_id,
+            "type": "function_call",
+            "status": "in_progress",
+            "call_id": wire_call_id,
+            "name": name,
+            "arguments": "",
+        }
+        await self._emit({
+            "type": "response.output_item.added",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": item,
+        })
+        await self._emit({"type": "conversation.item.added", "previous_item_id": None, "item": item})
+        await self._emit({
+            "type": "response.function_call_arguments.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "call_id": wire_call_id,
+            "name": name,
+            "arguments": encoded_arguments,
+        })
+        done_item = {**item, "status": "completed", "arguments": encoded_arguments}
+        await self._emit({"type": "conversation.item.done", "previous_item_id": None, "item": done_item})
+        await self._emit({
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": 0,
+            "item": done_item,
+        })
+        await self._complete_response(
+            "completed",
+            explicit_output=[{
+                "id": item_id,
+                "type": "function_call",
+                "call_id": wire_call_id,
+                "name": name,
+                "arguments": encoded_arguments,
+            }],
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(future), timeout=self._tool_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            if self._pending_tool is pending:
+                self._pending_tool = None
+            if not future.done():
+                future.cancel()
+            await self._error(
+                "tool_timeout",
+                "Timed out while waiting for client tool result",
+                next(iter(self._clients), ""),
+                param="item.output",
+            )
+            raise RuntimeError("Client tool result timeout") from None
+
     async def close(self) -> None:
         self._closed = True
+        pending, self._pending_tool = self._pending_tool, None
+        if pending is not None:
+            future = pending["future"]
+            if not future.done():
+                future.cancel()
         self._clients.clear()
         self._input_items.clear()
         self._pending_text_inputs.clear()
@@ -264,10 +367,13 @@ class RealtimeProtocol:
         event_id: str | None,
     ) -> None:
         item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            await self._accept_tool_output(item, identity, event_id)
+            return
         if not isinstance(item, dict) or item.get("type") != "message" or item.get("role") != "user":
             await self._error(
                 "unsupported_conversation_item",
-                "Only user message input is supported",
+                "Only user messages and function_call_output are supported",
                 identity,
                 param="item",
                 triggering_event_id=event_id,
@@ -308,6 +414,17 @@ class RealtimeProtocol:
         if self._active_response_id:
             await self._error("conversation_already_has_active_response", "The conversation already has an active response", identity, param="response", triggering_event_id=event_id)
             return
+        pending_tool = self._pending_tool
+        if pending_tool is not None:
+            if pending_tool["output"] is None:
+                await self._error("tool_outputs_pending", "The tool output is required before response.create", identity, param="response", triggering_event_id=event_id)
+                return
+            await self.response_started()
+            self._pending_tool = None
+            future = pending_tool["future"]
+            if not future.done():
+                future.set_result(pending_tool["output"])
+            return
         text = self._pending_text_inputs.pop(identity, None)
         if text is not None:
             if not await _call(self._on_text_input, text, identity):
@@ -315,6 +432,41 @@ class RealtimeProtocol:
             return
         if not await _call(self._on_response_requested, identity):
             await self._error("response_create_unsupported", "response.create is unavailable", identity, param="response", triggering_event_id=event_id)
+
+    async def _accept_tool_output(
+        self,
+        item: dict[str, Any],
+        identity: str,
+        event_id: str | None,
+    ) -> None:
+        call_id = item.get("call_id")
+        output = item.get("output")
+        if (
+            not isinstance(call_id, str)
+            or not call_id
+            or len(call_id.encode("utf-8")) > MAX_EVENT_ID_BYTES
+            or not isinstance(output, str)
+            or len(output.encode("utf-8")) > MAX_TOOL_OUTPUT_BYTES
+        ):
+            await self._error("invalid_tool_output", "call_id or output is invalid", identity, param="item", triggering_event_id=event_id)
+            return
+        pending = self._pending_tool
+        if pending is None or pending["call_id"] != call_id:
+            await self._error("unknown_tool_call", "Tool call is unknown or no longer pending", identity, param="item.call_id", triggering_event_id=event_id)
+            return
+        if pending["output"] is not None:
+            await self._error("duplicate_tool_output", "Tool output was already received", identity, param="item.call_id", triggering_event_id=event_id)
+            return
+        pending["output"] = output
+        await self._emit_conversation_item(
+            {
+                "id": f"item_{call_id}_output",
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            },
+            recipient=identity,
+        )
 
     async def _accept_response_cancel(self, identity: str, event_id: str | None) -> None:
         if not self._active_response_id:
@@ -328,12 +480,17 @@ class RealtimeProtocol:
             self._speaking = False
             await self._emit({"type": "output_audio_buffer.cleared", "response_id": response_id})
 
-    async def _complete_response(self, status: str) -> None:
+    async def _complete_response(
+        self,
+        status: str,
+        *,
+        explicit_output: list[dict[str, Any]] | None = None,
+    ) -> None:
         response_id = self._active_response_id
         if not response_id:
             return
-        output: list[dict[str, Any]] = []
-        if status == "completed" and self._active_transcript:
+        output: list[dict[str, Any]] = list(explicit_output or [])
+        if explicit_output is None and status == "completed" and self._active_transcript:
             output.append(
                 {
                     "id": self._active_output_item_id or f"item_{response_id}_audio",

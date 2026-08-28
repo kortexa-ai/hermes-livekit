@@ -10,6 +10,7 @@ import os
 from typing import Optional
 
 from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
+from .direct_tools import install_direct_toolsets
 from .realtime_webrtc import (
     RealtimeWebRTCAdapter,
     check_realtime_requirements,
@@ -251,7 +252,7 @@ def register(ctx) -> None:
         platform_hint=_LIVEKIT_PLATFORM_HINT.replace("LiveKit voice channel", "direct WebRTC voice call"),
     )
 
-    # Declare both the platform bundle and the late-bound remote-tool toolset.
+    # Declare the platform bundles and late-bound remote-tool toolsets.
     # Client tools are registered only after a participant connects, but the
     # empty declaration keeps config validation truthful before that happens.
     try:
@@ -268,6 +269,7 @@ def register(ctx) -> None:
                 "tools": [],
                 "includes": [],
             }
+        install_direct_toolsets()
     except Exception:
         # Toolset registration is best-effort; the adapter still works
         # without it (resolves through the gateway umbrella toolset).

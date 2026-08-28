@@ -54,12 +54,13 @@ from .adapter import (
     _compute_rms,
 )
 from .realtime_protocol import RealtimeProtocol
+from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
 CLIENT_IDENTITY = "webrtc-client"
 MAX_SDP_BYTES = 256 * 1024
-MAX_SESSION_BYTES = 64 * 1024
+MAX_SESSION_BYTES = 512 * 1024
 DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
 
@@ -130,6 +131,7 @@ class RealtimeCall:
     peer: Any
     output_track: QueuedAudioTrack
     protocol: RealtimeProtocol
+    tool_bridge: DirectToolBridge | None = None
     data_channel: Any = None
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     audio_buffer: bytearray = field(default_factory=bytearray)
@@ -230,6 +232,8 @@ class RealtimeCall:
             if task is not current:
                 task.cancel()
         self.output_track.clear()
+        if self.tool_bridge is not None:
+            self.tool_bridge.close()
         await self.protocol.close()
         try:
             await self.peer.close()
@@ -364,7 +368,10 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         if len(self._calls) >= self._max_calls:
             return web.Response(status=429, text="too many active calls", headers=headers)
         try:
-            sdp, _session = await self._read_offer(request)
+            sdp, session = await self._read_offer(request)
+            if session.get("type", "realtime") != "realtime":
+                raise web.HTTPBadRequest(text="only realtime sessions are supported")
+            tools, tool_choice = parse_direct_tools(session)
             call_id = f"call_{uuid.uuid4().hex}"
             peer = RTCPeerConnection()
             output_track = QueuedAudioTrack()
@@ -378,6 +385,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 model="hermes",
                 voice="hermes",
                 publish=publish,
+                tool_choice=tool_choice,
                 on_text_input=lambda text, _identity: self.process_text(call, text),
                 on_response_requested=lambda _identity: self.process_text(
                     call,
@@ -386,6 +394,13 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 on_response_cancelled=lambda _identity: self.cancel_call_response(call),
             )
             call = RealtimeCall(self, call_id, peer, output_track, protocol)
+            if tools:
+                bridge = DirectToolBridge(
+                    session_id=self._session_key_for_call(call_id),
+                    protocol=protocol,
+                )
+                bridge.register(tools)
+                call.tool_bridge = bridge
             self._calls[call_id] = call
             peer.addTrack(output_track)
 
@@ -417,12 +432,18 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 content_type="application/sdp",
                 headers=response_headers,
             )
+        except DirectToolError as exc:
+            if "call" in locals():
+                await call.close()
+            return web.Response(status=400, text=str(exc), headers=headers)
         except web.HTTPException:
             raise
         except Exception as exc:
             logger.warning("[%s] rejected WebRTC offer: %s", self.name, exc)
             if "call_id" in locals():
                 failed = self._calls.pop(call_id, None)
+                if failed is None and "call" in locals():
+                    failed = call
                 if failed is not None:
                     await failed.close()
             return web.Response(status=400, text="invalid WebRTC offer", headers=headers)
@@ -466,38 +487,40 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         await self._dispatch_text(call, text, MessageType.TEXT)
 
     async def _dispatch_text(self, call: RealtimeCall, text: str, kind: MessageType) -> None:
-        source = self.build_source(
-            chat_id=call.call_id,
-            chat_name=call.call_id,
-            chat_type="dm",
-            user_id=CLIENT_IDENTITY,
-            user_name=CLIENT_IDENTITY,
-        )
+        source = self._source_for_call(call.call_id)
         event = MessageEvent(
             text=text,
             message_type=kind,
             source=source,
             message_id=uuid.uuid4().hex[:12],
             timestamp=datetime.now(tz=timezone.utc),
+            channel_prompt=(
+                call.tool_bridge.prompt_hint() if call.tool_bridge is not None else None
+            ),
         )
         await call.protocol.response_started()
         await self.handle_message(event)
 
-    async def cancel_call_response(self, call: RealtimeCall) -> None:
-        source = self.build_source(
-            chat_id=call.call_id,
-            chat_name=call.call_id,
+    def _source_for_call(self, call_id: str) -> Any:
+        return self.build_source(
+            chat_id=call_id,
+            chat_name=call_id,
             chat_type="dm",
             user_id=CLIENT_IDENTITY,
             user_name=CLIENT_IDENTITY,
         )
-        session_key = build_session_key(
+
+    def _session_key_for_call(self, call_id: str) -> str:
+        source = self._source_for_call(call_id)
+        return build_session_key(
             source,
             group_sessions_per_user=False,
             thread_sessions_per_user=False,
             profile=self._session_key_profile(source),
         )
-        await self.cancel_session_processing(session_key)
+
+    async def cancel_call_response(self, call: RealtimeCall) -> None:
+        await self.cancel_session_processing(self._session_key_for_call(call.call_id))
         call.output_track.clear()
         call.paused = False
 
