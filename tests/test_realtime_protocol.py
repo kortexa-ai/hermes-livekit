@@ -42,6 +42,60 @@ async def test_targets_session_snapshot_and_correlated_client_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_accepts_bounded_session_update_and_targets_snapshot() -> None:
+    protocol, sent = protocol_fixture(instructions="initial")
+
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "session.update",
+            "event_id": "session-update-1",
+            "session": {
+                "type": "realtime",
+                "instructions": "Reply briefly.",
+                "tool_choice": "none",
+            },
+        }),
+        "client-a",
+    )
+
+    assert protocol.instructions == "Reply briefly."
+    assert protocol.tool_choice == "none"
+    assert sent[0][0]["event_id"].startswith("evt_room-a_1_")
+    assert sent[0][0]["type"] == "session.updated"
+    assert sent[0][0]["session"] == {
+        "id": "room-a",
+        "type": "realtime",
+        "model": "local-model",
+        "instructions": "Reply briefly.",
+        "tool_choice": "none",
+        "audio": {"output": {"voice": "local-voice"}},
+    }
+    assert sent[0][1] == "client-a"
+
+
+@pytest.mark.asyncio
+async def test_rejects_unsupported_session_update_fields() -> None:
+    protocol, sent = protocol_fixture()
+
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "session.update",
+            "event_id": "session-update-unsupported",
+            "session": {"type": "realtime", "temperature": 0.5},
+        }),
+        "client-a",
+    )
+
+    assert sent[-1][0]["error"] == {
+        "type": "invalid_request_error",
+        "code": "unsupported_session_field",
+        "message": "Unsupported session field: temperature",
+        "param": "session.temperature",
+        "event_id": "session-update-unsupported",
+    }
+
+
+@pytest.mark.asyncio
 async def test_maps_audio_and_response_lifecycle_to_openai_events() -> None:
     protocol, sent = protocol_fixture()
 

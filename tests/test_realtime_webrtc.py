@@ -58,6 +58,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
     )
     peer = RTCPeerConnection()
     created = asyncio.Event()
+    updated = asyncio.Event()
     received: list[dict[str, object]] = []
     channel = peer.createDataChannel("oai-events")
     peer.addTransceiver("audio", direction="recvonly")
@@ -70,6 +71,8 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         received.append(event)
         if event.get("type") == "session.created":
             created.set()
+        if event.get("type") == "session.updated":
+            updated.set()
 
     try:
         assert await adapter.connect() is True
@@ -81,6 +84,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
             "session",
             json.dumps({
                 "type": "realtime",
+                "instructions": "Initial instructions.",
                 "tools": [{
                     "type": "function",
                     "name": "fixture_echo",
@@ -108,11 +112,22 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         assert received[0]["type"] == "session.created"
         assert received[0]["session"]["model"] == "hermes"
         assert received[0]["session"]["tool_choice"] == "auto"
+        assert received[0]["session"]["instructions"] == "Initial instructions."
         assert len(adapter._calls) == 1
         active_call = next(iter(adapter._calls.values()))
         assert active_call.tool_bridge is not None
         registered_name = next(iter(active_call.tool_bridge._registered))
         assert registry.get_entry(registered_name) is not None
+        channel.send(json.dumps({
+            "type": "session.update",
+            "event_id": "fixture-session-update",
+            "session": {
+                "type": "realtime",
+                "instructions": "Reply briefly.",
+            },
+        }))
+        await asyncio.wait_for(updated.wait(), timeout=5)
+        assert active_call.protocol.instructions == "Reply briefly."
         channel.send(json.dumps({"type": "response.create"}))
         await asyncio.wait_for(
             _wait_until(lambda: adapter.process_text.await_count == 1),

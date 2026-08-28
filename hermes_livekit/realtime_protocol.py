@@ -14,6 +14,7 @@ from typing import Any, Optional
 MAX_EVENT_BYTES = 256 * 1024
 MAX_TEXT_BYTES = 64 * 1024
 MAX_EVENT_ID_BYTES = 128
+MAX_INSTRUCTIONS_BYTES = 64 * 1024
 MAX_TOOL_ARGUMENT_BYTES = 64 * 1024
 MAX_TOOL_OUTPUT_BYTES = 64 * 1024
 DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
@@ -45,6 +46,7 @@ class RealtimeProtocol:
         on_text_input: TextCallback | None = None,
         on_response_requested: ClientCallback | None = None,
         on_response_cancelled: ClientCallback | None = None,
+        instructions: str = "",
         tool_choice: str = "auto",
         tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> None:
@@ -55,6 +57,7 @@ class RealtimeProtocol:
         self._on_text_input = on_text_input
         self._on_response_requested = on_response_requested
         self._on_response_cancelled = on_response_cancelled
+        self.instructions = instructions
         self.tool_choice = tool_choice
         self._tool_timeout_seconds = tool_timeout_seconds
         self._started_at = time.monotonic()
@@ -83,13 +86,7 @@ class RealtimeProtocol:
         await self._emit(
             {
                 "type": "session.created",
-                "session": {
-                    "id": self.session_id,
-                    "type": "realtime",
-                    "model": self.model,
-                    "tool_choice": self.tool_choice,
-                    "audio": {"output": {"voice": self.voice}},
-                },
+                "session": self._session_snapshot(),
             },
             recipient=identity,
         )
@@ -128,7 +125,9 @@ class RealtimeProtocol:
         if not isinstance(event_id, str) or len(event_id.encode("utf-8")) > MAX_EVENT_ID_BYTES:
             event_id = None
         event_type = event.get("type")
-        if event_type == "conversation.item.create":
+        if event_type == "session.update":
+            await self._accept_session_update(event, identity, event_id)
+        elif event_type == "conversation.item.create":
             await self._accept_conversation_item(event, identity, event_id)
         elif event_type == "response.create":
             await self._accept_response_create(identity, event_id)
@@ -143,6 +142,79 @@ class RealtimeProtocol:
                 param="type",
                 triggering_event_id=event_id,
             )
+
+    def _session_snapshot(self) -> dict[str, Any]:
+        return {
+            "id": self.session_id,
+            "type": "realtime",
+            "model": self.model,
+            "instructions": self.instructions,
+            "tool_choice": self.tool_choice,
+            "audio": {"output": {"voice": self.voice}},
+        }
+
+    async def _accept_session_update(
+        self,
+        event: dict[str, Any],
+        identity: str,
+        event_id: str | None,
+    ) -> None:
+        session = event.get("session")
+        if not isinstance(session, dict):
+            await self._error(
+                "invalid_session",
+                "session must be an object",
+                identity,
+                param="session",
+                triggering_event_id=event_id,
+            )
+            return
+        allowed = {"type", "instructions", "tool_choice"}
+        unknown = next((key for key in session if key not in allowed), None)
+        if unknown is not None:
+            await self._error(
+                "unsupported_session_field",
+                f"Unsupported session field: {unknown}",
+                identity,
+                param=f"session.{unknown}",
+                triggering_event_id=event_id,
+            )
+            return
+        if session.get("type") != "realtime":
+            await self._error(
+                "unsupported_session_type",
+                "Only realtime sessions are supported",
+                identity,
+                param="session.type",
+                triggering_event_id=event_id,
+            )
+            return
+        instructions = session.get("instructions", self.instructions)
+        if not isinstance(instructions, str) or len(instructions.encode("utf-8")) > MAX_INSTRUCTIONS_BYTES:
+            await self._error(
+                "invalid_session",
+                "session.instructions is invalid",
+                identity,
+                param="session.instructions",
+                triggering_event_id=event_id,
+            )
+            return
+        tool_choice = session.get("tool_choice", self.tool_choice)
+        if tool_choice not in {"auto", "none"}:
+            await self._error(
+                "unsupported_tool_choice",
+                "Unsupported tool choice",
+                identity,
+                param="session.tool_choice",
+                triggering_event_id=event_id,
+            )
+            return
+        self.instructions = instructions
+        self.tool_choice = tool_choice
+        await self._emit(
+            {"type": "session.updated", "session": self._session_snapshot()},
+            recipient=identity,
+        )
 
     async def speech_started(self, identity: str) -> None:
         item_id = self._new_input_item(identity)

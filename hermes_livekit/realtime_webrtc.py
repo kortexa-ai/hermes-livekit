@@ -64,7 +64,7 @@ from .adapter import (
     SILENCE_THRESHOLD_SECONDS,
     _compute_rms,
 )
-from .realtime_protocol import RealtimeProtocol
+from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
 
 
@@ -532,6 +532,12 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             if session.get("type", "realtime") != "realtime":
                 raise web.HTTPBadRequest(text="only realtime sessions are supported")
             tools, tool_choice = parse_direct_tools(session)
+            instructions = session.get("instructions", "")
+            if (
+                not isinstance(instructions, str)
+                or len(instructions.encode("utf-8")) > MAX_INSTRUCTIONS_BYTES
+            ):
+                raise DirectToolError("instructions must be a bounded string")
             call_id = f"call_{uuid.uuid4().hex}"
             peer = RTCPeerConnection(RTCConfiguration(iceServers=self._ice_servers))
             output_track = QueuedAudioTrack()
@@ -545,6 +551,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 model="hermes",
                 voice="hermes",
                 publish=publish,
+                instructions=instructions,
                 tool_choice=tool_choice,
                 on_text_input=lambda text, _identity: self.process_text(call, text),
                 on_response_requested=lambda _identity: self.process_text(
@@ -657,15 +664,17 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
 
     async def _dispatch_text(self, call: RealtimeCall, text: str, kind: MessageType) -> None:
         source = self._source_for_call(call)
+        prompts = [call.protocol.instructions.strip()]
+        if call.tool_bridge is not None and call.protocol.tool_choice != "none":
+            prompts.append(call.tool_bridge.prompt_hint().strip())
+        channel_prompt = "\n\n".join(prompt for prompt in prompts if prompt) or None
         event = MessageEvent(
             text=text,
             message_type=kind,
             source=source,
             message_id=uuid.uuid4().hex[:12],
             timestamp=datetime.now(tz=timezone.utc),
-            channel_prompt=(
-                call.tool_bridge.prompt_hint() if call.tool_bridge is not None else None
-            ),
+            channel_prompt=channel_prompt,
         )
         await call.protocol.response_started()
         await self.handle_message(event)
