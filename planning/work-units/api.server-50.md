@@ -25,4 +25,6 @@ OpenAI Realtime multipart or data-channel contract.
 - Signed identity, replay/body binding, legacy direct identity, bounded ICE
   parsing, and the API cross-language HMAC fixture are covered.
 - Full repository suite passes: `156 passed`.
+- A real Node API proxy completed two sequential aiortc negotiations against an
+  ephemeral signed Hermes listener and received `session.created` on both.
 - Production off-LAN/TURN validation remains pending.
