@@ -32,4 +32,8 @@ OpenAI Realtime multipart or data-channel contract.
   ephemeral signed Hermes listener and received `session.created` on both.
 - Production api.server reaches the existing snappy Hermes gateway over
   Tailscale and returns `201 application/sdp` with a public Location header.
+- The production sweep passes typed response, session update, invalid-event
+  correlation, idle cancellation, and function-tool continuation. LFM skipped
+  the optional tool once under `tool_choice=auto`; the isolated rerun completed
+  the function call, client output, and continued response.
 - Production off-LAN/TURN validation remains pending.
