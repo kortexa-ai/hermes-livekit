@@ -15,6 +15,11 @@ changing `hermes-agent`.
   pipeline through an adapter callback.
 - Keep LiveKit admission, participant identity, RPC tools, and binary transfer
   as explicit Conference extensions rather than base-protocol forks.
+- Use `conference.tools.register` and its shared acknowledgement on
+  `conference.tools`; an empty list replaces a participant's registrations.
+- Remove `hermes-control` from the client path. Put optional camera and runtime
+  controls on `conference.extensions`, while native RPC and byte streams stay
+  negotiated transport capabilities.
 - Return validated client RPC JSON as serialized text because current Hermes
   accepts normal tool results only as strings. Preserve the supported
   multimodal dictionary envelope for verified image byte streams.

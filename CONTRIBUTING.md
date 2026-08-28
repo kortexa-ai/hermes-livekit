@@ -63,8 +63,8 @@ A reasonable smoke test loop, given those:
 3. Speak. The agent should hear, transcribe, respond.
 
 For frame-capture testing, see the `data channel protocol` section of the
-README — send `{"type": "client:capture-frame"}` on the `hermes-control`
-topic while a video track is published.
+README — send `{"type": "conference.capture_frame"}` on the
+`conference.extensions` topic while a video track is published.
 
 To enable verbose adapter logs:
 

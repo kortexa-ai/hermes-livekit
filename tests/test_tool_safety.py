@@ -163,7 +163,7 @@ async def test_missing_policy_denies_registration_before_registry_mutation(
     register = AsyncMock()
     monkeypatch.setattr(registry, "register", register)
 
-    await adapter._register_client_tool(
+    accepted = await adapter._register_client_tool(
         {
             "name": "observe",
             "description": "Read state.",
@@ -173,7 +173,7 @@ async def test_missing_policy_denies_registration_before_registry_mutation(
     )
 
     register.assert_not_called()
-    assert adapter._publish_typed.await_args.args[0]["reason"] == "policy-denied"
+    assert accepted is False
     assert [record["event"] for record in adapter._tool_audit_snapshot()] == [
         "policy",
         "registration",
@@ -200,7 +200,7 @@ async def test_invalid_registration_has_sanitized_denied_audit(
     register = AsyncMock()
     monkeypatch.setattr(registry, "register", register)
 
-    await adapter._register_client_tool(
+    accepted = await adapter._register_client_tool(
         {
             "name": name,
             "description": "description-secret",
@@ -210,6 +210,7 @@ async def test_invalid_registration_has_sanitized_denied_audit(
     )
 
     register.assert_not_called()
+    assert accepted is False
     records = adapter._tool_audit_snapshot()
     assert records[-1]["event"] == "registration"
     assert records[-1]["outcome"] == "denied"
@@ -234,16 +235,12 @@ async def test_registration_failure_does_not_expose_exception_text(
         raise RuntimeError("credential-shaped-registration-error")
 
     monkeypatch.setattr(registry, "register", fail_register)
-    await adapter._register_client_tool(
+    accepted = await adapter._register_client_tool(
         {"name": "observe", "input_schema": {"type": "object"}}, "client"
     )
 
-    assert adapter._publish_typed.await_args.args[0] == {
-        "type": "agent:tool-registered",
-        "name": "observe",
-        "success": False,
-        "reason": "register-failed",
-    }
+    assert accepted is False
+    adapter._publish_typed.assert_not_awaited()
     assert "credential-shaped-registration-error" not in caplog.text
     assert "credential-shaped-registration-error" not in json.dumps(
         adapter._tool_audit_snapshot()

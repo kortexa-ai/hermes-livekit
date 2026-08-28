@@ -306,6 +306,13 @@ async def test_cancellation_clears_partial_bytes_and_sends_targeted_cancel() -> 
 
     transfer = adapter._binary_transfers[TOPIC]
     assert bytes(transfer.buffer) == b"j"
+    for _ in range(10):
+        if room.local_participant.published:
+            break
+        await asyncio.sleep(0)
+    assert room.local_participant.published[-1]["message"]["type"] == (
+        "agent:tool-result-stream-ready"
+    )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -317,6 +324,7 @@ async def test_cancellation_clears_partial_bytes_and_sends_targeted_cancel() -> 
     assert room.local_participant.published[-1]["message"]["type"] == (
         "agent:tool-result-stream-cancel"
     )
+    assert room.local_participant.published[-1]["topic"] == "conference.tools"
     adapter._fail_binary_generation(1, "room_replaced")
 
 

@@ -98,6 +98,69 @@ def advertised_tool(name: str = "desktop_notify") -> dict[str, object]:
     }
 
 
+def conference_tools(*names: str) -> dict[str, object]:
+    return {
+        "type": "conference.tools.register",
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": "Show a notification.",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_portable_catalog_registers_and_acknowledges_on_shared_topic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    registered: dict[str, dict[str, object]] = {}
+    monkeypatch.setattr(registry, "get_entry", lambda name: registered.get(name))
+    monkeypatch.setattr(
+        registry,
+        "register",
+        lambda **kwargs: registered.__setitem__(str(kwargs["name"]), kwargs),
+    )
+
+    await adapter._register_client_tools(
+        conference_tools("desktop_notify"), "client-a"
+    )
+
+    assert len(registered) == 1
+    adapter._publish_typed.assert_awaited_once_with(
+        {"type": "conference.tools.registered"},
+        identity="client-a",
+        topic="conference.tools",
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_portable_catalog_is_rejected_without_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = adapter_for_registration()
+    register = AsyncMock()
+    monkeypatch.setattr(registry, "register", register)
+
+    await adapter._register_client_tools(
+        {"type": "conference.tools.register", "tools": [{"type": "function"}]},
+        "client-a",
+    )
+
+    register.assert_not_called()
+    adapter._publish_typed.assert_awaited_once_with(
+        {"type": "conference.tools.rejected"},
+        identity="client-a",
+        topic="conference.tools",
+    )
+
+
 @pytest.mark.asyncio
 async def test_same_advertised_name_gets_distinct_scoped_slots_and_routes_to_owner(
     monkeypatch: pytest.MonkeyPatch,
@@ -161,9 +224,9 @@ async def test_camera_snapshot_registers_routes_and_unregisters_for_two_clients(
 
     await adapter._register_client_tool(message, "client-a")
     await adapter._register_client_tool(message, "client-b")
-    await adapter._register_client_tool(message, "client-c")
+    accepted = await adapter._register_client_tool(message, "client-c")
     assert len(registered) == 2
-    assert adapter._publish_typed.await_args.args[0]["reason"] == "policy-denied"
+    assert accepted is False
     assert all("." not in scoped_name for scoped_name in registered)
 
     for scoped_name, registration in registered.items():
@@ -176,13 +239,13 @@ async def test_camera_snapshot_registers_routes_and_unregisters_for_two_clients(
 
     client_a_slot = next(iter(adapter._client_tools["client-a"]))
     client_b_slot = next(iter(adapter._client_tools["client-b"]))
-    await adapter._unregister_client_tool(message, "client-a")
+    await adapter._register_client_tools(conference_tools(), "client-a")
     assert removed == [client_a_slot]
     assert client_b_slot in adapter._tool_owners
 
 
 @pytest.mark.asyncio
-async def test_unregister_and_disconnect_are_scoped_to_exact_participant(
+async def test_empty_registration_and_disconnect_are_scoped_to_exact_participant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     adapter = adapter_for_registration()
@@ -200,7 +263,7 @@ async def test_unregister_and_disconnect_are_scoped_to_exact_participant(
     client_a_slot = next(iter(adapter._client_tools["client-a"]))
     client_b_slot = next(iter(adapter._client_tools["client-b"]))
 
-    await adapter._unregister_client_tool(advertised_tool(), "client-a")
+    await adapter._register_client_tools(conference_tools(), "client-a")
 
     assert removed == [client_a_slot]
     assert client_b_slot in adapter._tool_owners
@@ -250,18 +313,18 @@ async def test_scoped_name_collision_fails_before_registry_mutation(
     monkeypatch.setattr(registry, "get_entry", lambda name: object())
     monkeypatch.setattr(registry, "register", register)
 
-    await adapter._register_client_tool(advertised_tool(), "client-b")
+    accepted = await adapter._register_client_tool(advertised_tool(), "client-b")
 
     register.assert_not_called()
+    assert accepted is False
     assert adapter._tool_owners == {"lk_collision": "client-a"}
-    assert adapter._publish_typed.await_args.args[0]["reason"] == "registry-collision"
 
 
 def tool_packet(identity: str = "client-a") -> SimpleNamespace:
     return SimpleNamespace(
-        topic=LiveKitAdapter.DATA_CHANNEL_CONTROL_TOPIC,
+        topic=LiveKitAdapter.DATA_CHANNEL_TOOLS_TOPIC,
         participant=SimpleNamespace(identity=identity),
-        data=json.dumps({"type": "client:tool-register", **advertised_tool()}).encode(),
+        data=json.dumps(conference_tools("desktop_notify")).encode(),
     )
 
 
@@ -492,8 +555,10 @@ async def test_example_client_registers_rpc_before_advertising_tool() -> None:
         "rpc",
         (example_client.TOOL_NAME, client._handle_tool_call),
     )
-    assert events[1][0] == "publish"
-    assert events[1][1][0]["type"] == "client:tool-register"
+    assert events[1][0] == "rpc"
+    assert events[2][0] == "publish"
+    assert events[2][1][0]["type"] == "conference.tools.register"
+    assert events[2][1][1] == "conference.tools"
 
 
 @pytest.mark.asyncio

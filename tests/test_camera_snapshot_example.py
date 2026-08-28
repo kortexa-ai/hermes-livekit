@@ -97,7 +97,7 @@ def invocation(*, caller: str = "hermes-avery", payload: str = "{}"):
 def packet(message: dict[str, Any], *, sender: str = "hermes-avery"):
     return SimpleNamespace(
         data=json.dumps(message).encode(),
-        topic=example.HERMES_CONTROL_TOPIC,
+        topic=example.TOOLS_TOPIC,
         participant=SimpleNamespace(identity=sender),
     )
 
@@ -119,7 +119,7 @@ def cancel_message() -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_registration_uses_existing_discovery_and_rpc_path() -> None:
+async def test_registration_uses_portable_discovery_and_rpc_path() -> None:
     client = make_client()
     published: list[tuple[dict[str, Any], str]] = []
 
@@ -133,16 +133,32 @@ async def test_registration_uses_existing_discovery_and_rpc_path() -> None:
         example.TOOL_NAME,
         example.CAMERA_TOOL_NAME,
     }
-    camera = [message for message, _topic in published if message.get("name") == "camera.snapshot"]
-    assert camera == [
-        {
-            "type": "client:tool-register",
-            "name": "camera.snapshot",
-            "description": example.CAMERA_TOOL_DESCRIPTION,
-            "input_schema": example.CAMERA_TOOL_SCHEMA,
-        }
+    assert published == [
+        (
+            {
+                "type": "conference.tools.register",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": example.TOOL_NAME,
+                            "description": example.TOOL_DESCRIPTION,
+                            "parameters": example.TOOL_SCHEMA,
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": example.CAMERA_TOOL_NAME,
+                            "description": example.CAMERA_TOOL_DESCRIPTION,
+                            "parameters": example.CAMERA_TOOL_SCHEMA,
+                        },
+                    },
+                ],
+            },
+            example.TOOLS_TOPIC,
+        )
     ]
-    assert all(topic == example.HERMES_CONTROL_TOPIC for _message, topic in published)
 
 
 @pytest.mark.asyncio

@@ -261,8 +261,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._speaking_participants: set[str] = set()
 
         # Per-participant video streams (subscribed but NOT eagerly iterated —
-        # frames are only sampled when a client sends client:capture-frame on
-        # the hermes-control data-channel topic).
+        # frames are only sampled when a client sends conference.capture_frame
+        # on the conference.extensions data-channel topic).
         self._video_streams: Dict[str, "rtc.VideoStream"] = {}
 
         # Frames captured-but-not-yet-dispatched. Drained into the next
@@ -514,8 +514,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             self._room.on("participant_connected", self._on_participant_connected)
             self._room.on("participant_disconnected", self._on_participant_disconnected)
             self._room.on("disconnected", self._on_disconnected)
-            # Inbound data-channel: clients send control messages (capture-frame,
-            # typed text, runtime control hooks) on the hermes-control topic.
+            # Inbound data-channel: portable Realtime events and tools use the
+            # shared topics; optional controls use conference.extensions.
             receiving_room = self._room
             receiving_generation = self._room_generation
             self._room.on(
@@ -744,8 +744,8 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         Audio tracks are buffered continuously for VAD/STT. Video tracks are
         stored but NOT iterated eagerly — frames are pulled on demand when a
-        client sends a ``client:capture-frame`` message on the
-        ``hermes-control`` data-channel topic.
+        client sends ``conference.capture_frame`` on the
+        ``conference.extensions`` data-channel topic.
         """
         identity = participant.identity
 
@@ -1245,11 +1245,12 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     # -- Inbound data channel + frame capture -------------------------------
 
-    # Realtime conversation events use the same topic as api.server
-    # Conference. Native RPC and binary tool discovery remain extensions on
-    # the legacy control topic until the shared tool work lands.
+    # Realtime conversation events and participant-owned tools use the same
+    # topics as api.server Conference. Hermes-only controls stay isolated on
+    # one explicitly named extension topic.
     DATA_CHANNEL_EVENTS_TOPIC = "conference.events"
-    DATA_CHANNEL_CONTROL_TOPIC = "hermes-control"
+    DATA_CHANNEL_TOOLS_TOPIC = "conference.tools"
+    DATA_CHANNEL_EXTENSIONS_TOPIC = "conference.extensions"
 
     def _on_data_received(
         self,
@@ -1261,10 +1262,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         """Route inbound data-channel packets.
 
         Called synchronously by the SDK's event thread; heavy work is
-        kicked off as asyncio tasks. JSON payloads on the
-        ``hermes-control`` topic are dispatched by their ``type`` field;
-        anything else is ignored (silently — keeps the protocol open for
-        unrelated apps sharing the same data channel without spamming logs).
+        kicked off as asyncio tasks. Portable tool registration uses
+        ``conference.tools``. Hermes-only controls use
+        ``conference.extensions``. Anything else is ignored silently.
         """
         participant = getattr(packet, "participant", None)
         participant_identity = (
@@ -1282,7 +1282,10 @@ class LiveKitAdapter(BasePlatformAdapter):
             except RuntimeError:
                 pass
             return
-        if topic != self.DATA_CHANNEL_CONTROL_TOPIC:
+        if topic not in (
+            self.DATA_CHANNEL_TOOLS_TOPIC,
+            self.DATA_CHANNEL_EXTENSIONS_TOPIC,
+        ):
             return
         if receiving_room is None:
             receiving_room = self._room
@@ -1295,35 +1298,31 @@ class LiveKitAdapter(BasePlatformAdapter):
         except (UnicodeDecodeError, ValueError) as exc:
             logger.warning(
                 "[%s] %s: undecodable payload from %s: %s",
-                self.name, self.DATA_CHANNEL_CONTROL_TOPIC,
+                self.name, topic,
                 participant_identity or "?", exc,
             )
             return
 
         msg_type = msg.get("type", "") if isinstance(msg, dict) else ""
         if not msg_type:
-            logger.debug("[%s] %s: payload missing 'type'", self.name, self.DATA_CHANNEL_CONTROL_TOPIC)
+            logger.debug("[%s] %s: payload missing 'type'", self.name, topic)
             return
 
-        # Dispatch table. Keep additions here so adding new client:* types
-        # is a single line.
-        handlers = {
-            "client:capture-frame": lambda: self._capture_next_frame(participant_identity),
-            "client:message": lambda: self._handle_client_message(msg, participant_identity),
-            "client:control": lambda: self._handle_client_control(msg, participant_identity),
-            "client:tool-register": lambda: self._register_client_tool(
-                msg,
-                participant_identity,
-                receiving_room=receiving_room,
-                receiving_generation=receiving_generation,
-            ),
-            "client:tool-unregister": lambda: self._unregister_client_tool(
-                msg,
-                participant_identity,
-                receiving_room=receiving_room,
-                receiving_generation=receiving_generation,
-            ),
-        }
+        if topic == self.DATA_CHANNEL_TOOLS_TOPIC:
+            handlers = {
+                "conference.tools.register": lambda: self._register_client_tools(
+                    msg,
+                    participant_identity,
+                    receiving_room=receiving_room,
+                    receiving_generation=receiving_generation,
+                ),
+            }
+        else:
+            handlers = {
+                "conference.capture_frame": lambda: self._capture_next_frame(participant_identity),
+                "conference.message": lambda: self._handle_client_message(msg, participant_identity),
+                "conference.control": lambda: self._handle_client_control(msg, participant_identity),
+            }
         handler = handlers.get(msg_type)
         if handler is None:
             logger.debug("[%s] unknown control type %r from %s", self.name, msg_type, participant_identity or "?")
@@ -1638,7 +1637,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             await transfer.room.local_participant.publish_data(
                 _json.dumps(message).encode("utf-8"),
                 reliable=True,
-                topic="hermes-control",
+                topic=self.DATA_CHANNEL_TOOLS_TOPIC,
                 destination_identities=[transfer.reference.owner_identity],
             )
             return (
@@ -1859,6 +1858,9 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._publish_binary_control(transfer, stream_ready_message(reference)),
                 timeout=max(0.0, deadline - loop.time()),
             )
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling():
+                raise asyncio.CancelledError
             if not ready or room is not self._room or generation != self._room_generation:
                 raise self._binary_error("room_replaced")
             payload_bytes = await asyncio.wait_for(
@@ -1886,7 +1888,7 @@ class LiveKitAdapter(BasePlatformAdapter):
                 self._schedule_binary_terminal_cleanup(transfer, send_cancel=False)
             raise
 
-    async def _register_client_tool(
+    async def _register_client_tools(
         self,
         msg: Dict[str, Any],
         identity: str,
@@ -1894,6 +1896,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         receiving_room: Any = None,
         receiving_generation: Optional[int] = None,
     ) -> None:
+        """Replace one participant's tools using the portable Conference envelope."""
         if receiving_room is None:
             receiving_room = self._room
         if receiving_generation is None:
@@ -1902,6 +1905,77 @@ class LiveKitAdapter(BasePlatformAdapter):
             identity, receiving_room, receiving_generation
         ):
             return
+
+        values = msg.get("tools")
+        converted: list[Dict[str, Any]] = []
+        names: set[str] = set()
+        if not isinstance(values, list) or len(values) > 16:
+            values = None
+        if values is not None:
+            for value in values:
+                function = value.get("function") if isinstance(value, dict) else None
+                if (
+                    not isinstance(value, dict)
+                    or value.get("type") != "function"
+                    or not isinstance(function, dict)
+                    or not isinstance(function.get("name"), str)
+                    or not isinstance(function.get("description"), str)
+                    or not isinstance(function.get("parameters"), dict)
+                    or function["name"] in names
+                ):
+                    values = None
+                    break
+                names.add(function["name"])
+                converted.append(
+                    {
+                        "name": function["name"],
+                        "description": function["description"],
+                        "input_schema": function["parameters"],
+                    }
+                )
+
+        accepted = values is not None
+        if accepted:
+            self._cleanup_client_tools(identity)
+            for tool in converted:
+                if not await self._register_client_tool(
+                    tool,
+                    identity,
+                    receiving_room=receiving_room,
+                    receiving_generation=receiving_generation,
+                ):
+                    accepted = False
+                    self._cleanup_client_tools(identity)
+                    break
+
+        await self._publish_typed(
+            {
+                "type": (
+                    "conference.tools.registered"
+                    if accepted
+                    else "conference.tools.rejected"
+                )
+            },
+            identity=identity,
+            topic=self.DATA_CHANNEL_TOOLS_TOPIC,
+        )
+
+    async def _register_client_tool(
+        self,
+        msg: Dict[str, Any],
+        identity: str,
+        *,
+        receiving_room: Any = None,
+        receiving_generation: Optional[int] = None,
+    ) -> bool:
+        if receiving_room is None:
+            receiving_room = self._room
+        if receiving_generation is None:
+            receiving_generation = self._room_generation
+        if not self._tool_message_is_current(
+            identity, receiving_room, receiving_generation
+        ):
+            return False
         raw_name = msg.get("name")
         name = raw_name if isinstance(raw_name, str) else ""
         description = msg.get("description") or ""
@@ -1909,58 +1983,27 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         if not self._valid_tool_owner_identity(identity):
             self._audit_tool("registration", identity, name, 0, "denied")
-            if identity:
-                await self._publish_typed(
-                    {
-                        "type": "agent:tool-registered",
-                        "name": name,
-                        "success": False,
-                        "reason": "identity-invalid",
-                    },
-                    identity=identity,
-                )
-            return
+            return False
 
         if not valid_tool_name(name):
             self._audit_tool("registration", identity, name, 0, "denied")
-            await self._publish_typed(
-                {"type": "agent:tool-registered", "name": name, "success": False, "reason": "name-invalid"},
-                identity=identity,
-            )
-            return
+            return False
 
         if not isinstance(input_schema, dict) or input_schema.get("type") != "object":
             self._audit_tool("registration", identity, name, 0, "denied")
-            await self._publish_typed(
-                {"type": "agent:tool-registered", "name": name, "success": False, "reason": "schema-invalid"},
-                identity=identity,
-            )
-            return
+            return False
 
         decision = self._tool_policy_decision(identity, name)
         if not decision.allowed:
             self._audit_tool("registration", identity, name, decision.tier, "denied")
-            await self._publish_typed(
-                {
-                    "type": "agent:tool-registered",
-                    "name": name,
-                    "success": False,
-                    "reason": "policy-denied",
-                },
-                identity=identity,
-            )
-            return
+            return False
 
         try:
             from tools.registry import registry
         except Exception:
             logger.error("[%s] tool registry unavailable", self.name)
             self._audit_tool("registration", identity, name, decision.tier, "error")
-            await self._publish_typed(
-                {"type": "agent:tool-registered", "name": name, "success": False, "reason": "registry-unavailable"},
-                identity=identity,
-            )
-            return
+            return False
 
         self._ensure_client_tool_maps()
         registry_name = self._scoped_tool_name(identity, name)
@@ -1968,29 +2011,11 @@ class LiveKitAdapter(BasePlatformAdapter):
         method = self._tool_methods.get(registry_name)
         if owner is not None and (owner, method) != (identity, name):
             self._audit_tool("registration", identity, name, decision.tier, "denied")
-            await self._publish_typed(
-                {
-                    "type": "agent:tool-registered",
-                    "name": name,
-                    "success": False,
-                    "reason": "registry-collision",
-                },
-                identity=identity,
-            )
-            return
+            return False
         existing = registry.get_entry(registry_name)
         if existing is not None and owner is None:
             self._audit_tool("registration", identity, name, decision.tier, "denied")
-            await self._publish_typed(
-                {
-                    "type": "agent:tool-registered",
-                    "name": name,
-                    "success": False,
-                    "reason": "registry-collision",
-                },
-                identity=identity,
-            )
-            return
+            return False
 
         handler = self._build_tool_handler(identity, name)
         # The registry's `schema` is the OpenAI function-envelope shape
@@ -2016,16 +2041,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         except Exception:
             logger.warning("[%s] tool register %r failed", self.name, name)
             self._audit_tool("registration", identity, name, decision.tier, "error")
-            await self._publish_typed(
-                {
-                    "type": "agent:tool-registered",
-                    "name": name,
-                    "success": False,
-                    "reason": "register-failed",
-                },
-                identity=identity,
-            )
-            return
+            return False
 
         self._client_tools.setdefault(identity, set()).add(registry_name)
         self._tool_owners[registry_name] = identity
@@ -2038,59 +2054,7 @@ class LiveKitAdapter(BasePlatformAdapter):
             name,
             registry_name,
         )
-        await self._publish_typed(
-            {"type": "agent:tool-registered", "name": name, "success": True},
-            identity=identity,
-        )
-
-    async def _unregister_client_tool(
-        self,
-        msg: Dict[str, Any],
-        identity: str,
-        *,
-        receiving_room: Any = None,
-        receiving_generation: Optional[int] = None,
-    ) -> None:
-        if receiving_room is None:
-            receiving_room = self._room
-        if receiving_generation is None:
-            receiving_generation = self._room_generation
-        if not self._tool_message_is_current(
-            identity, receiving_room, receiving_generation
-        ):
-            return
-        raw_name = msg.get("name")
-        name = raw_name if isinstance(raw_name, str) else ""
-        if not self._valid_tool_owner_identity(identity):
-            if identity:
-                await self._publish_typed(
-                    {
-                        "type": "agent:tool-unregistered",
-                        "name": name,
-                        "success": False,
-                        "reason": "not-owned-by-you",
-                    },
-                    identity=identity,
-                )
-            return
-        if not valid_tool_name(name):
-            registry_name = ""
-        else:
-            registry_name = self._scoped_tool_name(identity, name)
-        self._ensure_client_tool_maps()
-        owner = self._tool_owners.get(registry_name)
-        method = self._tool_methods.get(registry_name)
-        if (owner, method) != (identity, name):
-            await self._publish_typed(
-                {"type": "agent:tool-unregistered", "name": name, "success": False, "reason": "not-owned-by-you"},
-                identity=identity,
-            )
-            return
-        self._deregister_tool(registry_name, identity)
-        await self._publish_typed(
-            {"type": "agent:tool-unregistered", "name": name, "success": True},
-            identity=identity,
-        )
+        return True
 
     def _build_tool_handler(self, owner_identity: str, registered_name: str):
         """Return an async fn that hermes will call when the LLM picks this tool.
@@ -2336,7 +2300,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         try:
             await self._publish_typed(
                 {"type": event_type, "payload": event_payload},
-                topic=self.DATA_CHANNEL_CONTROL_TOPIC,
+                topic=self.DATA_CHANNEL_EXTENSIONS_TOPIC,
             )
         except Exception as e:
             logger.debug("[%s] agent event publish failed (%s): %s", self.name, event_type, e)

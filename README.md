@@ -228,17 +228,24 @@ contract.
 
 ### Conference extensions
 
-Triggered camera capture and native tool discovery remain on
-`hermes-control`. Frame status messages also use that extension topic:
+Portable tool discovery uses `conference.tools`, exactly as it does with
+`api.server` Conference. Native RPC invocation and bounded byte streams are
+negotiated LiveKit extensions. Triggered camera and runtime controls use the
+separate `conference.extensions` topic.
+
+Frame status messages use the extension topic:
 
 - `agent:frame-captured`
 - `agent:frame-capture-failed`
 
-Remote-tool events (0.3.0+, flat envelope — no `payload` wrapper, sent
-only to the owning participant via `destination_identities`):
+Portable registration acknowledgements on `conference.tools` are targeted to
+the owning participant:
 
-- `agent:tool-registered` — ack to `client:tool-register`; `{name, success, reason?}`
-- `agent:tool-unregistered` — ack to `client:tool-unregister`; `{name, success, reason?}`
+- `conference.tools.registered`
+- `conference.tools.rejected`
+
+Binary-result lifecycle messages are also targeted on `conference.tools`:
+
 - `agent:tool-result-stream-ready` — the targeted binary-result receiver is
   installed; `{stream_id, topic}`
 - `agent:tool-result-stream-cancel` — stop and close that targeted binary
@@ -246,18 +253,18 @@ only to the owning participant via `destination_identities`):
 
 #### Inbound extension controls
 
-JSON payloads of the form `{"type": "client:<...>", ...}`:
+Reliable JSON payloads on `conference.extensions`:
 
 ```jsonc
 // sample the next frame from this client's published video track
-{"type": "client:capture-frame"}
+{"type": "conference.capture_frame"}
 
 // runtime control hooks
-{"type": "client:control", "action": "pause"}    // stop sampling audio
-{"type": "client:control", "action": "resume"}   // resume sampling audio
+{"type": "conference.control", "action": "pause"}    // stop sampling audio
+{"type": "conference.control", "action": "resume"}   // resume sampling audio
 
 // this speaker is done talking; close the utterance and dispatch it now (0.4.0+)
-{"type": "client:control", "action": "end-of-turn"}
+{"type": "conference.control", "action": "end-of-turn"}
 ```
 
 `end-of-turn` is for clients that endpoint locally. Without it the adapter can
@@ -266,24 +273,27 @@ and that wait lands on every single reply. Unlike `pause`/`resume` — which are
 global — this is scoped to the sending participant, so one client ending its
 turn cannot affect anyone else in the room.
 
-Remote-tool messages (0.3.0+):
+Tool catalogs use the portable Conference envelope on `conference.tools`:
 
 ```jsonc
-// register a tool the agent can call. input_schema is JSON Schema for
-// the tool's arguments (`type: object`, with `properties` and `required`).
 {
-  "type": "client:tool-register",
-  "name": "desktop_notify",
-  "description": "Show a desktop notification.",
-  "input_schema": {
-    "type": "object",
-    "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
-    "required": ["title", "body"]
-  }
+  "type": "conference.tools.register",
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "desktop_notify",
+      "description": "Show a desktop notification.",
+      "parameters": {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+        "required": ["title", "body"]
+      }
+    }
+  }]
 }
 
-// give back a tool the client no longer wants to offer
-{"type": "client:tool-unregister", "name": "desktop_notify"}
+// replace this participant's catalog with no tools
+{"type": "conference.tools.register", "tools": []}
 ```
 
 Remote tools are disabled unless `HERMES_LIVEKIT_REMOTE_TOOL_POLICY` contains
@@ -334,12 +344,13 @@ with apps that share the same data channel for unrelated control traffic.
 
 The agent does **not** consume video tracks continuously. When you
 publish a camera as a video track, the adapter just subscribes to it —
-no frames are decoded until you ask. Send `{"type": "client:capture-frame"}`
-on `hermes-control` and the agent samples the **very next** frame, encodes
+no frames are decoded until you ask. Send
+`{"type": "conference.capture_frame"}` on `conference.extensions` and the
+agent samples the **very next** frame, encodes
 it as JPEG (quality 85), and queues it locally.
 
 The frame attaches to **the next user message** dispatched by the adapter
-(either a closed voice utterance or a `client:message`). The hermes agent
+(either a closed voice utterance or a standard typed Realtime turn). The Hermes agent
 loop then processes it through its existing `image_input_mode: auto`
 vision path — exactly the same code path used by image attachments on
 other platforms.

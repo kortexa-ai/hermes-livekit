@@ -12,8 +12,8 @@ Capabilities:
   - Registers ``camera.snapshot()``, which returns a deterministic 1x1 PNG
     fixture through the bounded LiveKit byte-stream result protocol
   - Logs every inbound data-channel message (any topic)
-  - Reads stdin: each typed line is sent as a ``client:message`` user
-    prompt to the agent (same path the voice transcript takes)
+  - Reads stdin: each typed line is sent as a standard Realtime conversation
+    item followed by ``response.create``
   - Special commands: ``/quit``, ``/raw <json>``, ``/reregister``
 
 Run:
@@ -43,7 +43,8 @@ from hermes_livekit.tool_result_protocol import MAX_RESULT_BYTES, TOPIC_PREFIX
 
 LOG = logging.getLogger("test-client")
 
-HERMES_CONTROL_TOPIC = "hermes-control"
+EVENTS_TOPIC = "conference.events"
+TOOLS_TOPIC = "conference.tools"
 
 TOOL_NAME = "desktop_notify"
 TOOL_DESCRIPTION = "Show a desktop notification on the user's machine (macOS)."
@@ -198,30 +199,35 @@ class TestClient:
         self.room.local_participant.register_rpc_method(
             TOOL_NAME, self._handle_tool_call
         )
-        self._registered = True
-        await self.publish(
-            {
-                "type": "client:tool-register",
-                "name": TOOL_NAME,
-                "description": TOOL_DESCRIPTION,
-                "input_schema": TOOL_SCHEMA,
-            },
-            topic=HERMES_CONTROL_TOPIC,
-        )
-        LOG.info("sent client:tool-register for %s", TOOL_NAME)
         self.room.local_participant.register_rpc_method(
             CAMERA_TOOL_NAME, self._handle_camera_snapshot
         )
+        self._registered = True
         await self.publish(
             {
-                "type": "client:tool-register",
-                "name": CAMERA_TOOL_NAME,
-                "description": CAMERA_TOOL_DESCRIPTION,
-                "input_schema": CAMERA_TOOL_SCHEMA,
+                "type": "conference.tools.register",
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": TOOL_NAME,
+                            "description": TOOL_DESCRIPTION,
+                            "parameters": TOOL_SCHEMA,
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": CAMERA_TOOL_NAME,
+                            "description": CAMERA_TOOL_DESCRIPTION,
+                            "parameters": CAMERA_TOOL_SCHEMA,
+                        },
+                    },
+                ],
             },
-            topic=HERMES_CONTROL_TOPIC,
+            topic=TOOLS_TOPIC,
         )
-        LOG.info("sent client:tool-register for %s", CAMERA_TOOL_NAME)
+        LOG.info("sent portable Conference registration for %s, %s", TOOL_NAME, CAMERA_TOOL_NAME)
 
     def _agent_in_room(self) -> bool:
         if self.room is None:
@@ -243,12 +249,8 @@ class TestClient:
     async def unregister_tool(self) -> None:
         try:
             await self.publish(
-                {"type": "client:tool-unregister", "name": TOOL_NAME},
-                topic=HERMES_CONTROL_TOPIC,
-            )
-            await self.publish(
-                {"type": "client:tool-unregister", "name": CAMERA_TOOL_NAME},
-                topic=HERMES_CONTROL_TOPIC,
+                {"type": "conference.tools.register", "tools": []},
+                topic=TOOLS_TOPIC,
             )
         except Exception as exc:
             LOG.debug("tool unregister failed: %s", exc)
@@ -291,13 +293,8 @@ class TestClient:
             if len(summary) > 500:
                 summary = summary[:500] + "…"
             LOG.info("inbound [%s] %s: %s", topic, msg_type, summary)
-            if msg_type == "agent:agent-transcript":
-                # Final assistant reply for this turn — signal oneshot mode to
-                # exit. (Wrapped events have payload.final; flat ones would have
-                # final at top level. Check both.)
-                payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else msg
-                if payload.get("final"):
-                    self._reply_done.set()
+            if msg_type == "response.done":
+                self._reply_done.set()
         else:
             LOG.info("inbound [%s] non-dict payload: %r", topic, msg)
 
@@ -321,7 +318,7 @@ class TestClient:
     def _handle_snapshot_control(
         self, msg: dict[str, Any], packet: rtc.DataPacket
     ) -> None:
-        if packet.topic != HERMES_CONTROL_TOPIC or set(msg) != {
+        if packet.topic != TOOLS_TOPIC or set(msg) != {
             "type",
             "stream_id",
             "topic",
@@ -509,10 +506,20 @@ class TestClient:
             ) from exc
 
     async def send_prompt(self, text: str) -> None:
+        item_id = f"item_example_{uuid.uuid4().hex}"
         await self.publish(
-            {"type": "client:message", "text": text},
-            topic=HERMES_CONTROL_TOPIC,
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            },
+            topic=EVENTS_TOPIC,
         )
+        await self.publish({"type": "response.create"}, topic=EVENTS_TOPIC)
         LOG.info("→ prompt: %s", text)
 
     async def send_raw(self, raw_json: str) -> None:
@@ -522,9 +529,9 @@ class TestClient:
             print(f"  invalid JSON: {exc}", file=sys.stderr)
             return
         if isinstance(obj, dict):
-            topic = obj.pop("__topic", HERMES_CONTROL_TOPIC)
+            topic = obj.pop("__topic", EVENTS_TOPIC)
         else:
-            topic = HERMES_CONTROL_TOPIC
+            topic = EVENTS_TOPIC
         await self.publish(obj, topic=topic)
         LOG.info("→ raw on topic %r: %s", topic, obj)
 
@@ -533,7 +540,7 @@ class TestClient:
         print(
             "test-client ready. type messages to send to the agent.\n"
             "  /quit                end the session\n"
-            "  /raw <json>          publish arbitrary JSON on hermes-control\n"
+            "  /raw <json>          publish arbitrary JSON on conference.events\n"
             "                       (set __topic in the JSON to override topic)\n"
             "  /reregister          re-send the desktop_notify registration\n",
             file=sys.stderr,
@@ -591,7 +598,7 @@ class TestClient:
             if oneshot_prompt is not None:
                 # Non-interactive: send one prompt, wait for the agent's final
                 # transcript (any number of tool calls in between are fine).
-                await asyncio.sleep(0.5)  # let agent:tool-registered ack land in logs
+                await asyncio.sleep(0.5)  # let the tool registration ack land in logs
                 self._reply_done.clear()
                 await self.send_prompt(oneshot_prompt)
                 LOG.info("oneshot mode: waiting up to %.0fs for agent reply…", wait_timeout)

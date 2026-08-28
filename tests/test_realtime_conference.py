@@ -101,6 +101,25 @@ async def test_inbound_event_uses_authoritative_participant_identity(
     assert options["destination_identities"] == ["client-a"]
 
 
+def test_legacy_hermes_topics_are_not_client_protocol_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _local = conference_adapter()
+    monkeypatch.setattr(
+        asyncio,
+        "create_task",
+        lambda _coroutine: pytest.fail("legacy topic scheduled protocol work"),
+    )
+    packet = SimpleNamespace(
+        topic="hermes-control",
+        participant=SimpleNamespace(identity="client-a"),
+        data=json.dumps({"type": "client:tool-register"}).encode(),
+    )
+
+    adapter._on_data_received(packet)
+
+
+
 @pytest.mark.asyncio
 async def test_extension_events_stay_off_conversation_topic() -> None:
     adapter, local = conference_adapter()
@@ -112,4 +131,4 @@ async def test_extension_events_stay_off_conversation_topic() -> None:
 
     message, options = local.messages[-1]
     assert message["type"] == "agent:frame-captured"
-    assert options["topic"] == LiveKitAdapter.DATA_CHANNEL_CONTROL_TOPIC
+    assert options["topic"] == LiveKitAdapter.DATA_CHANNEL_EXTENSIONS_TOPIC

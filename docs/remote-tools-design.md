@@ -3,9 +3,9 @@
 ## Status
 
 Small JSON-shaped and bounded binary-result remote tools are implemented.
-Clients advertise tools over the existing `hermes-control` data topic and
-serve calls through LiveKit native RPC; binary payloads use targeted LiveKit
-byte streams after the RPC returns their reference.
+Clients advertise tools with the portable Conference contract on
+`conference.tools` and serve calls through LiveKit native RPC; binary payloads
+use targeted LiveKit byte streams after the RPC returns their reference.
 
 ## Goal
 
@@ -21,31 +21,36 @@ replacement for MCP, which covers long-lived process-to-process tool servers.
 
 ### Discovery
 
-Discovery remains a reliable JSON message on topic `hermes-control`, because
-LiveKit RPC has no discovery API.
+Discovery is a reliable JSON message on `conference.tools`, shared with
+`api.server` Conference. LiveKit RPC has no discovery API of its own.
 
 The client first registers an RPC method, then sends:
 
 ```json
 {
-  "type": "client:tool-register",
-  "name": "desktop_notify",
-  "description": "Show a desktop notification to the user.",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "title": {"type": "string"},
-      "body": {"type": "string"}
-    },
-    "required": ["title", "body"]
-  }
+  "type": "conference.tools.register",
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "desktop_notify",
+      "description": "Show a desktop notification to the user.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "body": {"type": "string"}
+        },
+        "required": ["title", "body"]
+      }
+    }
+  }]
 }
 ```
 
 The adapter validates the participant identity, name, and object schema. It
-registers a late-bound Hermes tool under `hermes-livekit-tools`, records the
-participant owner, and returns a targeted `agent:tool-registered`
-acknowledgement. The acknowledgement keeps the advertised name.
+registers late-bound Hermes tools under `hermes-livekit-tools`, records the
+participant owner, and returns targeted `conference.tools.registered` or
+`conference.tools.rejected` acknowledgement.
 
 The model-visible Hermes registry name is participant-scoped. It has the form
 `lk_<16 hex characters>_<method-prefix>`, where the digest covers the
@@ -81,10 +86,11 @@ The JSON document contains only `tools`, with at most 64 entries and at most
 }
 ```
 
-To remove the tool, the client sends:
+Registration replaces the participant's complete catalog. To remove all tools,
+the client sends:
 
 ```json
-{"type": "client:tool-unregister", "name": "desktop_notify"}
+{"type": "conference.tools.register", "tools": []}
 ```
 
 The client also unregisters its local RPC method. Participant disconnect and
@@ -121,9 +127,9 @@ registration or reconnect.
 
 | Event | Result |
 |---|---|
-| `client:tool-register` | Validate, register a participant-scoped Hermes tool, acknowledge |
+| `conference.tools.register` | Validate and replace one participant's scoped Hermes tool catalog, acknowledge |
 | Hermes invokes the tool | Target the owner with native `perform_rpc` |
-| `client:tool-unregister` | Verify ownership, deregister, acknowledge |
+| Empty tool catalog | Deregister that participant's tools |
 | Owner disconnects | Deregister all tools owned by that participant |
 | Adapter reconnects or stops | Clear all client-owned tool registrations |
 | Agent call is cancelled | The native RPC wait is abandoned with the coroutine |
@@ -305,7 +311,7 @@ reserves at most eight pending snapshots, and returns the version 1 reference.
 The example source is a fixed 1x1 PNG so tests need no camera.
 
 The client binds each pending snapshot to `RpcInvocationData.caller_identity`.
-Only an exact ready or cancel message on `hermes-control` from that participant
+Only an exact ready or cancel message on `conference.tools` from that participant
 can act on it. On ready, `stream_bytes` declares the exact PNG size, MIME, ID,
 and topic and sets `destination_identities` to only that caller. Success closes
 the writer trailer. Cancellation closes it with `transfer_cancelled`. Oversize,
