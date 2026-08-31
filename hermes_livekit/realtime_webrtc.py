@@ -74,6 +74,13 @@ MAX_SDP_BYTES = 256 * 1024
 MAX_SESSION_BYTES = 512 * 1024
 DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
+VAD_CALIBRATION_FRAMES = 20
+VAD_NOISE_CEILING = 300.0
+VAD_START_RATIO = 2.2
+VAD_START_MARGIN = 100.0
+VAD_STOP_RATIO = 1.5
+VAD_STOP_MARGIN = 60.0
+VAD_NOISE_ALPHA = 0.02
 PROXY_PRINCIPAL_HEADER = "X-Kortexa-Internal-Principal"
 PROXY_CALL_HEADER = "X-Kortexa-Internal-Call-Id"
 PROXY_TIMESTAMP_HEADER = "X-Kortexa-Internal-Timestamp"
@@ -233,6 +240,65 @@ class QueuedAudioTrack(MediaStreamTrack):
 
 
 @dataclass
+class AdaptiveRmsGate:
+    """Small adaptive energy gate for continuously noisy kiosk microphones."""
+
+    noise_rms: float | None = None
+    calibration: list[float] = field(default_factory=list)
+
+    @property
+    def ready(self) -> bool:
+        return self.noise_rms is not None
+
+    @property
+    def start_threshold(self) -> float:
+        noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
+        return max(
+            float(RMS_SILENCE_FLOOR),
+            noise * VAD_START_RATIO,
+            noise + VAD_START_MARGIN,
+        )
+
+    @property
+    def stop_threshold(self) -> float:
+        noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
+        return max(
+            float(RMS_SILENCE_FLOOR),
+            noise * VAD_STOP_RATIO,
+            noise + VAD_STOP_MARGIN,
+        )
+
+    def calibrate(self, rms: float) -> bool:
+        if self.ready:
+            return True
+        self.calibration.append(rms)
+        if len(self.calibration) < VAD_CALIBRATION_FRAMES:
+            return False
+
+        # Use the quieter half so somebody beginning to speak during the
+        # short calibration window does not become the learned noise floor.
+        ordered = sorted(self.calibration)
+        quiet = ordered[: max(1, len(ordered) // 2)]
+        measured = sum(quiet) / len(quiet)
+        self.noise_rms = min(VAD_NOISE_CEILING, max(1.0, measured))
+        self.calibration.clear()
+        return True
+
+    def is_speech(self, rms: float, *, speaking: bool) -> bool:
+        threshold = self.stop_threshold if speaking else self.start_threshold
+        speech = rms > threshold
+        if not speaking and not speech and self.noise_rms is not None:
+            # Follow slow changes such as a fan ramping up, but never learn a
+            # speech frame or allow an outlier to raise the floor indefinitely.
+            observed = min(rms, VAD_NOISE_CEILING)
+            self.noise_rms = (
+                (1.0 - VAD_NOISE_ALPHA) * self.noise_rms
+                + VAD_NOISE_ALPHA * observed
+            )
+        return speech
+
+
+@dataclass
 class RealtimeCall:
     adapter: "RealtimeWebRTCAdapter"
     call_id: str
@@ -249,6 +315,8 @@ class RealtimeCall:
     paused: bool = False
     tts_completed: bool = False
     closed: bool = False
+    vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
+    vad_calibration_pcm: list[bytes] = field(default_factory=list)
 
     def spawn(self, coroutine: Any) -> None:
         task = asyncio.create_task(coroutine)
@@ -305,9 +373,28 @@ class RealtimeCall:
                 await self.finish_utterance()
 
     async def accept_pcm(self, pcm: bytes) -> None:
+        rms = _compute_rms(pcm)
+        if not self.vad.ready:
+            self.vad_calibration_pcm.append(pcm)
+            if not self.vad.calibrate(rms):
+                return
+            logger.info(
+                "[%s] adaptive VAD calibrated: noise_rms=%.1f start=%.1f stop=%.1f",
+                self.call_id,
+                self.vad.noise_rms,
+                self.vad.start_threshold,
+                self.vad.stop_threshold,
+            )
+            calibration_pcm, self.vad_calibration_pcm = self.vad_calibration_pcm, []
+            for buffered in calibration_pcm:
+                await self._accept_calibrated_pcm(buffered)
+            return
+        await self._accept_calibrated_pcm(pcm)
+
+    async def _accept_calibrated_pcm(self, pcm: bytes) -> None:
         now = time.monotonic()
         rms = _compute_rms(pcm)
-        if rms > RMS_SILENCE_FLOOR:
+        if self.vad.is_speech(rms, speaking=self.speaking):
             if not self.speaking:
                 self.audio_buffer.clear()
                 self.speaking = True

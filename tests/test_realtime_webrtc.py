@@ -18,6 +18,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_livekit.realtime_webrtc import (
+    AdaptiveRmsGate,
     CLIENT_IDENTITY,
     PROXY_CALL_HEADER,
     PROXY_PRINCIPAL_HEADER,
@@ -169,6 +170,37 @@ async def test_queued_audio_track_paces_pcm_in_realtime() -> None:
         samples_per_frame * 2,
     ]
     assert all(frame.sample_rate == 48_000 for frame in frames)
+
+
+def test_adaptive_rms_gate_learns_fan_noise_without_calling_it_speech() -> None:
+    gate = AdaptiveRmsGate()
+
+    # The Pi fan measures around RMS 150, well above the legacy fixed gate of
+    # 50. Include loud samples to model the user starting to talk while the
+    # initial 400 ms calibration window is still open.
+    for rms in [150.0] * 12 + [900.0] * 8:
+        gate.calibrate(rms)
+
+    assert gate.ready is True
+    assert gate.noise_rms == 150.0
+    assert gate.is_speech(175.0, speaking=False) is False
+    assert gate.is_speech(900.0, speaking=False) is True
+    assert gate.is_speech(175.0, speaking=True) is False
+
+
+def test_adaptive_rms_gate_tracks_gradual_idle_noise_changes() -> None:
+    gate = AdaptiveRmsGate()
+    for _ in range(20):
+        gate.calibrate(100.0)
+    initial_floor = gate.noise_rms
+
+    for _ in range(100):
+        assert gate.is_speech(175.0, speaking=False) is False
+
+    assert gate.noise_rms is not None
+    assert initial_floor is not None
+    assert gate.noise_rms > initial_floor
+    assert gate.noise_rms < 175.0
 
 
 def _proxy_headers(
