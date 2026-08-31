@@ -25,6 +25,7 @@ from hermes_livekit.realtime_webrtc import (
     PROXY_SIGNATURE_HEADER,
     PROXY_TIMESTAMP_HEADER,
     QueuedAudioTrack,
+    RealtimeCall,
     RealtimeWebRTCAdapter,
     _parse_ice_servers,
     _proxy_signature_payload,
@@ -417,3 +418,34 @@ async def test_direct_send_completes_transcript_response() -> None:
     protocol.assistant_transcript.assert_awaited_once_with("hello")
     protocol.output_stopped.assert_awaited_once_with()
     assert call.tts_completed is False
+
+
+@pytest.mark.asyncio
+async def test_direct_mute_finalizes_and_unmute_resets_vad() -> None:
+    protocol = AsyncMock()
+    adapter = SimpleNamespace(process_voice=AsyncMock())
+    call = RealtimeCall(
+        adapter=adapter,
+        call_id="call-a",
+        peer=AsyncMock(),
+        output_track=QueuedAudioTrack(),
+        protocol=protocol,
+    )
+    call.speaking = True
+    call.audio_buffer.extend(b"\x00\x00" * 48_000)
+    old_vad = call.vad
+
+    await call.set_input_audio_state(True)
+    await asyncio.sleep(0)
+    assert call.input_muted is True
+    assert call.audio_buffer == b""
+    protocol.speech_stopped.assert_awaited_once_with("webrtc-client")
+    adapter.process_voice.assert_awaited_once()
+
+    await call.set_input_audio_state(False)
+    assert call.input_muted is False
+    assert call.vad is not old_vad
+    assert call.vad.ready is False
+
+    for task in list(call.tasks):
+        task.cancel()

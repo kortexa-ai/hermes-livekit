@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -28,8 +29,48 @@ def conference_adapter() -> tuple[LiveKitAdapter, LocalParticipant]:
     )
     adapter._audio_source = None
     adapter._paused = False
+    adapter._audio_buffers = {"client-a": bytearray()}
+    adapter._last_audio_time = {}
+    adapter._speaking_participants = set()
+    adapter._audio_gates = {}
+    adapter._muted_inputs = set()
     adapter._realtime_protocol = adapter._new_realtime_protocol()
     return adapter, local
+
+
+@pytest.mark.asyncio
+async def test_conference_input_audio_state_is_scoped_and_acknowledged() -> None:
+    adapter, local = conference_adapter()
+    adapter._process_voice_input = AsyncMock()
+    adapter._audio_buffers["client-a"].extend(b"\x00\x00" * 48_000)
+    adapter._speaking_participants.add("client-a")
+
+    await adapter._handle_input_audio_state(
+        {"type": "hermes.input_audio.state", "muted": True},
+        "client-a",
+    )
+    assert "client-a" in adapter._muted_inputs
+    assert adapter._audio_buffers["client-a"] == b""
+    acknowledgement = next(
+        (message, options)
+        for message, options in local.messages
+        if message["type"] == "hermes.input_audio.state_updated"
+    )
+    assert acknowledgement[0] == {
+        "type": "hermes.input_audio.state_updated",
+        "muted": True,
+    }
+    assert acknowledgement[1]["topic"] == adapter.DATA_CHANNEL_EXTENSIONS_TOPIC
+    assert acknowledgement[1]["destination_identities"] == ["client-a"]
+    await asyncio.sleep(0)
+    adapter._process_voice_input.assert_awaited_once()
+
+    await adapter._handle_input_audio_state(
+        {"type": "hermes.input_audio.state", "muted": False},
+        "client-a",
+    )
+    assert "client-a" not in adapter._muted_inputs
+    assert adapter._audio_gates["client-a"].ready is False
 
 
 @pytest.mark.asyncio

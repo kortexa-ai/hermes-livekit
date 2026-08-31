@@ -67,7 +67,11 @@ from gateway.platforms.base import (
 )
 from gateway.session import build_session_key
 
-from .realtime_protocol import RealtimeProtocol
+from .realtime_protocol import (
+    HERMES_INPUT_AUDIO_STATE,
+    HERMES_INPUT_AUDIO_STATE_UPDATED,
+    RealtimeProtocol,
+)
 from .tool_result_protocol import (
     DRAIN_TIMEOUT_SEC,
     REFERENCE_TYPE,
@@ -91,6 +95,7 @@ from .tool_safety import (
     valid_participant_identity,
     valid_tool_name,
 )
+from .vad import AdaptiveRmsGate
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -248,6 +253,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_buffers: Dict[str, bytearray] = {}
         self._last_audio_time: Dict[str, float] = {}
         self._audio_streams: Dict[str, asyncio.Task] = {}
+        self._audio_gates: Dict[str, AdaptiveRmsGate] = {}
+        self._muted_inputs: set[str] = set()
 
         # Pause audio capture during TTS playback
         self._paused = False
@@ -646,6 +653,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._local_track = None
         self._audio_buffers.clear()
         self._last_audio_time.clear()
+        self._audio_gates.clear()
+        self._muted_inputs.clear()
         self._speaking_participants.clear()
 
         # Unlink any frame files that were captured but never dispatched
@@ -752,6 +761,10 @@ class LiveKitAdapter(BasePlatformAdapter):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info("[%s] Audio track subscribed: %s", self.name, identity)
             self._audio_buffers[identity] = bytearray()
+            self._audio_gates[identity] = AdaptiveRmsGate(
+                calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
+                minimum_floor=RMS_SILENCE_FLOOR,
+            )
             # Deliberately do NOT seed _last_audio_time here. _check_silence_loop
             # sets it on the first chunk above RMS_SILENCE_FLOOR, and treats a
             # missing entry as "this participant has never spoken" — discarding
@@ -891,6 +904,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_streams.clear()
         self._audio_buffers.clear()
         self._last_audio_time.clear()
+        self._audio_gates.clear()
+        self._muted_inputs.clear()
         self._speaking_participants.clear()
 
         # Clients will be gone after we drop the room — clear their tools.
@@ -1038,6 +1053,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             task.cancel()
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
+        self._audio_gates.pop(identity, None)
+        self._muted_inputs.discard(identity)
         self._speaking_participants.discard(identity)
 
     # -- Audio capture and processing ---------------------------------------
@@ -1056,7 +1073,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         """
         try:
             async for event in stream:
-                if self._paused:
+                if self._paused or identity in self._muted_inputs:
                     continue
                 if identity not in self._audio_buffers:
                     break
@@ -1104,7 +1121,29 @@ class LiveKitAdapter(BasePlatformAdapter):
                     tail = bytes(buf[-bytes_per_tick:]) if buf_len >= bytes_per_tick else bytes(buf)
                     rms = _compute_rms(tail)
 
-                    if rms > RMS_SILENCE_FLOOR:
+                    gate = self._audio_gates.get(identity)
+                    if gate is None:
+                        gate = AdaptiveRmsGate(
+                            calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
+                            minimum_floor=RMS_SILENCE_FLOOR,
+                        )
+                        self._audio_gates[identity] = gate
+                    if not gate.ready:
+                        if not gate.calibrate(rms):
+                            continue
+                        logger.info(
+                            "[%s] adaptive VAD for %s: noise_rms=%.1f start=%.1f stop=%.1f",
+                            self.name,
+                            identity,
+                            gate.noise_rms,
+                            gate.start_threshold,
+                            gate.stop_threshold,
+                        )
+
+                    if gate.is_speech(
+                        rms,
+                        speaking=identity in self._speaking_participants,
+                    ):
                         # Active speech — update timestamp
                         self._last_audio_time[identity] = time.monotonic()
                         # Emit listening-start on first loud chunk of an utterance
@@ -1322,6 +1361,10 @@ class LiveKitAdapter(BasePlatformAdapter):
                 "conference.capture_frame": lambda: self._capture_next_frame(participant_identity),
                 "conference.message": lambda: self._handle_client_message(msg, participant_identity),
                 "conference.control": lambda: self._handle_client_control(msg, participant_identity),
+                HERMES_INPUT_AUDIO_STATE: lambda: self._handle_input_audio_state(
+                    msg,
+                    participant_identity,
+                ),
             }
         handler = handlers.get(msg_type)
         if handler is None:
@@ -1483,6 +1526,58 @@ class LiveKitAdapter(BasePlatformAdapter):
             logger.info("[%s] resumed by client %s", self.name, identity)
         else:
             logger.debug("[%s] unknown client:control action %r", self.name, action)
+
+    async def _handle_input_audio_state(
+        self,
+        msg: Dict[str, Any],
+        identity: str,
+    ) -> None:
+        """Apply the shared Hermes mute extension to one participant."""
+        muted = msg.get("muted")
+        if not isinstance(muted, bool):
+            logger.debug("[%s] invalid input audio state from %s", self.name, identity)
+            return
+        await self._set_input_audio_state(identity, muted)
+        await self._publish_typed(
+            {
+                "type": HERMES_INPUT_AUDIO_STATE_UPDATED,
+                "muted": muted,
+            },
+            identity=identity,
+            topic=self.DATA_CHANNEL_EXTENSIONS_TOPIC,
+        )
+
+    async def _set_input_audio_state(self, identity: str, muted: bool) -> None:
+        muted_inputs = getattr(self, "_muted_inputs", None)
+        if muted_inputs is None:
+            muted_inputs = self._muted_inputs = set()
+        if muted:
+            muted_inputs.add(identity)
+            buf = self._audio_buffers.get(identity)
+            if (
+                identity in self._speaking_participants
+                and self._flush_utterance(identity, len(buf) if buf else 0)
+            ):
+                logger.info("[%s] input muted by %s; utterance finalized", self.name, identity)
+            else:
+                self._audio_buffers[identity] = bytearray()
+                self._last_audio_time.pop(identity, None)
+                self._speaking_participants.discard(identity)
+                logger.info("[%s] input muted by %s", self.name, identity)
+            return
+
+        muted_inputs.discard(identity)
+        self._audio_buffers[identity] = bytearray()
+        self._last_audio_time.pop(identity, None)
+        self._speaking_participants.discard(identity)
+        audio_gates = getattr(self, "_audio_gates", None)
+        if audio_gates is None:
+            audio_gates = self._audio_gates = {}
+        audio_gates[identity] = AdaptiveRmsGate(
+            calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
+            minimum_floor=RMS_SILENCE_FLOOR,
+        )
+        logger.info("[%s] input unmuted by %s; adaptive VAD reset", self.name, identity)
 
     # -- Remote tools (client-registered) -----------------------------------
 
@@ -1696,6 +1791,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         getattr(self, "_video_streams", {}).clear()
         getattr(self, "_audio_buffers", {}).clear()
         getattr(self, "_last_audio_time", {}).clear()
+        getattr(self, "_audio_gates", {}).clear()
+        getattr(self, "_muted_inputs", set()).clear()
         getattr(self, "_speaking_participants", set()).clear()
         self._audio_source = None
         self._local_track = None

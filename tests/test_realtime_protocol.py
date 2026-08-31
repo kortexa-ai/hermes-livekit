@@ -26,6 +26,40 @@ def protocol_fixture(**callbacks):
 
 
 @pytest.mark.asyncio
+async def test_routes_namespaced_input_audio_state_and_acknowledges_it() -> None:
+    states: list[tuple[bool, str]] = []
+
+    async def on_state(muted: bool, identity: str) -> None:
+        states.append((muted, identity))
+
+    protocol, sent = protocol_fixture(on_input_audio_state=on_state)
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "hermes.input_audio.state",
+            "event_id": "mute-1",
+            "muted": True,
+        }),
+        "client-a",
+    )
+
+    assert states == [(True, "client-a")]
+    assert sent[-1][0]["type"] == "hermes.input_audio.state_updated"
+    assert sent[-1][0]["muted"] is True
+    assert sent[-1][1] == "client-a"
+
+
+@pytest.mark.asyncio
+async def test_rejects_invalid_input_audio_state() -> None:
+    protocol, sent = protocol_fixture(on_input_audio_state=lambda *_args: None)
+    await protocol.handle_client_message(
+        json.dumps({"type": "hermes.input_audio.state", "muted": "yes"}),
+        "client-a",
+    )
+
+    assert sent[-1][0]["error"]["code"] == "invalid_input_audio_state"
+
+
+@pytest.mark.asyncio
 async def test_targets_session_snapshot_and_correlated_client_error() -> None:
     protocol, sent = protocol_fixture()
 
