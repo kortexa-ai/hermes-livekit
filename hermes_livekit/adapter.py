@@ -1053,8 +1053,8 @@ class LiveKitAdapter(BasePlatformAdapter):
             task.cancel()
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
-        self._audio_gates.pop(identity, None)
-        self._muted_inputs.discard(identity)
+        getattr(self, "_audio_gates", {}).pop(identity, None)
+        getattr(self, "_muted_inputs", set()).discard(identity)
         self._speaking_participants.discard(identity)
 
     # -- Audio capture and processing ---------------------------------------
