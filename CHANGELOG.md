@@ -31,6 +31,12 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 - Removed private LiveKit FFI teardown now that the SDK owns remote-disconnect
   queue cleanup.
 
+### Fixed
+
+- Kept Direct Realtime capture suppressed for a short playout guard after TTS
+  leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
+  from being transcribed as a second user turn.
+
 ## [0.4.0] — 2026-07-28
 
 ### Added

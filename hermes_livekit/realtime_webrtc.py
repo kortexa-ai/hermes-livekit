@@ -76,6 +76,10 @@ MAX_SDP_BYTES = 256 * 1024
 MAX_SESSION_BYTES = 512 * 1024
 DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
+# Queued RTP frames have left the server when ``drained()`` returns, but the
+# remote jitter buffer and speaker can still be playing their tail.  Keep
+# capture suppressed briefly so that tail cannot become a new user turn.
+OUTPUT_ECHO_GUARD_SECONDS = 0.75
 PROXY_PRINCIPAL_HEADER = "X-Kortexa-Internal-Principal"
 PROXY_CALL_HEADER = "X-Kortexa-Internal-Call-Id"
 PROXY_TIMESTAMP_HEADER = "X-Kortexa-Internal-Timestamp"
@@ -861,6 +865,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             await call.protocol.output_started()
             await call.output_track.enqueue_pcm(pcm)
             await call.output_track.drained()
+            await asyncio.sleep(OUTPUT_ECHO_GUARD_SECONDS)
             await call.protocol.output_stopped()
             call.tts_completed = True
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
