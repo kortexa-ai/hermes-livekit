@@ -415,7 +415,10 @@ class RealtimeCall:
 class RealtimeWebRTCAdapter(BasePlatformAdapter):
     """Hermes platform serving direct OpenAI-compatible WebRTC calls."""
 
-    supports_async_delivery = False
+    # An active call is a persistent outbound channel: Hermes may inject a
+    # background completion turn and this adapter can publish its transcript
+    # and TTS response over the existing peer connection.
+    supports_async_delivery = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("realtime"))
@@ -759,6 +762,24 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
 
     async def process_text(self, call: RealtimeCall, text: str) -> None:
         await self._dispatch_text(call, text, MessageType.TEXT)
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Defer an internal completion wake while this call has live speech."""
+        call = self._calls.get(event.source.chat_id)
+        if event.internal and call is not None and call.speaking:
+            call.spawn(self._deliver_internal_when_silent(call, event))
+            return
+        await super().handle_message(event)
+
+    async def _deliver_internal_when_silent(
+        self,
+        call: RealtimeCall,
+        event: MessageEvent,
+    ) -> None:
+        while self._calls.get(call.call_id) is call and not call.closed and call.speaking:
+            await asyncio.sleep(0.05)
+        if self._calls.get(call.call_id) is call and not call.closed:
+            await super().handle_message(event)
 
     async def _dispatch_text(self, call: RealtimeCall, text: str, kind: MessageType) -> None:
         source = self._source_for_call(call)

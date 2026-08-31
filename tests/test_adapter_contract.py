@@ -16,8 +16,10 @@ tests make them fail here instead.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
-from unittest.mock import AsyncMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -119,3 +121,21 @@ async def test_livekit_send_completes_transcript_response():
     adapter._realtime_protocol.assistant_transcript.assert_awaited_once_with("hello")
     adapter._realtime_protocol.output_stopped.assert_awaited_once_with()
     assert adapter._tts_completed is False
+
+
+@pytest.mark.asyncio
+async def test_livekit_internal_wake_waits_for_silence() -> None:
+    adapter = object.__new__(LiveKitAdapter)
+    adapter._room = object()
+    adapter._speaking_participants = {"client"}
+    adapter._deferred_internal_wakes = set()
+    event = SimpleNamespace(internal=True)
+
+    with patch.object(BasePlatformAdapter, "handle_message", new=AsyncMock()) as dispatch:
+        await adapter.handle_message(event)
+        await asyncio.sleep(0)
+        dispatch.assert_not_awaited()
+
+        adapter._speaking_participants.clear()
+        await asyncio.gather(*adapter._deferred_internal_wakes)
+        dispatch.assert_awaited_once_with(event)

@@ -9,13 +9,14 @@ import hmac
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import ClientSession, FormData, web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter
 from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_livekit.realtime_webrtc import (
     AdaptiveRmsGate,
@@ -461,6 +462,39 @@ async def test_direct_send_completes_transcript_response() -> None:
     protocol.assistant_transcript.assert_awaited_once_with("hello")
     protocol.output_stopped.assert_awaited_once_with()
     assert call.tts_completed is False
+
+
+def test_direct_adapter_supports_async_completion_delivery() -> None:
+    assert RealtimeWebRTCAdapter.supports_async_delivery is True
+
+
+@pytest.mark.asyncio
+async def test_direct_internal_wake_waits_for_silence() -> None:
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    call = SimpleNamespace(
+        call_id="call",
+        speaking=True,
+        closed=False,
+        tasks=set(),
+    )
+
+    def spawn(coroutine: object) -> None:
+        task = asyncio.create_task(coroutine)
+        call.tasks.add(task)
+        task.add_done_callback(call.tasks.discard)
+
+    call.spawn = spawn
+    adapter._calls = {"call": call}
+    event = SimpleNamespace(internal=True, source=SimpleNamespace(chat_id="call"))
+
+    with patch.object(BasePlatformAdapter, "handle_message", new=AsyncMock()) as dispatch:
+        await adapter.handle_message(event)
+        await asyncio.sleep(0)
+        dispatch.assert_not_awaited()
+
+        call.speaking = False
+        await asyncio.gather(*call.tasks)
+        dispatch.assert_awaited_once_with(event)
 
 
 @pytest.mark.asyncio

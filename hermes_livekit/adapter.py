@@ -266,6 +266,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
         # Per-participant speech state (for listening-start/stop events)
         self._speaking_participants: set[str] = set()
+        self._deferred_internal_wakes: set[asyncio.Task[None]] = set()
 
         # Per-participant video streams (subscribed but NOT eagerly iterated —
         # frames are only sampled when a client sends conference.capture_frame
@@ -656,6 +657,9 @@ class LiveKitAdapter(BasePlatformAdapter):
         self._audio_gates.clear()
         self._muted_inputs.clear()
         self._speaking_participants.clear()
+        for task in list(self._deferred_internal_wakes):
+            task.cancel()
+        self._deferred_internal_wakes.clear()
 
         # Unlink any frame files that were captured but never dispatched
         # (no MessageEvent ever drained them). Dispatched-but-not-yet-read
@@ -2355,6 +2359,29 @@ class LiveKitAdapter(BasePlatformAdapter):
         return urls, types
 
     # -- Outbound messaging -------------------------------------------------
+
+    async def handle_message(self, event: MessageEvent) -> None:
+        """Defer background completion wakes until the room is quiet.
+
+        Normal user turns retain the base adapter's interruption semantics.
+        Only internal events (such as a Kanban completion wake) are delayed,
+        and each event is dispatched exactly once if the room remains joined.
+        """
+        if event.internal and getattr(self, "_speaking_participants", set()):
+            task = asyncio.create_task(self._deliver_internal_when_silent(event))
+            pending = getattr(self, "_deferred_internal_wakes", None)
+            if pending is None:
+                pending = self._deferred_internal_wakes = set()
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+            return
+        await super().handle_message(event)
+
+    async def _deliver_internal_when_silent(self, event: MessageEvent) -> None:
+        while self._room is not None and getattr(self, "_speaking_participants", set()):
+            await asyncio.sleep(0.05)
+        if self._room is not None:
+            await super().handle_message(event)
 
     async def _publish_agent_event(
         self, event_type: str, payload: Optional[Dict[str, Any]] = None
