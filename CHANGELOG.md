@@ -6,6 +6,12 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ## [Unreleased]
 
+### Added
+
+- Added authenticated `GET /v1/realtime/discovery` metadata so trusted routers
+  can map a Hermes profile name to the fixed-profile Direct Realtime listener
+  without loading or switching profiles inside hermes-livekit.
+
 ### Changed
 
 - Replaced the legacy Hermes data topics with the shared Conference contract.

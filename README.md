@@ -135,6 +135,19 @@ missing. `HERMES_REALTIME_MAX_CALLS` defaults to 8 and
 advertises host ICE candidates; deployments across NAT still need a TURN-aware
 front door before they are internet-ready.
 
+Each listener is permanently bound to the Hermes profile of its gateway
+process. Trusted routers can discover that fixed binding from
+`GET /v1/realtime/discovery` with the same Bearer token:
+
+```bash
+curl -H "Authorization: Bearer $HERMES_REALTIME_API_KEY" \
+  http://127.0.0.1:8091/v1/realtime/discovery
+```
+
+The bounded response contains only `version`, `profile`, and the relative
+`realtime_path`. It does not enumerate other profiles or expose credentials,
+filesystem paths, rooms, models, or provider configuration.
+
 ### Realtime Conference / LiveKit
 
 Set these env vars. Current Hermes also accepts the matching lowercase keys

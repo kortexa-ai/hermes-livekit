@@ -27,6 +27,7 @@ from hermes_livekit.realtime_webrtc import (
     QueuedAudioTrack,
     RealtimeCall,
     RealtimeWebRTCAdapter,
+    _gateway_profile_name,
     _parse_ice_servers,
     _proxy_signature_payload,
     check_realtime_requirements,
@@ -149,6 +150,48 @@ async def test_direct_listener_negotiates_and_sends_session_created(
 async def _wait_until(predicate, interval: float = 0.01) -> None:
     while not predicate():
         await asyncio.sleep(interval)
+
+
+def test_gateway_profile_name_is_derived_from_process_home(tmp_path) -> None:
+    assert _gateway_profile_name(tmp_path / ".hermes") == "default"
+    assert _gateway_profile_name(tmp_path / ".hermes" / "profiles" / "mira") == "mira"
+    assert _gateway_profile_name(tmp_path / ".hermes" / "profiles" / "Mira") == "default"
+
+
+@pytest.mark.asyncio
+async def test_direct_listener_exposes_authenticated_fixed_profile_discovery(
+    realtime_platform: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "mira"))
+    adapter = RealtimeWebRTCAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"host": "127.0.0.1", "port": 0, "api_key": "test-token"},
+        )
+    )
+    try:
+        assert await adapter.connect() is True
+        port = adapter._site._server.sockets[0].getsockname()[1]
+        async with ClientSession() as client:
+            async with client.get(
+                f"http://127.0.0.1:{port}/v1/realtime/discovery",
+            ) as response:
+                assert response.status == 401
+            async with client.get(
+                f"http://127.0.0.1:{port}/v1/realtime/discovery",
+                headers={"Authorization": "Bearer test-token"},
+            ) as response:
+                assert response.status == 200
+                assert response.headers["Cache-Control"] == "no-store"
+                assert await response.json() == {
+                    "version": 1,
+                    "profile": "mira",
+                    "realtime_path": "/v1/realtime/calls",
+                }
+    finally:
+        await adapter.disconnect()
 
 
 @pytest.mark.asyncio

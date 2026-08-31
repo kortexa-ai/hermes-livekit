@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fractions import Fraction
+from pathlib import Path
 from typing import Any, Optional
 
 try:
@@ -85,6 +86,7 @@ MAX_PROXY_PRINCIPAL_BYTES = 256
 MAX_ICE_SERVERS = 8
 MAX_ICE_URLS = 8
 _CALL_ID_PATTERN = re.compile(r"^rt_[A-Za-z0-9_-]{8,96}$")
+_PROFILE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _ICE_URL_PATTERN = re.compile(r"^(?:stun|stuns|turn|turns):", re.IGNORECASE)
 
 
@@ -99,6 +101,18 @@ def _configured_int(value: Any, default: int, *, minimum: int = 1) -> int:
 def check_realtime_requirements() -> bool:
     """Return whether the pinned HTTP, WebRTC, and media dependencies load."""
     return WEBRTC_AVAILABLE
+
+
+def _gateway_profile_name(home: str | os.PathLike[str] | None = None) -> str:
+    """Return the fixed profile represented by this gateway process."""
+    if home is None:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+    resolved = Path(home).expanduser().resolve(strict=False)
+    if resolved.parent.name == "profiles" and _PROFILE_ID_PATTERN.fullmatch(resolved.name):
+        return resolved.name
+    return "default"
 
 
 def _proxy_signature_payload(
@@ -430,6 +444,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             extra.get("max_call_seconds", os.getenv("HERMES_REALTIME_MAX_CALL_SECONDS")),
             DEFAULT_MAX_CALL_SECONDS,
         )
+        self._profile_name = _gateway_profile_name()
         self._calls: dict[str, RealtimeCall] = {}
         self._pending_calls = 0
         self._proxy_call_ids: dict[str, float] = {}
@@ -448,6 +463,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             return False
         try:
             application = web.Application(client_max_size=MAX_SDP_BYTES + MAX_SESSION_BYTES)
+            application.router.add_get("/v1/realtime/discovery", self._discovery)
             application.router.add_route("OPTIONS", "/v1/realtime/calls", self._options)
             application.router.add_post("/v1/realtime/calls", self._create_call)
             application.router.add_route("OPTIONS", "/realtime/calls", self._options)
@@ -491,6 +507,18 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         header = request.headers.get("Authorization", "")
         prefix = "Bearer "
         return header.startswith(prefix) and hmac.compare_digest(header[len(prefix) :], self._api_key)
+
+    async def _discovery(self, request: Any) -> Any:
+        if not self._authorized(request):
+            return web.Response(status=401, text="unauthorized")
+        return web.json_response(
+            {
+                "version": 1,
+                "profile": self._profile_name,
+                "realtime_path": "/v1/realtime/calls",
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def _read_offer(self, request: Any) -> tuple[str, dict[str, Any], str]:
         content_type = request.content_type.lower()
