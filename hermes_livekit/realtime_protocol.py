@@ -22,6 +22,9 @@ DEFAULT_TOOL_TIMEOUT_SECONDS = 30.0
 Publish = Callable[[dict[str, Any], Optional[str]], Awaitable[bool]]
 ClientCallback = Callable[[str], Awaitable[None] | None]
 TextCallback = Callable[[str, str], Awaitable[None] | None]
+InputAudioStateCallback = Callable[[bool, str], Awaitable[None] | None]
+HERMES_INPUT_AUDIO_STATE = "hermes.input_audio.state"
+HERMES_INPUT_AUDIO_STATE_UPDATED = "hermes.input_audio.state_updated"
 
 
 async def _call(callback: Callable[..., Any] | None, *args: Any) -> bool:
@@ -46,6 +49,7 @@ class RealtimeProtocol:
         on_text_input: TextCallback | None = None,
         on_response_requested: ClientCallback | None = None,
         on_response_cancelled: ClientCallback | None = None,
+        on_input_audio_state: InputAudioStateCallback | None = None,
         instructions: str = "",
         tool_choice: str = "auto",
         tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
@@ -57,6 +61,7 @@ class RealtimeProtocol:
         self._on_text_input = on_text_input
         self._on_response_requested = on_response_requested
         self._on_response_cancelled = on_response_cancelled
+        self._on_input_audio_state = on_input_audio_state
         self.instructions = instructions
         self.tool_choice = tool_choice
         self._tool_timeout_seconds = tool_timeout_seconds
@@ -133,6 +138,8 @@ class RealtimeProtocol:
             await self._accept_response_create(identity, event_id)
         elif event_type == "response.cancel":
             await self._accept_response_cancel(identity, event_id)
+        elif event_type == HERMES_INPUT_AUDIO_STATE:
+            await self._accept_input_audio_state(event, identity, event_id)
         else:
             label = event_type if isinstance(event_type, str) else "unknown"
             await self._error(
@@ -142,6 +149,39 @@ class RealtimeProtocol:
                 param="type",
                 triggering_event_id=event_id,
             )
+
+    async def _accept_input_audio_state(
+        self,
+        event: dict[str, Any],
+        identity: str,
+        event_id: str | None,
+    ) -> None:
+        muted = event.get("muted")
+        if not isinstance(muted, bool):
+            await self._error(
+                "invalid_input_audio_state",
+                "muted must be a boolean",
+                identity,
+                param="muted",
+                triggering_event_id=event_id,
+            )
+            return
+        if not await _call(self._on_input_audio_state, muted, identity):
+            await self._error(
+                "unsupported_client_event",
+                "Input audio state is not supported by this transport",
+                identity,
+                param="type",
+                triggering_event_id=event_id,
+            )
+            return
+        await self._emit(
+            {
+                "type": HERMES_INPUT_AUDIO_STATE_UPDATED,
+                "muted": muted,
+            },
+            recipient=identity,
+        )
 
     def _session_snapshot(self) -> dict[str, Any]:
         return {

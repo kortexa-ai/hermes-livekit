@@ -66,6 +66,7 @@ from .adapter import (
 )
 from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
+from .vad import AdaptiveRmsGate
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
@@ -74,15 +75,6 @@ MAX_SDP_BYTES = 256 * 1024
 MAX_SESSION_BYTES = 512 * 1024
 DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
-VAD_CALIBRATION_FRAMES = 20
-VAD_NOISE_CEILING = 300.0
-VAD_MIN_START_THRESHOLD = 300.0
-VAD_MIN_STOP_THRESHOLD = 220.0
-VAD_START_RATIO = 2.2
-VAD_START_MARGIN = 100.0
-VAD_STOP_RATIO = 1.5
-VAD_STOP_MARGIN = 60.0
-VAD_NOISE_ALPHA = 0.02
 PROXY_PRINCIPAL_HEADER = "X-Kortexa-Internal-Principal"
 PROXY_CALL_HEADER = "X-Kortexa-Internal-Call-Id"
 PROXY_TIMESTAMP_HEADER = "X-Kortexa-Internal-Timestamp"
@@ -242,65 +234,6 @@ class QueuedAudioTrack(MediaStreamTrack):
 
 
 @dataclass
-class AdaptiveRmsGate:
-    """Small adaptive energy gate for continuously noisy kiosk microphones."""
-
-    noise_rms: float | None = None
-    calibration: list[float] = field(default_factory=list)
-
-    @property
-    def ready(self) -> bool:
-        return self.noise_rms is not None
-
-    @property
-    def start_threshold(self) -> float:
-        noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
-        return max(
-            VAD_MIN_START_THRESHOLD,
-            noise * VAD_START_RATIO,
-            noise + VAD_START_MARGIN,
-        )
-
-    @property
-    def stop_threshold(self) -> float:
-        noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
-        return max(
-            VAD_MIN_STOP_THRESHOLD,
-            noise * VAD_STOP_RATIO,
-            noise + VAD_STOP_MARGIN,
-        )
-
-    def calibrate(self, rms: float) -> bool:
-        if self.ready:
-            return True
-        self.calibration.append(rms)
-        if len(self.calibration) < VAD_CALIBRATION_FRAMES:
-            return False
-
-        # Use the quieter half so somebody beginning to speak during the
-        # short calibration window does not become the learned noise floor.
-        ordered = sorted(self.calibration)
-        quiet = ordered[: max(1, len(ordered) // 2)]
-        measured = sum(quiet) / len(quiet)
-        self.noise_rms = min(VAD_NOISE_CEILING, max(1.0, measured))
-        self.calibration.clear()
-        return True
-
-    def is_speech(self, rms: float, *, speaking: bool) -> bool:
-        threshold = self.stop_threshold if speaking else self.start_threshold
-        speech = rms > threshold
-        if not speaking and not speech and self.noise_rms is not None:
-            # Follow slow changes such as a fan ramping up, but never learn a
-            # speech frame or allow an outlier to raise the floor indefinitely.
-            observed = min(rms, VAD_NOISE_CEILING)
-            self.noise_rms = (
-                (1.0 - VAD_NOISE_ALPHA) * self.noise_rms
-                + VAD_NOISE_ALPHA * observed
-            )
-        return speech
-
-
-@dataclass
 class RealtimeCall:
     adapter: "RealtimeWebRTCAdapter"
     call_id: str
@@ -315,6 +248,7 @@ class RealtimeCall:
     last_speech_at: float | None = None
     speaking: bool = False
     paused: bool = False
+    input_muted: bool = False
     tts_completed: bool = False
     closed: bool = False
     vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
@@ -359,7 +293,7 @@ class RealtimeCall:
         try:
             while not self.closed:
                 frame = await track.recv()
-                if self.paused:
+                if self.paused or self.input_muted:
                     continue
                 for converted in resampler.resample(frame):
                     size = converted.samples * NUM_CHANNELS * 2
@@ -420,6 +354,31 @@ class RealtimeCall:
         duration = len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)
         if duration >= MIN_SPEECH_DURATION:
             self.spawn(self.adapter.process_voice(self, pcm))
+
+    async def set_input_audio_state(self, muted: bool) -> None:
+        """Apply an explicit client mute boundary to capture and endpointing."""
+        if muted == self.input_muted:
+            return
+        self.input_muted = muted
+        if muted:
+            if self.speaking and self.audio_buffer:
+                await self.finish_utterance()
+            else:
+                self.audio_buffer.clear()
+                self.last_speech_at = None
+                self.speaking = False
+            self.vad_calibration_pcm.clear()
+            logger.info("[%s] input muted by client", self.call_id)
+            return
+
+        # Calibrate against the real microphone after it replaces any muted
+        # placeholder track. This avoids learning digital zero as room noise.
+        self.audio_buffer.clear()
+        self.last_speech_at = None
+        self.speaking = False
+        self.vad = AdaptiveRmsGate(minimum_floor=RMS_SILENCE_FLOOR)
+        self.vad_calibration_pcm.clear()
+        logger.info("[%s] input unmuted; adaptive VAD reset", self.call_id)
 
     async def close(self) -> None:
         if self.closed:
@@ -669,6 +628,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                     "Follow the session instructions and respond now.",
                 ),
                 on_response_cancelled=lambda _identity: self.cancel_call_response(call),
+                on_input_audio_state=lambda muted, _identity: call.set_input_audio_state(muted),
             )
             call = RealtimeCall(
                 self,

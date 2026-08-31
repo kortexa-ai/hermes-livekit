@@ -226,6 +226,20 @@ receive an explicit error targeted to the sending participant. The old
 `hermes-chat` and raw conversation `agent:*` streams are not part of the new
 contract.
 
+Hermes adds one namespaced input-state extension because the portable OpenAI
+Realtime event set has no microphone mute/unmute signal:
+
+```json
+{"type":"hermes.input_audio.state","muted":true}
+```
+
+Direct WebRTC clients send it on `oai-events`. Conference clients send the
+same envelope reliably on `conference.extensions`. The server responds on the
+same transport with `hermes.input_audio.state_updated`. Muting immediately
+finalizes any active utterance and then ignores media frames; unmuting clears
+stale audio and recalibrates the participant's adaptive noise gate. Clients
+that omit this optional extension retain energy-based endpointing.
+
 ### Conference extensions
 
 Portable tool discovery uses `conference.tools`, exactly as it does with
@@ -265,6 +279,10 @@ Reliable JSON payloads on `conference.extensions`:
 
 // this speaker is done talking; close the utterance and dispatch it now (0.4.0+)
 {"type": "conference.control", "action": "end-of-turn"}
+
+// participant-scoped mute boundary and VAD recalibration
+{"type": "hermes.input_audio.state", "muted": true}
+{"type": "hermes.input_audio.state", "muted": false}
 ```
 
 `end-of-turn` is for clients that endpoint locally. Without it the adapter can
