@@ -23,6 +23,7 @@ from hermes_livekit.realtime_webrtc import (
     PROXY_PRINCIPAL_HEADER,
     PROXY_SIGNATURE_HEADER,
     PROXY_TIMESTAMP_HEADER,
+    QueuedAudioTrack,
     RealtimeWebRTCAdapter,
     _parse_ice_servers,
     _proxy_signature_payload,
@@ -146,6 +147,28 @@ async def test_direct_listener_negotiates_and_sends_session_created(
 async def _wait_until(predicate, interval: float = 0.01) -> None:
     while not predicate():
         await asyncio.sleep(interval)
+
+
+@pytest.mark.asyncio
+async def test_queued_audio_track_paces_pcm_in_realtime() -> None:
+    track = QueuedAudioTrack()
+    samples_per_frame = 48_000 // 50
+    frame_bytes = b"\x00\x00" * samples_per_frame
+    await track.enqueue_pcm(frame_bytes * 3)
+
+    started_at = asyncio.get_running_loop().time()
+    frames = [await track.recv() for _ in range(3)]
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    # The first frame is ready immediately; the next two are spaced 20 ms
+    # apart instead of being returned as a single RTP burst.
+    assert elapsed >= 0.035
+    assert [frame.pts for frame in frames] == [
+        0,
+        samples_per_frame,
+        samples_per_frame * 2,
+    ]
+    assert all(frame.sample_rate == 48_000 for frame in frames)
 
 
 def _proxy_headers(

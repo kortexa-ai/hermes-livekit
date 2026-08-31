@@ -174,11 +174,31 @@ class QueuedAudioTrack(MediaStreamTrack):
         super().__init__()
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._timestamp = 0
+        self._next_frame_at: float | None = None
 
     async def recv(self) -> Any:
         chunk = await self._queue.get()
         try:
             samples = len(chunk) // 2
+            duration = samples / SAMPLE_RATE
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+
+            # RTCRtpSender calls recv() again as soon as it has encoded the
+            # previous frame.  Timestamps alone do not pace aiortc, so without
+            # this wait an entire reply is emitted as one RTP burst.  Apart
+            # from making output-start/output-stop lie about playback time,
+            # that burst overruns browser jitter buffers and sounds garbled.
+            # Never try to catch up after scheduler stalls or an idle period:
+            # resume from the current monotonic time instead.
+            deadline = self._next_frame_at
+            if deadline is None or deadline < now:
+                deadline = now
+            delay = deadline - now
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_frame_at = deadline + duration
+
             frame = AudioFrame(format="s16", layout="mono", samples=samples)
             frame.planes[0].update(chunk)
             frame.sample_rate = SAMPLE_RATE
@@ -202,6 +222,7 @@ class QueuedAudioTrack(MediaStreamTrack):
         await self._queue.join()
 
     def clear(self) -> None:
+        self._next_frame_at = None
         while True:
             try:
                 self._queue.get_nowait()
