@@ -21,6 +21,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_livekit.realtime_webrtc import (
     AdaptiveRmsGate,
     CLIENT_IDENTITY,
+    OUTPUT_ECHO_GUARD_SECONDS,
     PROXY_CALL_HEADER,
     PROXY_PRINCIPAL_HEADER,
     PROXY_SIGNATURE_HEADER,
@@ -447,6 +448,46 @@ async def test_direct_send_voice_uses_native_audio_track() -> None:
         reply_to="message",
         metadata={"turn": 1},
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> None:
+    protocol = AsyncMock()
+    output_track = SimpleNamespace(enqueue_pcm=AsyncMock(), drained=AsyncMock())
+    call = SimpleNamespace(
+        protocol=protocol,
+        output_track=output_track,
+        paused=False,
+        tts_completed=False,
+    )
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter._calls = {"call": call}
+
+    async def guarded_sleep(delay: float) -> None:
+        assert delay == OUTPUT_ECHO_GUARD_SECONDS
+        assert call.paused is True
+        protocol.output_stopped.assert_not_awaited()
+
+    with (
+        patch(
+            "hermes_livekit.adapter.LiveKitAdapter._decode_audio_to_pcm",
+            return_value=b"\x00\x00" * 320,
+        ),
+        patch(
+            "hermes_livekit.realtime_webrtc.asyncio.sleep",
+            side_effect=guarded_sleep,
+        ) as sleep,
+    ):
+        result = await adapter.play_tts("call", "reply.wav")
+
+    assert result.success is True
+    sleep.assert_awaited_once_with(OUTPUT_ECHO_GUARD_SECONDS)
+    output_track.enqueue_pcm.assert_awaited_once()
+    output_track.drained.assert_awaited_once_with()
+    protocol.output_started.assert_awaited_once_with()
+    protocol.output_stopped.assert_awaited_once_with()
+    assert call.tts_completed is True
+    assert call.paused is False
 
 
 @pytest.mark.asyncio
