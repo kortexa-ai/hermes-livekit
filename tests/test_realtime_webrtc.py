@@ -188,6 +188,21 @@ def test_adaptive_rms_gate_learns_fan_noise_without_calling_it_speech() -> None:
     assert gate.is_speech(175.0, speaking=True) is False
 
 
+def test_adaptive_rms_gate_keeps_safe_floor_after_muted_track_calibration() -> None:
+    gate = AdaptiveRmsGate()
+    for _ in range(20):
+        gate.calibrate(0.0)
+
+    # WPE sends digital silence before replaceTrack installs the real mic.
+    # The measured Pi fan (RMS ~150, short-window peaks below 200) must not
+    # become speech merely because calibration happened while muted.
+    assert gate.noise_rms == 1.0
+    assert gate.start_threshold == 300.0
+    assert gate.stop_threshold == 220.0
+    assert gate.is_speech(200.0, speaking=False) is False
+    assert gate.is_speech(700.0, speaking=False) is True
+
+
 def test_adaptive_rms_gate_tracks_gradual_idle_noise_changes() -> None:
     gate = AdaptiveRmsGate()
     for _ in range(20):

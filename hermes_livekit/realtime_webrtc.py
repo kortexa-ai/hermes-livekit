@@ -76,6 +76,8 @@ DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
 VAD_CALIBRATION_FRAMES = 20
 VAD_NOISE_CEILING = 300.0
+VAD_MIN_START_THRESHOLD = 300.0
+VAD_MIN_STOP_THRESHOLD = 220.0
 VAD_START_RATIO = 2.2
 VAD_START_MARGIN = 100.0
 VAD_STOP_RATIO = 1.5
@@ -254,7 +256,7 @@ class AdaptiveRmsGate:
     def start_threshold(self) -> float:
         noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
         return max(
-            float(RMS_SILENCE_FLOOR),
+            VAD_MIN_START_THRESHOLD,
             noise * VAD_START_RATIO,
             noise + VAD_START_MARGIN,
         )
@@ -263,7 +265,7 @@ class AdaptiveRmsGate:
     def stop_threshold(self) -> float:
         noise = self.noise_rms or float(RMS_SILENCE_FLOOR)
         return max(
-            float(RMS_SILENCE_FLOOR),
+            VAD_MIN_STOP_THRESHOLD,
             noise * VAD_STOP_RATIO,
             noise + VAD_STOP_MARGIN,
         )
