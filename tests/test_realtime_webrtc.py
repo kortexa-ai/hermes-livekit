@@ -389,7 +389,7 @@ async def test_listener_requires_api_key(realtime_platform: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_listener_rejects_required_tool_choice_explicitly(
+async def test_listener_accepts_required_tool_choice(
     realtime_platform: None,
 ) -> None:
     adapter = RealtimeWebRTCAdapter(
@@ -398,11 +398,22 @@ async def test_listener_rejects_required_tool_choice_explicitly(
             extra={"host": "127.0.0.1", "port": 0, "api_key": "test-token"},
         )
     )
+    peer = RTCPeerConnection()
+    created = asyncio.Event()
+    channel = peer.createDataChannel("oai-events")
+    peer.addTransceiver("audio", direction="recvonly")
+
+    @channel.on("message")
+    def on_message(raw: str) -> None:
+        if json.loads(raw).get("type") == "session.created":
+            created.set()
+
     try:
         assert await adapter.connect() is True
         port = adapter._site._server.sockets[0].getsockname()[1]
+        await peer.setLocalDescription(await peer.createOffer())
         form = FormData(default_to_multipart=True)
-        form.add_field("sdp", "v=0\r\n")
+        form.add_field("sdp", peer.localDescription.sdp)
         form.add_field(
             "session",
             json.dumps({
@@ -421,9 +432,14 @@ async def test_listener_rejects_required_tool_choice_explicitly(
                 data=form,
                 headers={"Authorization": "Bearer test-token"},
             ) as response:
-                assert response.status == 400
-                assert "required is not supported" in await response.text()
+                assert response.status == 201
+                answer = await response.text()
+        await peer.setRemoteDescription(RTCSessionDescription(sdp=answer, type="answer"))
+        await asyncio.wait_for(created.wait(), timeout=10)
+        call = next(iter(adapter._calls.values()))
+        assert call.protocol.tool_choice == "required"
     finally:
+        await peer.close()
         await adapter.disconnect()
 
 

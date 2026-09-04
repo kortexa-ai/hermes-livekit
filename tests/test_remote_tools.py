@@ -162,6 +162,28 @@ async def test_invalid_portable_catalog_is_rejected_without_mutation(
 
 
 @pytest.mark.asyncio
+async def test_conference_catalog_uses_shared_duplicate_and_size_validation() -> None:
+    adapter = adapter_for_registration()
+    await adapter._register_client_tools(
+        conference_tools("desktop_notify", "desktop_notify"), "client-a"
+    )
+    adapter._publish_typed.assert_awaited_with(
+        {"type": "conference.tools.rejected"},
+        identity="client-a",
+        topic="conference.tools",
+    )
+
+    oversized = conference_tools("desktop_notify")
+    oversized["tools"][0]["function"]["description"] = "x" * (4 * 1024 + 1)
+    await adapter._register_client_tools(oversized, "client-a")
+    adapter._publish_typed.assert_awaited_with(
+        {"type": "conference.tools.rejected"},
+        identity="client-a",
+        topic="conference.tools",
+    )
+
+
+@pytest.mark.asyncio
 async def test_same_advertised_name_gets_distinct_scoped_slots_and_routes_to_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

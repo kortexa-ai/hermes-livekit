@@ -5,82 +5,40 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .tool_safety import valid_tool_name
+from .tool_model import (
+    FunctionToolDefinition,
+    ToolDefinitionError,
+    parse_function_tools,
+    parse_tool_choice,
+)
 
 
 DIRECT_TOOLSET_NAME = "realtime-client-tools"
 DIRECT_TOOL_PREFIX = "rt_"
-MAX_DIRECT_TOOLS = 16
-MAX_TOOL_DESCRIPTION_BYTES = 4 * 1024
-MAX_TOOL_SCHEMA_BYTES = 64 * 1024
-
-
-class DirectToolError(ValueError):
+class DirectToolError(ToolDefinitionError):
     """The OpenAI Realtime tool setup is invalid or unsupported."""
 
 
-@dataclass(frozen=True)
-class DirectToolDefinition:
-    name: str
-    description: str
-    parameters: dict[str, Any]
+DirectToolDefinition = FunctionToolDefinition
 
 
-def parse_direct_tools(session: dict[str, Any]) -> tuple[list[DirectToolDefinition], str]:
+def parse_direct_tools(
+    session: dict[str, Any],
+) -> tuple[list[DirectToolDefinition], str | dict[str, str]]:
     """Validate the portable OpenAI function-tool subset used by Hermes Direct."""
-    choice = session.get("tool_choice", "auto")
-    if choice not in {"auto", "none", "required"}:
-        raise DirectToolError("tool_choice must be auto, none, or required")
-    if choice == "required":
-        raise DirectToolError("tool_choice required is not supported by Hermes Direct")
-
     raw_tools = session.get("tools", [])
-    if not isinstance(raw_tools, list):
-        raise DirectToolError("tools must be an array")
-    if len(raw_tools) > MAX_DIRECT_TOOLS:
-        raise DirectToolError("too many tools")
     try:
-        encoded_tools = json.dumps(raw_tools, separators=(",", ":")).encode("utf-8")
-    except (TypeError, ValueError, UnicodeEncodeError) as exc:
-        raise DirectToolError("tools must contain valid JSON") from exc
-    if len(encoded_tools) > MAX_TOOL_SCHEMA_BYTES:
-        raise DirectToolError("tool schemas are too large")
-
-    parsed: list[DirectToolDefinition] = []
-    names: set[str] = set()
-    allowed_keys = {"type", "name", "description", "parameters"}
-    for index, value in enumerate(raw_tools):
-        label = f"tools[{index}]"
-        if not isinstance(value, dict):
-            raise DirectToolError(f"{label} must be an object")
-        unknown = set(value) - allowed_keys
-        if unknown:
-            raise DirectToolError(f"unsupported {label} field: {sorted(unknown)[0]}")
-        if value.get("type") != "function":
-            raise DirectToolError(f"{label}.type must be function")
-        name = value.get("name")
-        # Hermes's public registry contract supports canonical names up to 64
-        # characters. Reject OpenAI's wider name subset instead of silently
-        # rewriting the public function identity.
-        if not valid_tool_name(name) or "." in str(name):
-            raise DirectToolError(f"{label}.name is invalid")
-        if name in names:
-            raise DirectToolError(f"duplicate tool: {name}")
-        names.add(name)
-        description = value.get("description", "")
-        if not isinstance(description, str):
-            raise DirectToolError(f"{label}.description must be a string")
-        if len(description.encode("utf-8")) > MAX_TOOL_DESCRIPTION_BYTES:
-            raise DirectToolError(f"{label}.description is too large")
-        parameters = value.get("parameters")
-        if not isinstance(parameters, dict) or parameters.get("type") != "object":
-            raise DirectToolError(f"{label}.parameters must be an object schema")
-        parsed.append(DirectToolDefinition(name, description, parameters))
-
-    return ([] if choice == "none" else parsed), choice
+        parsed = parse_function_tools(
+            raw_tools, nested=False, allow_dotted_names=False
+        )
+        choice = parse_tool_choice(
+            session.get("tool_choice", "auto"), {tool.name for tool in parsed}
+        )
+    except ToolDefinitionError as exc:
+        raise DirectToolError(str(exc)) from exc
+    return parsed, choice
 
 
 def install_direct_toolsets() -> None:
@@ -153,11 +111,7 @@ class DirectToolBridge:
                 registry.register(
                     name=registry_name,
                     toolset=DIRECT_TOOLSET_NAME,
-                    schema={
-                        "name": registry_name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
+                    schema=tool.registry_schema(registry_name),
                     handler=handler,
                     is_async=True,
                     description=tool.description,
@@ -171,6 +125,21 @@ class DirectToolBridge:
         except Exception:
             self.close()
             raise
+
+    def set_tool_choice(self, tool_choice: str | dict[str, str]) -> None:
+        """Expose only the registry entries allowed for the next Hermes turn."""
+        from toolsets import TOOLSETS
+
+        static_names = TOOLSETS[DIRECT_TOOLSET_NAME]["tools"]
+        selected_name = tool_choice.get("name") if isinstance(tool_choice, dict) else None
+        for registry_name, definition in self._definitions.items():
+            exposed = tool_choice != "none" and (
+                selected_name is None or definition.name == selected_name
+            )
+            if exposed and registry_name not in static_names:
+                static_names.append(registry_name)
+            while not exposed and registry_name in static_names:
+                static_names.remove(registry_name)
 
     def close(self) -> None:
         from tools.registry import registry
@@ -190,8 +159,9 @@ class DirectToolBridge:
         self._registered.clear()
         self._definitions.clear()
 
-    def prompt_hint(self) -> str:
+    def prompt_hint(self, tool_choice: str | dict[str, str] = "auto") -> str:
         """Describe deferred client tools in an ephemeral per-turn prompt."""
+        selected_name = tool_choice.get("name") if isinstance(tool_choice, dict) else None
         tools = [
             {
                 "client_name": definition.name,
@@ -200,10 +170,27 @@ class DirectToolBridge:
                 "parameters": definition.parameters,
             }
             for registry_name, definition in self._definitions.items()
+            if selected_name is None or definition.name == selected_name
         ]
         if not tools:
             return ""
         catalog = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+        choice_instruction = ""
+        if tool_choice == "required":
+            choice_instruction = (
+                "You must invoke at least one supplied function before answering. "
+            )
+        elif isinstance(tool_choice, dict):
+            advertised_name = tool_choice["name"]
+            registry_name = next(
+                name
+                for name, definition in self._definitions.items()
+                if definition.name == advertised_name
+            )
+            choice_instruction = (
+                f"You must invoke the function with internal_name {registry_name!r} "
+                "before answering. "
+            )
         return (
             "This Realtime call has client-provided function tools. Their exact "
             "schemas and call-scoped internal names are in the JSON below. When "
@@ -215,7 +202,8 @@ class DirectToolBridge:
             "its value; for example, 'with value ready' means "
             "{\"value\":\"ready\"}. Do not ask for clarification when all "
             "required arguments are present in the request. "
-            "Never reveal the internal name.\n"
+            "Never reveal the internal name. "
+            f"{choice_instruction}\n"
             f"{catalog}"
         )
 
@@ -224,6 +212,11 @@ class DirectToolBridge:
             invocation_session = kwargs.get("session_id")
             if not self._owns_invocation(invocation_session):
                 raise RuntimeError("realtime tool invoked outside its owning session")
+            tool_choice = self.protocol.tool_choice
+            if tool_choice == "none":
+                raise RuntimeError("realtime tool invocation disabled by tool_choice")
+            if isinstance(tool_choice, dict) and tool_choice["name"] != advertised_name:
+                raise RuntimeError("realtime tool invocation does not match tool_choice")
             arguments = dict(args or {})
             running_loop = asyncio.get_running_loop()
             owner_loop = self._owner_loop

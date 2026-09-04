@@ -367,3 +367,121 @@ async def test_function_output_rejects_unknown_call_ids() -> None:
 
     assert sent[-1][0]["error"]["code"] == "unknown_tool_call"
     assert sent[-1][0]["error"]["event_id"] == "unknown-output"
+
+
+@pytest.mark.asyncio
+async def test_function_output_rejects_duplicates_and_oversized_values() -> None:
+    protocol, sent = protocol_fixture()
+    await protocol.client_connected("client-a")
+    pending = asyncio.create_task(protocol.request_client_tool("fixture_echo", {}))
+    await asyncio.sleep(0)
+    call_id = next(
+        event["call_id"]
+        for event, _ in sent
+        if event["type"] == "response.function_call_arguments.done"
+    )
+
+    def output(value: str) -> str:
+        return json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": value,
+            },
+        })
+
+    await protocol.handle_client_message(output("x" * (64 * 1024 + 1)), "client-a")
+    assert sent[-1][0]["error"]["code"] == "invalid_tool_output"
+    await protocol.handle_client_message(output("ok"), "client-a")
+    await protocol.handle_client_message(output("again"), "client-a")
+    assert sent[-1][0]["error"]["code"] == "duplicate_tool_output"
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+
+
+@pytest.mark.asyncio
+async def test_oversized_tool_arguments_fail_before_pending_state() -> None:
+    protocol, _sent = protocol_fixture()
+    with pytest.raises(RuntimeError, match="too large"):
+        await protocol.request_client_tool("fixture_echo", {"value": "x" * (64 * 1024)})
+    assert protocol._pending_tool is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_wait_clears_pending_state_and_rejects_late_output() -> None:
+    protocol, sent = protocol_fixture(tool_names={"fixture_echo"})
+    await protocol.client_connected("client-a")
+    pending = asyncio.create_task(
+        protocol.request_client_tool("fixture_echo", {"value": "ready"})
+    )
+    await asyncio.sleep(0)
+    call_id = next(
+        event["call_id"]
+        for event, _ in sent
+        if event["type"] == "response.function_call_arguments.done"
+    )
+
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert protocol._pending_tool is None
+
+    await protocol.handle_client_message(
+        json.dumps({
+            "type": "conversation.item.create",
+            "item": {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "late",
+            },
+        }),
+        "client-a",
+    )
+    assert sent[-1][0]["error"]["code"] == "unknown_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_tool_wait_times_out_and_clears_pending_state() -> None:
+    protocol, sent = protocol_fixture(
+        tool_names={"fixture_echo"}, tool_timeout_seconds=0.001
+    )
+    await protocol.client_connected("client-a")
+
+    with pytest.raises(RuntimeError, match="timeout"):
+        await protocol.request_client_tool("fixture_echo", {})
+
+    assert protocol._pending_tool is None
+    assert sent[-1][0]["error"]["code"] == "tool_timeout"
+    assert sent[-1][1] == "client-a"
+
+
+@pytest.mark.asyncio
+async def test_protocol_close_cancels_pending_tool_wait() -> None:
+    protocol, _sent = protocol_fixture()
+    pending = asyncio.create_task(protocol.request_client_tool("fixture_echo", {}))
+    await asyncio.sleep(0)
+    await protocol.close()
+
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert protocol._pending_tool is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_accepts_required_and_named_function_choices() -> None:
+    protocol, sent = protocol_fixture(tool_names={"fixture_echo"})
+    for choice in (
+        "required",
+        {"type": "function", "name": "fixture_echo"},
+    ):
+        await protocol.handle_client_message(
+            json.dumps({
+                "type": "session.update",
+                "session": {"type": "realtime", "tool_choice": choice},
+            }),
+            "client-a",
+        )
+        assert protocol.tool_choice == choice
+        assert sent[-1][0]["type"] == "session.updated"

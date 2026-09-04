@@ -87,6 +87,11 @@ from .tool_result_protocol import (
     validate_completed_size,
     validate_stream_header,
 )
+from .tool_model import (
+    FunctionToolDefinition,
+    ToolDefinitionError,
+    parse_function_tools,
+)
 from .tool_safety import (
     PolicyDecision,
     ToolAuditLog,
@@ -2008,39 +2013,24 @@ class LiveKitAdapter(BasePlatformAdapter):
             return
 
         values = msg.get("tools")
-        converted: list[Dict[str, Any]] = []
-        names: set[str] = set()
-        if not isinstance(values, list) or len(values) > 16:
-            values = None
-        if values is not None:
-            for value in values:
-                function = value.get("function") if isinstance(value, dict) else None
-                if (
-                    not isinstance(value, dict)
-                    or value.get("type") != "function"
-                    or not isinstance(function, dict)
-                    or not isinstance(function.get("name"), str)
-                    or not isinstance(function.get("description"), str)
-                    or not isinstance(function.get("parameters"), dict)
-                    or function["name"] in names
-                ):
-                    values = None
-                    break
-                names.add(function["name"])
-                converted.append(
-                    {
-                        "name": function["name"],
-                        "description": function["description"],
-                        "input_schema": function["parameters"],
-                    }
-                )
-
-        accepted = values is not None
+        try:
+            converted = parse_function_tools(
+                values, nested=True, allow_dotted_names=True
+            )
+        except ToolDefinitionError:
+            converted = []
+            accepted = False
+        else:
+            accepted = True
         if accepted:
             self._cleanup_client_tools(identity)
-            for tool in converted:
+            for definition in converted:
                 if not await self._register_client_tool(
-                    tool,
+                    {
+                        "name": definition.name,
+                        "description": definition.description,
+                        "input_schema": definition.parameters,
+                    },
                     identity,
                     receiving_room=receiving_room,
                     receiving_generation=receiving_generation,
@@ -2122,11 +2112,8 @@ class LiveKitAdapter(BasePlatformAdapter):
         # The registry's `schema` is the OpenAI function-envelope shape
         # (`{name, description, parameters}`), not a bare JSON Schema. Wrap
         # the client-supplied input_schema accordingly.
-        registry_schema = {
-            "name": registry_name,
-            "description": description,
-            "parameters": input_schema,
-        }
+        definition = FunctionToolDefinition(name, str(description), input_schema)
+        registry_schema = definition.registry_schema(registry_name)
         try:
             # override=True permits the exact owner/method pair to re-register
             # after reconnect. Collision checks above protect every other slot.

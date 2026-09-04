@@ -657,6 +657,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 publish=publish,
                 instructions=instructions,
                 tool_choice=tool_choice,
+                tool_names={tool.name for tool in tools},
                 on_text_input=lambda text, _identity: self.process_text(call, text),
                 on_response_requested=lambda _identity: self.process_text(
                     call,
@@ -664,6 +665,11 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                 ),
                 on_response_cancelled=lambda _identity: self.cancel_call_response(call),
                 on_input_audio_state=lambda muted, _identity: call.set_input_audio_state(muted),
+                on_tool_choice_updated=lambda choice: (
+                    call.tool_bridge.set_tool_choice(choice)
+                    if call.tool_bridge is not None
+                    else None
+                ),
             )
             call = RealtimeCall(
                 self,
@@ -679,6 +685,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                     protocol=protocol,
                 )
                 bridge.register(tools)
+                bridge.set_tool_choice(tool_choice)
                 call.tool_bridge = bridge
             self._calls[call_id] = call
             peer.addTrack(output_track)
@@ -789,7 +796,9 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         source = self._source_for_call(call)
         prompts = [call.protocol.instructions.strip()]
         if call.tool_bridge is not None and call.protocol.tool_choice != "none":
-            prompts.append(call.tool_bridge.prompt_hint().strip())
+            prompts.append(
+                call.tool_bridge.prompt_hint(call.protocol.tool_choice).strip()
+            )
         channel_prompt = "\n\n".join(prompt for prompt in prompts if prompt) or None
         event = MessageEvent(
             text=text,

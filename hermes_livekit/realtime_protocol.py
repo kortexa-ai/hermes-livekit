@@ -10,6 +10,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional
 
+from .tool_model import ToolDefinitionError, parse_tool_choice
+
 
 MAX_EVENT_BYTES = 256 * 1024
 MAX_TEXT_BYTES = 64 * 1024
@@ -23,6 +25,7 @@ Publish = Callable[[dict[str, Any], Optional[str]], Awaitable[bool]]
 ClientCallback = Callable[[str], Awaitable[None] | None]
 TextCallback = Callable[[str, str], Awaitable[None] | None]
 InputAudioStateCallback = Callable[[bool, str], Awaitable[None] | None]
+ToolChoiceCallback = Callable[[str | dict[str, str]], Awaitable[None] | None]
 HERMES_INPUT_AUDIO_STATE = "hermes.input_audio.state"
 HERMES_INPUT_AUDIO_STATE_UPDATED = "hermes.input_audio.state_updated"
 
@@ -50,8 +53,10 @@ class RealtimeProtocol:
         on_response_requested: ClientCallback | None = None,
         on_response_cancelled: ClientCallback | None = None,
         on_input_audio_state: InputAudioStateCallback | None = None,
+        on_tool_choice_updated: ToolChoiceCallback | None = None,
         instructions: str = "",
-        tool_choice: str = "auto",
+        tool_choice: str | dict[str, str] = "auto",
+        tool_names: set[str] | None = None,
         tool_timeout_seconds: float = DEFAULT_TOOL_TIMEOUT_SECONDS,
     ) -> None:
         self.session_id = session_id
@@ -62,8 +67,10 @@ class RealtimeProtocol:
         self._on_response_requested = on_response_requested
         self._on_response_cancelled = on_response_cancelled
         self._on_input_audio_state = on_input_audio_state
+        self._on_tool_choice_updated = on_tool_choice_updated
         self.instructions = instructions
         self.tool_choice = tool_choice
+        self._tool_names = set(tool_names or ())
         self._tool_timeout_seconds = tool_timeout_seconds
         self._started_at = time.monotonic()
         self._event_sequence = 0
@@ -239,8 +246,11 @@ class RealtimeProtocol:
                 triggering_event_id=event_id,
             )
             return
-        tool_choice = session.get("tool_choice", self.tool_choice)
-        if tool_choice not in {"auto", "none"}:
+        try:
+            tool_choice = parse_tool_choice(
+                session.get("tool_choice", self.tool_choice), self._tool_names
+            )
+        except ToolDefinitionError:
             await self._error(
                 "unsupported_tool_choice",
                 "Unsupported tool choice",
@@ -251,6 +261,7 @@ class RealtimeProtocol:
             return
         self.instructions = instructions
         self.tool_choice = tool_choice
+        await _call(self._on_tool_choice_updated, tool_choice)
         await self._emit(
             {"type": "session.updated", "session": self._session_snapshot()},
             recipient=identity,
@@ -443,6 +454,12 @@ class RealtimeProtocol:
             return await asyncio.wait_for(
                 asyncio.shield(future), timeout=self._tool_timeout_seconds
             )
+        except asyncio.CancelledError:
+            if self._pending_tool is pending:
+                self._pending_tool = None
+            if not future.done():
+                future.cancel()
+            raise
         except asyncio.TimeoutError:
             if self._pending_tool is pending:
                 self._pending_tool = None

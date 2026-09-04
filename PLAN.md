@@ -117,11 +117,11 @@ Current compatibility assessment:
   `api.server` on LFM2.5 8B A1B. Each api.server setup returns HTTP 201 with a
   call Location. The same suite still needs to run against Hermes Direct;
 - Direct setup now aligns on optional multipart session data, HTTP 201, and a
-  call `Location`. Typed input and cancellation use the normal local agent
-  pipelines. api.server Direct and Conference now support the safe mutable
-  `session.update` subset (`instructions`, `tool_choice`) and reject other
-  mutable fields explicitly. Audio equivalence, the remaining session fields,
-  and Hermes Direct function tools remain;
+  call `Location`. Typed input, cancellation, and flat function tools use the
+  normal local agent pipelines. Direct tools share the bounded internal
+  definition model used by Conference, support the OpenAI choice modes and a
+  declared named function, and complete the call/output/continuation loop.
+  Audio equivalence and the remaining session fields remain;
 - API Conference and Hermes Conference use one authenticated
   `/v1/conference/calls` setup message and one ConfCall LiveKit client. The
   server derives a stable user-namespaced participant identity, and exact
@@ -214,9 +214,8 @@ Current implementation status (2026-08-27):
   `api.server#46` and #23. The clients are now interchangeable for the exercised
   setup, typed-turn, cancellation implementation, spoken-turn, transcript,
   reliable-data, reconnect, repeat-call, base lifecycle, and model-initiated
-  client-tool paths. Session logging, direct forced relay, audio differential
-  fixtures, and the Hermes Direct function-tool fixture are the main parity
-  boundary.
+  client-tool paths. Session logging, direct forced relay, and audio
+  differential fixtures are the main parity boundary.
 
 The Conference service will match `api.server` authentication and connection
 setup, including the returned LiveKit URL, token, room, and participant
@@ -267,7 +266,7 @@ can follow after the new interfaces stabilize.
 - [#21](https://github.com/kortexa-ai/hermes-livekit/issues/21) — Kortexa
   Realtime Conference-compatible LiveKit service.
 - [#22](https://github.com/kortexa-ai/hermes-livekit/issues/22) — shared
-  function tools plus bounded Conference extensions.
+  function tools plus bounded Conference extensions (completed).
 - [#23](https://github.com/kortexa-ai/hermes-livekit/issues/23) — four-backend
   conformance tests, examples, migration notes, and release documentation.
 - [#24](https://github.com/kortexa-ai/hermes-livekit/issues/24) — neutral rename
