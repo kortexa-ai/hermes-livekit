@@ -495,6 +495,7 @@ class RealtimeProtocol:
             raise RuntimeError("Realtime session is closed")
         if self._pending_tool is not None:
             raise RuntimeError("A client tool call is already pending")
+        processing_turn = self._processing_turn_id
         try:
             encoded_arguments = json.dumps(
                 arguments, ensure_ascii=False, separators=(",", ":")
@@ -577,6 +578,11 @@ class RealtimeProtocol:
                 self._pending_tool = None
             if not future.done():
                 future.cancel()
+            # A timeout resumes Hermes without a client response.create. Open
+            # its continuation before native text can arrive ahead of TTS PCM,
+            # but never reopen a cancelled or replaced processing turn.
+            if processing_turn is not None and self._processing_turn_id is processing_turn:
+                await self.response_started()
             await self._error(
                 "tool_timeout",
                 "Timed out while waiting for client tool result",

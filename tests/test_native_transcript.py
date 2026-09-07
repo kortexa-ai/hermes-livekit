@@ -129,6 +129,103 @@ async def test_client_tool_response_continues_the_same_processing_and_caption_tu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("final_before_audio", [False, True])
+async def test_timed_out_client_tool_preserves_captions_before_first_audio(kind, final_before_audio):
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, protocol, events, _ = endpoint(kind)
+    protocol._tool_timeout_seconds = 0.001
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    await adapter.on_processing_start(event)
+    processing_turn = protocol.processing_turn_id
+    await adapter.send_stream_frame("", chat_id="chat", turn_id="turn")
+    with pytest.raises(RuntimeError, match="Client tool result timeout"):
+        await protocol.request_client_tool("fixture", {})
+    assert protocol.processing_turn_id is processing_turn
+    # Core can produce the entire short final transcript before TTS has PCM.
+    # No client response.create follows a server-generated tool error.
+    await adapter.send_stream_frame("Tool unavailable.", chat_id="chat", turn_id="turn")
+    assert events[-1]["type"] == "response.output_audio_transcript.delta"
+    if final_before_audio:
+        await adapter.send_stream_frame("Tool unavailable.", chat_id="chat", turn_id="turn", finalize=True)
+    response_id = protocol.active_response_id
+    await protocol.output_started()
+    if not final_before_audio:
+        await adapter.send_stream_frame("Tool unavailable.", chat_id="chat", turn_id="turn", finalize=True)
+    await protocol.output_playback_stopped()
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert len(done) == 2
+    assert done[-1]["id"] == response_id
+    assert done[-1]["status"] == "completed"
+    assert done[-1]["output"][0]["content"][0]["transcript"] == "Tool unavailable."
+    assert protocol.active_response_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_cancelled_client_tool_does_not_reopen_a_caption_response(kind):
+    adapter, protocol, events, _ = endpoint(kind)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    await adapter.on_processing_start(event)
+    await adapter.send_stream_frame("", chat_id="chat", turn_id="turn")
+    task = asyncio.create_task(protocol.request_client_tool("fixture", {}))
+    try:
+        async def sealed():
+            while not any(e["type"] == "response.done" for e in events):
+                await asyncio.sleep(0)
+        await asyncio.wait_for(sealed(), 2)
+        await protocol.response_cancelled()
+        task.cancel()  # The adapter/core cancellation path stops the tool task.
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        count = len(events)
+        await adapter.send_stream_frame("Stale answer.", chat_id="chat", turn_id="turn", finalize=True)
+        assert len(events) == count
+        assert protocol.active_response_id is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("replace", [False, True])
+async def test_old_tool_timeout_cannot_reopen_or_change_a_cancelled_turn(kind, replace):
+    adapter, protocol, events, _ = endpoint(kind)
+    protocol._tool_timeout_seconds = 0.01
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    await adapter.on_processing_start(event)
+    await adapter.send_stream_frame("", chat_id="chat", turn_id="old")
+    task = asyncio.create_task(protocol.request_client_tool("fixture", {}))
+    try:
+        async def sealed():
+            while not any(e["type"] == "response.done" for e in events):
+                await asyncio.sleep(0)
+        await asyncio.wait_for(sealed(), 2)
+        await protocol.response_cancelled()
+        if replace:
+            await adapter.on_processing_start(event)
+            await adapter.send_stream_frame("", chat_id="chat", turn_id="new")
+            await adapter.send_stream_frame("New answer.", chat_id="chat", turn_id="new")
+        response_id = protocol.active_response_id
+        created = sum(e["type"] == "response.created" for e in events)
+        with pytest.raises(RuntimeError, match="Client tool result timeout"):
+            await asyncio.wait_for(task, 2)
+        assert protocol.active_response_id == response_id
+        assert sum(e["type"] == "response.created" for e in events) == created
+        count = len(events)
+        await adapter.send_stream_frame("Stale answer.", chat_id="chat", turn_id="old", finalize=True)
+        assert len(events) == count
+        if replace:
+            assert protocol._active_transcript == "New answer."
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
 @pytest.mark.parametrize("override", [None, True])
 async def test_runner_routes_text_only_when_profile_streaming_policy_enables_it(kind, override):
     from gateway.config import StreamingConfig
