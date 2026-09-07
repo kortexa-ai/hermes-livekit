@@ -246,6 +246,27 @@ in with `HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml` and select
 `-k smarty-opt-in -s`. The canary prints timings, not credentials, and does not
 play sound on a physical device.
 
+For an end-to-end measurement from the Pi, run the isolated voice probe:
+
+```bash
+uv run --no-project --no-build \
+  --with aiortc==1.15.0 --with aiohttp==3.14.3 --with av==17.0.0 \
+  python tools/voice_latency_probe.py \
+  --gateway http://192.168.2.6:8092 --config-host snappy --profile mira
+```
+
+It fetches profile credentials over passwordless SSH into memory, synthesizes
+one fixed question, and sends a real voice turn through ASR, Hermes, and TTS.
+It neither captures the microphone nor plays audio. The configuration host
+must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
+the speech fixture expects the configured service's 24 kHz mono PCM format.
+Run probes serially and avoid concurrent service benchmarks. JSON timings
+measure from the last voiced source frame to endpoint detection, transcript,
+audio-start event, and first audible RTP received by the Pi. The latter includes
+network and receiver buffering, but not the kiosk's physical speaker latency.
+Compare several runs: model generation time can vary independently of the
+silence timeout or TTS transport.
+
 ## Verify
 
 ```bash
