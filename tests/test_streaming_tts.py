@@ -447,7 +447,10 @@ async def test_gateway_finalizer_allows_a_long_reply_to_finish_playing(monkeypat
     async def play():
         nonlocal samples
         while True:
-            samples += (await owner.output_track.recv()).samples
+            frame = await owner.output_track.recv()
+            # Count the test tone, not the track's new idle keepalive frames.
+            if any(bytes(frame.planes[0])):
+                samples += frame.samples
 
     playing = asyncio.create_task(play())
     task = consumer.start()
@@ -569,6 +572,72 @@ async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, tr
         if consumer is not None:
             consumer.abort()
         await adapter._abort_tts_for_chat("chat")
+        await sender.close()
+        await receiver.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_real_rtp_preserves_short_onsets_after_idle_and_sentence_gaps():
+    import numpy as np
+    from aiortc import RTCConfiguration, RTCPeerConnection
+    from av import AudioResampler
+
+    source = QueuedAudioTrack()
+    sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    receiver = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    sender.addTrack(source)
+    received, tasks = [], []
+
+    @receiver.on("track")
+    def receive(track):
+        async def drain():
+            mono = AudioResampler(format="s16", layout="mono", rate=48000)
+            while True:
+                frame = await track.recv()
+                for converted in mono.resample(frame):
+                    samples = converted.to_ndarray().reshape(-1)
+                    frequency = 0
+                    if np.max(np.abs(samples.astype(np.int32))) > 500:
+                        spectrum = np.abs(np.fft.rfft(samples))
+                        frequency = int(np.argmax(spectrum) * 48000 / len(samples))
+                    received.append((converted.pts, frequency))
+        tasks.append(asyncio.create_task(drain()))
+
+    async def received_count(count):
+        while len(received) < count:
+            await asyncio.sleep(0.01)
+
+    def marked_burst():
+        # Three distinct 60ms segments: losing the initial 50–100ms cannot
+        # hide behind a test which merely detects that some audio arrived.
+        return b"".join(
+            struct.pack("<h", int(8000 * math.sin(2 * math.pi * hz * i / 48000)))
+            for hz in (400, 1000, 1800) for i in range(2880)
+        )
+
+    try:
+        await sender.setLocalDescription(await sender.createOffer())
+        await receiver.setRemoteDescription(sender.localDescription)
+        await receiver.setLocalDescription(await receiver.createAnswer())
+        await sender.setRemoteDescription(receiver.localDescription)
+        await asyncio.wait_for(received_count(15), 10)
+        assert all(frequency == 0 for _, frequency in received)
+        for _ in range(3):
+            start = len(received)
+            await source.enqueue_pcm(marked_burst())
+            await asyncio.wait_for(source.drained(), 2)
+            await asyncio.wait_for(received_count(start + 35), 2)
+            frequencies = [frequency for _, frequency in received[start:] if frequency]
+            for hz in (400, 1000, 1800):
+                assert sum(abs(frequency - hz) < 100 for frequency in frequencies) >= 2
+            assert abs(frequencies[0] - 400) < 100
+            assert abs(frequencies[-1] - 1800) < 100
+        timestamps = [pts for pts, _ in received]
+        assert all(b - a == 960 for a, b in zip(timestamps, timestamps[1:]))
+    finally:
         await sender.close()
         await receiver.close()
         for task in tasks:

@@ -220,6 +220,44 @@ async def test_queued_audio_track_paces_pcm_in_realtime() -> None:
     assert all(frame.sample_rate == 48_000 for frame in frames)
 
 
+@pytest.mark.asyncio
+async def test_idle_audio_keeps_clock_running_and_preserves_burst_onsets():
+    track = QueuedAudioTrack()
+    frames = []
+    started = asyncio.get_running_loop().time()
+    try:
+        # Keep an idle receiver primed before and between two short utterances.
+        for burst in range(2):
+            for _ in range(6):
+                frame = await asyncio.wait_for(track.recv(), 0.3)
+                assert bytes(frame.planes[0]) == b"\x00\x00" * 960
+                frames.append(frame)
+            onset = b"\x00\x10" * 960
+            tail = b"\x00\x08" * 960
+            await track.enqueue_pcm(onset + tail)
+            for expected in (onset, tail):
+                frame = await asyncio.wait_for(track.recv(), 0.3)
+                assert bytes(frame.planes[0]) == expected
+                frames.append(frame)
+            await asyncio.wait_for(track.drained(), 0.1)
+        assert [frame.pts for frame in frames] == list(range(0, 16 * 960, 960))
+        assert asyncio.get_running_loop().time() - started >= 0.28
+        # Background silence is not unfinished speech and cannot delay drain.
+        await asyncio.wait_for(track.drained(), 0.1)
+    finally:
+        track.stop()
+
+
+@pytest.mark.asyncio
+async def test_stopped_idle_audio_track_ends_promptly():
+    from aiortc.mediastreams import MediaStreamError
+
+    track = QueuedAudioTrack()
+    track.stop()
+    with pytest.raises(MediaStreamError):
+        await asyncio.wait_for(track.recv(), 0.1)
+
+
 def test_adaptive_rms_gate_learns_fan_noise_without_calling_it_speech() -> None:
     gate = AdaptiveRmsGate()
 

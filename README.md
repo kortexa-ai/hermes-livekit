@@ -240,6 +240,12 @@ Gateway logs indicate whether each final transcription reused an early result.
 
 ### Streaming speech
 
+Direct WebRTC keeps a paced 20 ms audio stream open, including silent frames
+between replies and between generated clauses. This keeps the receiver's
+media clock running instead of restarting an audio burst after every pause.
+Idle frames do not create response events or delay speech-queue draining;
+they add a small ongoing Opus/network cost while a call is connected.
+
 Both transports implement Hermes Agent's streaming-TTS audio sink. For voice
 turns with auto-TTS enabled and a supported streaming provider, completed text
 clauses can play while the rest of the reply is still being generated. The

@@ -33,12 +33,14 @@ try:
         RTCPeerConnection,
         RTCSessionDescription,
     )
+    from aiortc.mediastreams import MediaStreamError
     from av import AudioFrame, AudioResampler
 
     WEBRTC_AVAILABLE = True
 except ImportError:
     web = None  # type: ignore[assignment]
     MediaStreamTrack = object  # type: ignore[assignment,misc]
+    MediaStreamError = RuntimeError  # type: ignore[assignment,misc]
     RTCPeerConnection = None  # type: ignore[assignment,misc]
     RTCSessionDescription = None  # type: ignore[assignment,misc]
     RTCConfiguration = None  # type: ignore[assignment,misc]
@@ -188,7 +190,7 @@ def _parse_ice_servers(raw: Any) -> list[Any]:
 
 
 class QueuedAudioTrack(MediaStreamTrack):
-    """A paced aiortc audio track fed with 48 kHz mono signed PCM."""
+    """Continuous 20 ms RTP clock, with bounded speech and silent idle frames."""
 
     kind = "audio"
 
@@ -202,37 +204,32 @@ class QueuedAudioTrack(MediaStreamTrack):
         self._timestamp = 0
         self._next_frame_at: float | None = None
         self._generation = 0
+        self._silence = b"\x00\x00" * (SAMPLE_RATE // 50)
 
     async def recv(self) -> Any:
-        chunk = await self._queue.get()
-        self._space.set()
-        generation = self._generation
+        if self.readyState != "live":
+            raise MediaStreamError
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        deadline = max(self._next_frame_at or now, now)
+        await asyncio.sleep(deadline - now)
+        if self.readyState != "live":
+            raise MediaStreamError
+        self._next_frame_at = deadline + 0.02
+
+        # Select speech at the send deadline, not before sleeping: a new burst
+        # should use the next available frame. Idle silence keeps the receiver
+        # primed and advances RTP time across TTS/model gaps. It is not queued
+        # speech and must not hold drained() open or emit response-start events.
+        queued = False
+        try:
+            chunk = self._queue.get_nowait()
+            queued = True
+            self._space.set()
+        except asyncio.QueueEmpty:
+            chunk = self._silence
         try:
             samples = len(chunk) // 2
-            duration = samples / SAMPLE_RATE
-            loop = asyncio.get_running_loop()
-            now = loop.time()
-
-            # RTCRtpSender calls recv() again as soon as it has encoded the
-            # previous frame.  Timestamps alone do not pace aiortc, so without
-            # this wait an entire reply is emitted as one RTP burst.  Apart
-            # from making output-start/output-stop lie about playback time,
-            # that burst overruns browser jitter buffers and sounds garbled.
-            # Never try to catch up after scheduler stalls or an idle period:
-            # resume from the current monotonic time instead.
-            deadline = self._next_frame_at
-            if deadline is None or deadline < now:
-                deadline = now
-            delay = deadline - now
-            if delay > 0:
-                await asyncio.sleep(delay)
-            if generation != self._generation:
-                # clear() can race the paced frame already removed from the
-                # queue. Do not emit that cancelled reply's final frame.
-                chunk = b"\x00" * len(chunk)
-                deadline = loop.time()
-            self._next_frame_at = deadline + duration
-
             frame = AudioFrame(format="s16", layout="mono", samples=samples)
             frame.planes[0].update(chunk)
             frame.sample_rate = SAMPLE_RATE
@@ -241,7 +238,8 @@ class QueuedAudioTrack(MediaStreamTrack):
             self._timestamp += samples
             return frame
         finally:
-            self._queue.task_done()
+            if queued:
+                self._queue.task_done()
 
     async def enqueue_pcm(self, pcm: bytes) -> None:
         generation = self._generation
@@ -264,7 +262,6 @@ class QueuedAudioTrack(MediaStreamTrack):
     def clear(self) -> None:
         self._generation += 1
         self._space.set()
-        self._next_frame_at = None
         while True:
             try:
                 self._queue.get_nowait()
