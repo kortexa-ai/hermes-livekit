@@ -1,6 +1,7 @@
 """Real Hermes text consumer -> voice protocol, without an audio device."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +83,48 @@ async def test_setup_notice_cannot_end_the_processing_turn_before_native_audio(k
     assert done[0]["status"] == "completed"
     assert done[0]["output"][0]["content"][0]["transcript"] == "I am Mira."
     assert protocol.active_response_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_client_tool_response_continues_the_same_processing_and_caption_turn(kind):
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter, protocol, events, _ = endpoint(kind)
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    await adapter.on_processing_start(event)
+    await adapter.send_stream_frame("", chat_id="chat", turn_id="turn")
+    await adapter.send_stream_frame("Checking.", chat_id="chat", turn_id="turn")
+    task = asyncio.create_task(protocol.request_client_tool("fixture", {}))
+    try:
+        # Wait for the actual function-call response, then use the public
+        # client protocol to return its result and request continuation.
+        async def tool_response():
+            while not any(e["type"] == "response.done" for e in events):
+                await asyncio.sleep(0)
+            return next(e["response"] for e in events if e["type"] == "response.done")
+
+        first = await asyncio.wait_for(tool_response(), 2)
+        call_id = first["output"][0]["call_id"]
+        await protocol.handle_client_message(json.dumps({
+            "type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": call_id, "output": "ok"},
+        }), "client")
+        await protocol.handle_client_message('{"type":"response.create"}', "client")
+        assert await asyncio.wait_for(task, 2) == "ok"
+        await adapter.send_stream_frame("It worked.", chat_id="chat", turn_id="turn")
+        await protocol.output_started()
+        await adapter.send_stream_frame("It worked.", chat_id="chat", turn_id="turn", finalize=True)
+        await protocol.output_playback_stopped()
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        done = [e["response"] for e in events if e["type"] == "response.done"]
+        assert len(done) == 2
+        assert done[-1]["status"] == "completed"
+        assert done[-1]["output"][0]["content"][0]["transcript"] == "It worked."
+        assert protocol.active_response_id is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
