@@ -107,3 +107,41 @@ async def test_revisions_and_late_cancelled_frames_do_not_escape_their_response(
     count = len(events)
     await send("late after close", chat_id="chat", turn_id="new", finalize=True)
     assert len(events) == count
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("finalize", [False, True])
+async def test_cancel_during_item_publication_cannot_relabel_old_text_as_new(kind, finalize):
+    adapter, protocol, events, _ = endpoint(kind)
+    await protocol.response_started()
+    await adapter.send_stream_frame("", chat_id="chat", turn_id="old")
+    entered, release = asyncio.Event(), asyncio.Event()
+    publish = protocol._publish
+
+    async def delayed_publish(event, recipient):
+        result = await publish(event, recipient)
+        if event["type"] == "response.output_item.added" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return result
+
+    protocol._publish = delayed_publish
+    task = asyncio.create_task(adapter.send_stream_frame(
+        "Old answer", chat_id="chat", turn_id="old", finalize=finalize,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await protocol.response_cancelled()
+        await protocol.response_started()
+        await adapter.send_stream_frame("", chat_id="chat", turn_id="new")
+        await adapter.send_stream_frame("New answer", chat_id="chat", turn_id="new")
+        count = len(events)
+        release.set()
+        await asyncio.wait_for(task, 2)
+        assert len(events) == count
+        assert protocol._active_transcript == "New answer"
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
