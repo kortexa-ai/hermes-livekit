@@ -287,7 +287,10 @@ silence timeout or TTS transport.
 For local model timing logs, set
 `plugins.entries.livekit.settings.voice_latency_metrics: true` in the Hermes
 profile and restart its gateway. It defaults to off and uses existing plugin
-hooks, without changing model requests. `voice_timing` JSON logs contain the
+hooks; it does not rewrite requests or change model configuration. Hermes
+treats stream observers as stream consumers, so enabling this in a mixed-channel
+profile can also enable internal model streaming for other channels. Logs remain
+limited to voice turns. `voice_timing` JSON logs contain the
 first observed visible text and each completed API request, token/cache counts,
 and tool-call count. Correlate `(session_id, turn_id, iteration)`; separate hook
 workers can log out of order. First-text time includes observer queue delay.
