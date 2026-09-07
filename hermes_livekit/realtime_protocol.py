@@ -395,14 +395,11 @@ class RealtimeProtocol:
             return
         self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
         self._active_transcript = transcript
-        response_id, item_id = self._active_response_id, self._active_output_item_id
         await self._announce_audio_output_item()
-        if self._active_response_id != response_id or self._transcript_turn_id != turn_id:
-            return
         event = {
             "type": "response.output_audio_transcript.delta",
-            "response_id": response_id,
-            "item_id": item_id,
+            "response_id": self._active_response_id,
+            "item_id": self._active_output_item_id,
             "output_index": 0,
             "content_index": 0,
             "delta": transcript[len(previous):] if transcript.startswith(previous) else "",
@@ -419,15 +416,12 @@ class RealtimeProtocol:
             return
         self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
         self._active_transcript = transcript
-        response_id, item_id = self._active_response_id, self._active_output_item_id
         await self._announce_audio_output_item()
-        if self._active_response_id != response_id:
-            return
         await self._emit(
             {
                 "type": "response.output_audio_transcript.done",
-                "response_id": response_id,
-                "item_id": item_id,
+                "response_id": self._active_response_id,
+                "item_id": self._active_output_item_id,
                 "output_index": 0,
                 "content_index": 0,
                 "transcript": transcript,
@@ -757,23 +751,18 @@ class RealtimeProtocol:
         item = self._audio_output_item("in_progress")
         if item is None:
             return
-        response_id, item_id = self._active_response_id, self._active_output_item_id
         self._output_item_announced = True
         await self._emit({
             "type": "response.output_item.added",
-            "response_id": response_id,
+            "response_id": self._active_response_id,
             "output_index": 0,
             "item": item,
         })
-        if self._active_response_id != response_id:
-            return
         await self._emit({"type": "conversation.item.added", "previous_item_id": None, "item": item})
-        if self._active_response_id != response_id:
-            return
         await self._emit({
             "type": "response.content_part.added",
-            "response_id": response_id,
-            "item_id": item_id,
+            "response_id": self._active_response_id,
+            "item_id": self._active_output_item_id,
             "output_index": 0,
             "content_index": 0,
             "part": {"type": "output_audio", "transcript": ""},
