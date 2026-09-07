@@ -68,9 +68,9 @@ from .adapter import (
 )
 from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
-from .vad import AdaptiveRmsGate, configured_silence_duration
+from .vad import AdaptiveRmsGate, configured_silence_duration, configured_vad_factory
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
-                    transcribe_pcm, transcribe_with_prefetch)
+                    transcribe_pcm, transcribe_with_prefetch, append_capture, PREROLL_BYTES)
 from .streaming_tts import RealtimeStreamingTTSMixin
 from .native_transcript import NativeTranscriptMixin
 
@@ -290,7 +290,10 @@ class RealtimeCall:
     input_muted: bool = False
     closed: bool = False
     vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
+    vad_factory: Any = AdaptiveRmsGate
     vad_calibration_pcm: list[bytes] = field(default_factory=list)
+    preroll: bytearray = field(default_factory=bytearray)
+    input_overflowed: bool = False
     silence_duration: float = SILENCE_THRESHOLD_SECONDS
     asr_prefetch_silence: float = 0.0
     early_asr: EarlyTranscription | None = None
@@ -350,8 +353,10 @@ class RealtimeCall:
                 await self.finish_utterance()
 
     async def accept_pcm(self, pcm: bytes) -> None:
-        rms = pcm_rms(pcm)
+        if self.closed or self.paused or self.input_muted:
+            return
         if not self.vad.ready:
+            rms = pcm_rms(pcm)
             self.vad_calibration_pcm.append(pcm)
             if not self.vad.calibrate(rms):
                 return
@@ -371,20 +376,35 @@ class RealtimeCall:
     async def _accept_calibrated_pcm(self, pcm: bytes) -> None:
         now = time.monotonic()
         rms = pcm_rms(pcm)
-        if self.vad.is_speech(rms, speaking=self.speaking,
-                              frame_seconds=len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)):
+        speech = self.vad.is_speech(rms, speaking=self.speaking, pcm=pcm,
+                                   frame_seconds=len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2))
+        if self.input_overflowed:
+            if speech:
+                self.last_speech_at = now
+            elif self.last_speech_at is not None and now - self.last_speech_at >= self.silence_duration:
+                self.input_overflowed = False
+                self.last_speech_at = None
+            return
+        if speech:
             if self.early_asr is not None:
                 self.early_asr.discard()
             if not self.speaking:
                 self.audio_buffer.clear()
+                self.audio_buffer.extend(self.preroll)
+                self.preroll.clear()
                 self.speaking = True
                 await self.protocol.speech_started(self.client_identity)
             self.last_speech_at = now
-            self.audio_buffer.extend(pcm)
+            if not append_capture(self.audio_buffer, pcm):
+                await self._capture_overflow(now)
             return
         if not self.speaking:
+            self.preroll.extend(pcm[-PREROLL_BYTES:])
+            del self.preroll[:-PREROLL_BYTES]
             return
-        self.audio_buffer.extend(pcm)
+        if not append_capture(self.audio_buffer, pcm):
+            await self._capture_overflow(now)
+            return
         if (self.early_asr is not None and self.last_speech_at is not None
                 and now - self.last_speech_at >= self.asr_prefetch_silence):
             self.early_asr.start(self.audio_buffer, self.last_speech_at)
@@ -392,6 +412,16 @@ class RealtimeCall:
             logger.info("[%s] voice endpoint: silence=%.3fs target=%.3fs noise_rms=%.1f",
                         self.call_id, now - self.last_speech_at, self.silence_duration, self.vad.noise_rms)
             await self.finish_utterance()
+
+    async def _capture_overflow(self, now: float) -> None:
+        self.audio_buffer.clear()
+        self.preroll.clear()
+        self.input_overflowed = True
+        self.last_speech_at = now
+        self.speaking = False
+        if self.early_asr is not None:
+            self.early_asr.discard()
+        await self.protocol.input_audio_overflow(self.client_identity)
 
     async def finish_utterance(self) -> None:
         pcm = bytes(self.audio_buffer)
@@ -412,6 +442,8 @@ class RealtimeCall:
         if muted == self.input_muted:
             return
         self.input_muted = muted
+        self.preroll.clear()
+        self.input_overflowed = False
         if muted:
             if self.speaking and self.audio_buffer:
                 await self.finish_utterance()
@@ -432,7 +464,7 @@ class RealtimeCall:
         self.speaking = False
         if self.early_asr is not None:
             self.early_asr.discard()
-        self.vad = AdaptiveRmsGate(minimum_floor=RMS_SILENCE_FLOOR)
+        self.vad = self.vad_factory(minimum_floor=RMS_SILENCE_FLOOR)
         self.vad_calibration_pcm.clear()
         logger.info("[%s] input unmuted; adaptive VAD reset", self.call_id)
 
@@ -443,6 +475,7 @@ class RealtimeCall:
         if self.early_asr is not None:
             self.early_asr.discard()
         self.audio_buffer.clear()
+        self.preroll.clear()
         self.speaking = False
         self.vad_calibration_pcm.clear()
         current = asyncio.current_task()
@@ -476,6 +509,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         self.config.extra = extra
         self._silence_duration = configured_silence_duration(extra)
         self._asr_prefetch_silence = configured_asr_prefetch(extra, self._silence_duration)
+        self._vad_factory = configured_vad_factory(extra)
         self.config.extra["group_sessions_per_user"] = False
         self._host = str(extra.get("host") or os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"))
         self._port = _configured_int(
@@ -732,6 +766,8 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
                 output_track,
                 protocol,
                 client_identity=client_identity,
+                vad=self._vad_factory(minimum_floor=RMS_SILENCE_FLOOR),
+                vad_factory=self._vad_factory,
                 silence_duration=self._silence_duration,
                 asr_prefetch_silence=self._asr_prefetch_silence,
                 early_asr=(EarlyTranscription(

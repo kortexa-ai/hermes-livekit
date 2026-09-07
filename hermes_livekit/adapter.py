@@ -97,9 +97,10 @@ from .tool_safety import (
     valid_participant_identity,
     valid_tool_name,
 )
-from .vad import AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_duration
+from .vad import (AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_duration,
+                  configured_vad_factory)
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
-                    transcribe_pcm, transcribe_with_prefetch)
+                    transcribe_pcm, transcribe_with_prefetch, append_capture, PREROLL_BYTES)
 from .streaming_tts import LiveKitStreamingTTSMixin
 from .native_transcript import NativeTranscriptMixin
 
@@ -213,6 +214,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self.config.extra = extra
         self._silence_duration = configured_silence_duration(extra)
         self._asr_prefetch_silence = configured_asr_prefetch(extra, self._silence_duration)
+        self._vad_factory = configured_vad_factory(extra)
         self._early_asr: Dict[str, EarlyTranscription] = {}
         # Realtime Conference owns one conversation per room. Participant
         # identity remains available on MessageEvent for attribution and tool
@@ -240,6 +242,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._last_audio_time: Dict[str, float] = {}
         self._audio_streams: Dict[str, asyncio.Task] = {}
         self._audio_gates: Dict[str, AdaptiveRmsGate] = {}
+        self._audio_processed: Dict[str, tuple[int, bool | None]] = {}
+        self._audio_overflowed: set[str] = set()
         self._muted_inputs: set[str] = set()
         self._audio_ready = asyncio.Event()
 
@@ -639,6 +643,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._audio_buffers.clear()
         self._last_audio_time.clear()
         self._audio_gates.clear()
+        getattr(self, "_audio_processed", {}).clear()
+        getattr(self, "_audio_overflowed", set()).clear()
         self._muted_inputs.clear()
         self._speaking_participants.clear()
         for task in list(self._deferred_internal_wakes):
@@ -752,10 +758,9 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             self._speaking_participants.discard(identity)
             self._audio_buffers[identity] = bytearray()
             self._audio_ready.set()
-            self._audio_gates[identity] = AdaptiveRmsGate(
-                calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
-                minimum_floor=RMS_SILENCE_FLOOR,
-            )
+            self._audio_gates[identity] = self._new_audio_gate()
+            self._audio_processed.pop(identity, None)
+            self._audio_overflowed.discard(identity)
             # Deliberately do NOT seed _last_audio_time here. _check_silence_loop
             # sets it on the first chunk above RMS_SILENCE_FLOOR, and treats a
             # missing entry as "this participant has never spoken" — discarding
@@ -901,6 +906,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         getattr(self, "_audio_buffers", {}).clear()
         getattr(self, "_last_audio_time", {}).clear()
         getattr(self, "_audio_gates", {}).clear()
+        getattr(self, "_audio_processed", {}).clear()
+        getattr(self, "_audio_overflowed", set()).clear()
         for prefetch in getattr(self, "_early_asr", {}).values():
             prefetch.discard()
         getattr(self, "_early_asr", {}).clear()
@@ -924,6 +931,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._audio_buffers.clear()
         self._last_audio_time.clear()
         self._audio_gates.clear()
+        getattr(self, "_audio_processed", {}).clear()
+        getattr(self, "_audio_overflowed", set()).clear()
         self._muted_inputs.clear()
         self._speaking_participants.clear()
 
@@ -1058,6 +1067,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
         getattr(self, "_audio_gates", {}).pop(identity, None)
+        getattr(self, "_audio_processed", {}).pop(identity, None)
+        getattr(self, "_audio_overflowed", set()).discard(identity)
         prefetch = getattr(self, "_early_asr", {}).pop(identity, None)
         if prefetch is not None:
             prefetch.discard()
@@ -1065,6 +1076,27 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._speaking_participants.discard(identity)
 
     # -- Audio capture and processing ---------------------------------------
+
+    def _new_audio_gate(self):
+        factory = getattr(self, "_vad_factory", AdaptiveRmsGate)
+        return factory(calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
+                       minimum_floor=RMS_SILENCE_FLOOR)
+
+    async def _capture_overflow(self, identity: str) -> None:
+        self._audio_overflowed.add(identity)
+        self._audio_processed.pop(identity, None)
+        self._last_audio_time[identity] = time.monotonic()
+        self._speaking_participants.discard(identity)
+        prefetch = getattr(self, "_early_asr", {}).get(identity)
+        if prefetch is not None:
+            prefetch.discard()
+        if self._realtime_protocol is not None:
+            await self._realtime_protocol.input_audio_overflow(identity)
+        await self._publish_agent_event("agent:listening-stop", {"identity": identity})
+        await self._publish_typed({"type": "error", "error": {
+            "code": "input_audio_too_long",
+            "message": "Speech exceeded two minutes. Please pause and try again.",
+        }}, identity=identity, topic=self.DATA_CHANNEL_EXTENSIONS_TOPIC)
 
     async def _audio_receive_loop(
         self,
@@ -1079,13 +1111,23 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         _check_silence_loop instead.
         """
         try:
+            self._audio_processed = getattr(self, "_audio_processed", {})
+            self._audio_overflowed = getattr(self, "_audio_overflowed", set())
             async for event in stream:
                 if self._paused or identity in self._muted_inputs:
                     continue
                 if identity not in self._audio_buffers:
                     break
 
-                self._audio_buffers[identity].extend(event.frame.data.tobytes())
+                pcm = event.frame.data.tobytes()
+                buffer = self._audio_buffers[identity]
+                if identity in self._audio_overflowed:
+                    # Keep enough fresh sound to recognize a recovery pause,
+                    # even if the polling task is delayed by other work.
+                    buffer.extend(pcm[-PREROLL_BYTES * 2:])
+                    del buffer[:-PREROLL_BYTES * 2]
+                elif not append_capture(buffer, pcm):
+                    await self._capture_overflow(identity)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -1109,6 +1151,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         bytes_per_tick = int(SAMPLE_RATE * NUM_CHANNELS * 2 * POLL_INTERVAL)
 
         try:
+            self._audio_processed = getattr(self, "_audio_processed", {})
+            self._audio_overflowed = getattr(self, "_audio_overflowed", set())
             while self._running:
                 # No one to listen to — wake on subscription, without polling.
                 if not self._audio_buffers:
@@ -1128,20 +1172,24 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                     if buf_len == 0:
                         continue
 
+                    processed, speech = self._audio_processed.get(identity, (0, None))
+                    pending = bytes(buf[processed:])
+                    if not pending and speech is not False:
+                        continue  # Never replay stale speech into a stateful detector.
+                    self._audio_processed[identity] = (buf_len, speech)
+
                     # Check RMS of the most recent chunk to detect speech/silence
                     tail = bytes(buf[-bytes_per_tick:]) if buf_len >= bytes_per_tick else bytes(buf)
                     rms = pcm_rms(tail)
 
                     gate = self._audio_gates.get(identity)
                     if gate is None:
-                        gate = AdaptiveRmsGate(
-                            calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
-                            minimum_floor=RMS_SILENCE_FLOOR,
-                        )
+                        gate = self._new_audio_gate()
                         self._audio_gates[identity] = gate
                     if not gate.ready:
                         if not gate.calibrate(rms):
                             continue
+                        pending = bytes(buf)  # Classifier has not seen calibration audio yet.
                         logger.info(
                             "[%s] adaptive VAD for %s: noise_rms=%.1f start=%.1f stop=%.1f",
                             self.name,
@@ -1151,11 +1199,25 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                             gate.stop_threshold,
                         )
 
-                    if gate.is_speech(
-                        rms,
-                        speaking=identity in self._speaking_participants,
-                        frame_seconds=POLL_INTERVAL,
-                    ):
+                    if pending:
+                        speech = gate.is_speech(
+                            rms,
+                            speaking=identity in self._speaking_participants,
+                            frame_seconds=len(pending) / (SAMPLE_RATE * NUM_CHANNELS * 2),
+                            pcm=pending,
+                        )
+                        self._audio_processed[identity] = (buf_len, speech)
+                    if identity in self._audio_overflowed:
+                        now = time.monotonic()
+                        if speech:
+                            self._last_audio_time[identity] = now
+                        elif now - self._last_audio_time[identity] >= self._silence_duration:
+                            self._audio_overflowed.discard(identity)
+                            self._last_audio_time.pop(identity, None)
+                        buf.clear()
+                        self._audio_processed.pop(identity, None)
+                        continue
+                    if speech:
                         prefetch = getattr(self, "_early_asr", {}).get(identity)
                         if prefetch is not None:
                             prefetch.discard()
@@ -1174,8 +1236,10 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                     # Silent — check if silence has lasted long enough
                     last_time = self._last_audio_time.get(identity)
                     if last_time is None:
-                        # Never spoke — discard accumulated noise
-                        self._audio_buffers[identity] = bytearray()
+                        # Preserve word onsets before the classifier crosses
+                        # its threshold; keep idle room audio strictly bounded.
+                        del buf[:-PREROLL_BYTES]
+                        self._audio_processed[identity] = (len(buf), False)
                         continue
 
                     elapsed_silence = time.monotonic() - last_time
@@ -1213,7 +1277,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         other cannot transcribe the same audio twice.
         """
         buf = self._audio_buffers.get(identity)
-        if not buf or speech_end <= 0:
+        if not buf or speech_end <= 0 or identity in getattr(self, "_audio_overflowed", ()):
             return False
 
         duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
@@ -1223,6 +1287,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             if prefetch is not None:
                 prefetch.discard()
             self._audio_buffers[identity] = bytearray()
+            getattr(self, "_audio_processed", {}).pop(identity, None)
             self._last_audio_time.pop(identity, None)
             # False alarm — revert the listening-start we sent
             if identity in self._speaking_participants:
@@ -1240,6 +1305,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             pcm_data, self._last_audio_time.get(identity), gate.stop_threshold,
         ) if prefetch is not None and gate is not None else None)
         self._audio_buffers[identity] = bytearray()
+        getattr(self, "_audio_processed", {}).pop(identity, None)
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
         logger.info("[%s] Utterance from %s: %.1fs audio", self.name, identity, duration)
@@ -1590,6 +1656,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         )
 
     async def _set_input_audio_state(self, identity: str, muted: bool) -> None:
+        getattr(self, "_audio_processed", {}).pop(identity, None)
+        getattr(self, "_audio_overflowed", set()).discard(identity)
         muted_inputs = getattr(self, "_muted_inputs", None)
         if muted_inputs is None:
             muted_inputs = self._muted_inputs = set()
@@ -1621,10 +1689,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         audio_gates = getattr(self, "_audio_gates", None)
         if audio_gates is None:
             audio_gates = self._audio_gates = {}
-        audio_gates[identity] = AdaptiveRmsGate(
-            calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
-            minimum_floor=RMS_SILENCE_FLOOR,
-        )
+        audio_gates[identity] = self._new_audio_gate()
         logger.info("[%s] input unmuted by %s; adaptive VAD reset", self.name, identity)
 
     # -- Remote tools (client-registered) -----------------------------------

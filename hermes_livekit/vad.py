@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 import math
 
 
@@ -18,6 +19,24 @@ VAD_STOP_MARGIN = 60.0
 DEFAULT_SILENCE_DURATION = 1.5
 NOISE_RISE_SECONDS = 2.0
 NOISE_FALL_SECONDS = 0.5
+
+
+def configured_vad_factory(extra: dict):
+    """Resolve once at adapter startup; every input gets independent VAD state."""
+    backend = extra.get("vad_backend", "rms")
+    if backend == "rms":
+        return AdaptiveRmsGate
+    if backend != "silero":
+        raise ValueError("vad_backend must be rms or silero")
+    threshold = extra.get("vad_threshold", 0.5)
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or not 0.2 <= threshold <= 0.9 or not math.isfinite(threshold)):
+        raise ValueError("vad_threshold must be a finite number from 0.2 to 0.9")
+    path = extra.get("vad_model_path")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("silero requires vad_model_path; run tools/prepare_vad.py first")
+    from .speech_detector import SileroRmsGate, load_silero_model
+    return partial(SileroRmsGate, load_silero_model(path), float(threshold))
 
 
 def configured_silence_duration(extra: dict) -> float:
@@ -76,7 +95,8 @@ class AdaptiveRmsGate:
         self.calibration.clear()
         return True
 
-    def is_speech(self, rms: float, *, speaking: bool, frame_seconds: float = 0.02) -> bool:
+    def is_speech(self, rms: float, *, speaking: bool, frame_seconds: float = 0.02,
+                  pcm: bytes | None = None) -> bool:
         threshold = self.stop_threshold if speaking else self.start_threshold
         speech = rms > threshold
         if speech or self.noise_rms is None:
@@ -87,8 +107,11 @@ class AdaptiveRmsGate:
         # Learn ambient sound in pauses too, but freeze for speech frames.
         # Time-based coefficients keep 20 ms WebRTC and 200 ms LiveKit
         # observations consistent. Fall faster when a fan switches off.
+        self._learn_noise(rms, frame_seconds)
+        return False
+
+    def _learn_noise(self, rms: float, frame_seconds: float) -> None:
         observed = min(rms, VAD_NOISE_CEILING)
         tau = NOISE_RISE_SECONDS if observed > self.noise_rms else NOISE_FALL_SECONDS
         alpha = -math.expm1(-frame_seconds / tau)
         self.noise_rms = max(1.0, self.noise_rms + alpha * (observed - self.noise_rms))
-        return False

@@ -220,6 +220,53 @@ split thinking pauses. Validate with the actual room and microphone before
 lowering it further. Endpoint logs include observed silence, configured target,
 and learned noise RMS; they do not contain microphone recordings.
 
+For speech/noise discrimination, optionally install the `vad` extra in the
+gateway's Python environment and prepare the pinned Silero v6.2 model:
+
+```sh
+python -m pip install -e '.[vad]'
+python tools/prepare_vad.py /absolute/path/to/silero-v6.2.onnx
+```
+
+Set these keys under either platform's `extra` configuration, then restart
+only the affected gateway:
+
+```yaml
+vad_backend: silero
+vad_model_path: /absolute/path/to/silero-v6.2.onnx
+vad_threshold: 0.5
+```
+
+The default backend remains `rms`, with no added runtime dependency. Silero
+uses only CPU, one inference thread and independent state per input. The
+model is shared between inputs, loaded at adapter startup and checked against
+a pinned SHA-256. Missing dependencies or an invalid model fail startup; there
+is no automatic download, GPU fallback or silent change back to energy VAD.
+The confidence threshold accepts 0.2–0.9; lower values are more sensitive.
+The existing silence timeout still applies: this is not semantic endpointing.
+The [model and its license](https://github.com/snakers4/silero-vad/tree/be95df9152c0d7618fa1edfeb296fc3dae32376f)
+are MIT-licensed by the Silero Team; the installer saves the license beside
+the model. Keep both outside the repository.
+
+Both backends retain 500 ms of pre-roll to protect word onsets, without waiting
+longer to dispatch the utterance. Continuous
+capture is limited to two minutes per input. Overflow discards the whole
+unsubmitted utterance and reports `input_audio_too_long`; no truncated command
+is sent to ASR or Hermes. Pause for the configured silence interval, or mute
+then unmute, before trying again. Other callers and ongoing replies continue.
+
+For an offline noise-step and quiet-speech check through the actual direct
+capture path, run:
+
+```sh
+python tools/vad_probe.py --model /absolute/path/to/silero-v6.2.onnx \
+  --speech-fixture /absolute/path/to/mono-pcm16.wav
+```
+
+It reports
+CPU timings and endpoint events without recording, playback or service calls.
+Synthetic fixtures do not replace qualification with the actual room/mic.
+
 To overlap transcription with that silence window, optionally set
 `asr_prefetch_silence: 0.35` beside `silence_duration: 0.7` in either platform's
 `extra` configuration. The default is `0` (disabled); enabled values must be
@@ -452,7 +499,7 @@ same envelope reliably on `conference.extensions`. The server responds on the
 same transport with `hermes.input_audio.state_updated`. Muting immediately
 finalizes any active utterance and then ignores media frames; unmuting clears
 stale audio and recalibrates the participant's adaptive noise gate. Clients
-that omit this optional extension retain energy-based endpointing.
+that omit this optional extension retain the configured server-side endpointing.
 
 ### Conference extensions
 

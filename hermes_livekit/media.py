@@ -10,6 +10,21 @@ import tempfile
 import wave
 
 
+# Resource limit, not an end-of-turn heuristic. Never turn a truncated prefix
+# into a command. Report overflow and require a pause before capture resumes.
+MAX_CAPTURE_SECONDS = 120
+MAX_CAPTURE_BYTES = MAX_CAPTURE_SECONDS * 48000 * 2
+PREROLL_BYTES = 48000  # 500 ms protects quiet consonants/model lookback; no added wait.
+
+
+def append_capture(buffer: bytearray, pcm: bytes) -> bool:
+    if len(buffer) + len(pcm) > MAX_CAPTURE_BYTES:
+        buffer.clear()
+        return False
+    buffer.extend(pcm)
+    return True
+
+
 def pcm_rms(pcm: bytes) -> float:
     """RMS of little-endian signed PCM16, independent of host byte order."""
     count = len(pcm) // 2

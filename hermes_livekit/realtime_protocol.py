@@ -311,6 +311,14 @@ class RealtimeProtocol:
         )
         return item_id
 
+    async def input_audio_overflow(self, identity: str) -> None:
+        """Retire an unsubmitted input without manufacturing a partial command."""
+        if identity in self._input_items:
+            await self.speech_stopped(identity)
+        self._input_items.pop(identity, None)
+        await self._error("input_audio_too_long",
+                          "Speech exceeded two minutes. Please pause and try again.", identity)
+
     async def user_transcript(
         self, transcript: str, identity: str, *, item_id: str | None = None
     ) -> None:

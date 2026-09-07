@@ -33,6 +33,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+vad = [
+  "onnxruntime==1.29.0",
+  "numpy==2.4.3",
+]
 dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
