@@ -125,3 +125,58 @@ def test_reasoning_and_answer_output_are_opt_in(probe_module):
     assert args.reasoning == "profile" and not args.show_answer
     args = probe_module.parse_args(["--reasoning", "low", "--show-answer"])
     assert args.reasoning == "low" and args.show_answer
+
+
+@pytest.mark.parametrize("bad_audio", [None, "early", "duplicate", "unidentified"])
+def test_voice_turn_correlates_completion_and_rejects_early_audio(probe_module, bad_audio):
+    turn = probe_module.VoiceTurn(ignored_response_ids={"previous"})
+    turn.accept({"type": "output_audio_buffer.started", "response_id": "previous"}, 0.0)
+    old = completed("previous answer")
+    old["response"]["id"] = "previous"
+    turn.accept(old, 0.1)
+    assert not turn.done.is_set() and not turn.events
+
+    turn.accept({"type": "input_audio_buffer.speech_stopped"}, 1.7)
+    turn.accept({"type": "conversation.item.input_audio_transcription.completed"}, 2.0)
+    turn.accept({"type": "output_audio_buffer.started", "response_id": "current"}, 3.0)
+    turn.accept_audio(0.5 if bad_audio == "early" else 3.1)
+    if bad_audio in {"duplicate", "unidentified"}:
+        turn.accept({"type": "output_audio_buffer.started",
+                     "response_id": "extra" if bad_audio == "duplicate" else None}, 3.2)
+    answer = completed("current answer")
+    answer["response"]["id"] = "current"
+    turn.accept(answer, 4.0)
+    assert turn.done.is_set()
+    if bad_audio:
+        with pytest.raises(RuntimeError, match="discard timings"):
+            turn.result(last_voice_at=1.0, fixture_complete=True)
+    else:
+        result = turn.result(last_voice_at=1.0, fixture_complete=True)
+        assert result["response_id"] == "current"
+        assert result["audible_rtp_after_speech_s"] == 2.1
+        assert result["response_count"] == result["audio_response_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_replayed_fixture_preserves_pcm_and_rtp_clock(probe_module):
+    assert probe_module.parse_args([]).turns == 1
+    assert probe_module.parse_args(["--turns", "4"]).turns == 4
+    for invalid in ("0", "11", "1.5"):
+        with pytest.raises(SystemExit):
+            probe_module.parse_args(["--turns", invalid])
+    pcm = b"\x00\x10" * probe_module.SAMPLES * 2
+    microphone = probe_module.SyntheticMicrophone(pcm)
+    try:
+        frames = []
+        for _ in range(2):
+            microphone.begin_turn()
+            assert microphone.last_voice_at is None
+            frames.append([await microphone.recv(), await microphone.recv()])
+            assert microphone.index == len(microphone.chunks)
+        assert bytes(frames[0][0].planes[0]) == bytes(frames[1][0].planes[0]) == pcm[:probe_module.SAMPLES * 2]
+        assert frames[1][0].pts > frames[0][-1].pts
+        microphone.begin_turn()
+        with pytest.raises(RuntimeError, match="unfinished"):
+            microphone.begin_turn()
+    finally:
+        microphone.stop()

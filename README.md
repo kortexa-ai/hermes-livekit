@@ -284,6 +284,17 @@ fail the probe. The default `--reasoning profile` sends no command. Add
 manual review; otherwise only its word count is reported. Counterbalance effort
 order and compare several serial runs. These simple questions do not establish
 general reasoning/tool quality, so do not promote a default from timing alone.
+Use `--turns 4` to compare the first reply with three later replies on the same
+connection (1–10 turns; default 1). The probe synthesizes the question once and
+replays identical PCM without resetting the RTP clock. Multi-turn output has a
+`turns` array, one shared `call_id` and `fixture_sha256`, and a `response_id` per
+reply. There is a one-second settling interval between completed replies and
+the next utterance; recent residual audio, early response audio, split fixtures
+and multiple audio replies invalidate the measurement. The interval is outside
+the measured latency. Correlate these identities with the opt-in gateway metrics
+to distinguish fresh-call prompt-cache misses from warm-session model time.
+Repeated requests share conversation history, so later answers can differ;
+this measures the conversation path, not identical model inputs or pure prefill.
 It neither captures the microphone nor plays audio. The configuration host
 must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
 the speech fixture expects the configured service's 24 kHz mono PCM format.

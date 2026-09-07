@@ -3,7 +3,7 @@
 
 Run on the Pi with aiortc, aiohttp and av installed. Credentials are fetched
 over SSH into memory; the probe never records the microphone or plays sound.
-It creates one real Hermes voice turn, so it does use the configured services.
+It creates real Hermes voice turns, so it does use the configured services.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import argparse
 import asyncio
 from array import array
 from fractions import Fraction
+import hashlib
 import json
 import math
 import random
@@ -136,6 +137,14 @@ class SyntheticMicrophone(MediaStreamTrack):
         self.deadline = None
         self.last_voice_at = None
 
+    def begin_turn(self):
+        """Replay the fixture without resetting the live RTP clock."""
+        if self.started and self.index < len(self.chunks):
+            raise RuntimeError("Cannot replace an unfinished speech fixture")
+        self.index = 0
+        self.last_voice_at = None
+        self.started = True
+
     async def recv(self):
         now = time.monotonic()
         deadline = max(now, self.deadline or now)
@@ -166,11 +175,75 @@ def validate_single_turn(events: list, times: dict, last_voice_at: float) -> Non
             raise RuntimeError("Probe endpoint preceded the end of the spoken fixture; discard timings")
 
 
+class VoiceTurn:
+    """One utterance's measurements; never reuse timestamps across replies."""
+
+    def __init__(self, *, ignored_response_ids=()):
+        self.events, self.times = [], {}
+        self.audio_response_ids = set()
+        self.ignored_response_ids = set(ignored_response_ids)
+        self.done = asyncio.Event()
+        self.completion = None
+
+    def accept(self, event, now):
+        kind = event.get("type")
+        response_id = event.get("response_id") or event.get("response", {}).get("id")
+        if response_id in self.ignored_response_ids:
+            return
+        self.events.append(event)
+        self.times.setdefault(kind, now)
+        if kind == "output_audio_buffer.started":
+            self.audio_response_ids.add(response_id)
+        # First-contact notices are text-only, not completion of the voice answer.
+        if kind == "response.done" and response_id in self.audio_response_ids:
+            self.completion = event["response"]
+            self.done.set()
+        if kind == "error":
+            self.done.set()
+
+    def accept_audio(self, now):
+        self.times.setdefault("first_audible_rtp", now)
+
+    def result(self, *, last_voice_at, fixture_complete, reasoning="profile", show_answer=False):
+        if any(e.get("type") == "error" for e in self.events):
+            raise RuntimeError("Gateway emitted a protocol error")
+        if self.completion is None or self.completion.get("status") != "completed":
+            raise RuntimeError("Gateway response did not complete successfully")
+        if len(self.audio_response_ids) != 1 or None in self.audio_response_ids:
+            raise RuntimeError("Expected exactly one identified audio reply; discard timings")
+        if "first_audible_rtp" not in self.times or last_voice_at is None:
+            raise RuntimeError("No synthesized response audio received")
+        validate_single_turn(self.events, self.times, last_voice_at)
+        if not fixture_complete:
+            raise RuntimeError("Reply completed before the spoken fixture finished; discard timings")
+        if self.times["first_audible_rtp"] < last_voice_at:
+            raise RuntimeError("Response audio preceded the end of the spoken fixture; discard timings")
+        result = {"response_id": self.completion["id"]}
+        for label, event_name in [
+            ("endpoint", "input_audio_buffer.speech_stopped"),
+            ("transcript", "conversation.item.input_audio_transcription.completed"),
+            ("audio_event", "output_audio_buffer.started"),
+            ("audible_rtp", "first_audible_rtp"),
+        ]:
+            result[label + "_after_speech_s"] = round(self.times[event_name] - last_voice_at, 3)
+        result["response_count"] = sum(e.get("type") == "response.done" for e in self.events)
+        result["audio_response_count"] = len(self.audio_response_ids)
+        result["reasoning"] = reasoning
+        answer = completion_text(self.completion)
+        result["answer_word_count"] = len(answer.split())
+        if show_answer:
+            result["answer"] = answer
+        return result
+
+
 async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
-                reasoning: str = "profile", show_answer: bool = False) -> dict:
-    events, times, audio_tasks = [], {}, []
-    audio_response_ids = set()
-    ready, done = asyncio.Event(), asyncio.Event()
+                reasoning: str = "profile", show_answer: bool = False, turns: int = 1) -> dict:
+    if type(turns) is not int or not 1 <= turns <= 10:
+        raise ValueError("turns must be an integer from 1 to 10")
+    audio_tasks = []
+    ready = asyncio.Event()
+    measurement = None
+    last_audible_at = 0.0
     setup = None if reasoning == "profile" else ReasoningSetup(reasoning)
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     microphone = None
@@ -184,7 +257,8 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
                                  json={"model": tts["model"], "voice": tts["voice"],
                                        "input": prompt, "response_format": "pcm"}) as response:
                 response.raise_for_status()
-                microphone = SyntheticMicrophone(converted_pcm(await response.read()))
+                fixture = converted_pcm(await response.read())
+                microphone = SyntheticMicrophone(fixture)
             peer.addTrack(microphone)
             channel = peer.createDataChannel("oai-events")
 
@@ -197,26 +271,22 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
                 if setup is not None:
                     setup.accept(value)
                     return
-                events.append(value)
-                times.setdefault(kind, time.monotonic())
-                if kind == "output_audio_buffer.started":
-                    audio_response_ids.add(value.get("response_id"))
-                # First-contact notices (e.g. /sethome guidance) are separate
-                # text-only responses, not completion of the voice answer.
-                if kind == "error" or (kind == "response.done" and
-                        value.get("response", {}).get("id") in audio_response_ids):
-                    done.set()
+                if measurement is not None:
+                    measurement.accept(value, time.monotonic())
 
             @peer.on("track")
             def track_received(track):
                 async def drain():
+                    nonlocal last_audible_at
                     resampler = AudioResampler(format="s16", layout="mono", rate=RATE)
                     while True:
                         frame = await track.recv()
                         for converted in resampler.resample(frame):
                             pcm = bytes(converted.planes[0])[:converted.samples * 2]
                             if any(abs(v) > 40 for v in array("h", pcm)):
-                                times.setdefault("first_audible_rtp", time.monotonic())
+                                last_audible_at = time.monotonic()
+                                if measurement is not None:
+                                    measurement.accept_audio(last_audible_at)
                 audio_tasks.append(asyncio.create_task(drain()))
 
             await peer.setLocalDescription(await peer.createOffer())
@@ -236,39 +306,31 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
                 setup.send(channel)
                 await setup.wait()
                 setup = None
-                times.clear()  # Do not mix command/setup timing with speech timing.
             await asyncio.sleep(1)  # Calibrate on synthetic RMS-150 room noise first.
-            microphone.started = True
-            await asyncio.wait_for(done.wait(), 90)
-            if any(e.get("type") == "error" for e in events):
-                raise RuntimeError("Gateway emitted a protocol error")
-            completion = next(e for e in reversed(events) if e.get("type") == "response.done")
-            if completion["response"]["status"] != "completed":
-                raise RuntimeError("Gateway response did not complete successfully")
-            if "first_audible_rtp" not in times or microphone.last_voice_at is None:
-                raise RuntimeError("No synthesized response audio received: " + json.dumps({
-                    "event_types": [e.get("type") for e in events],
-                }))
-            validate_single_turn(events, times, microphone.last_voice_at)
-            if microphone.index < len(microphone.chunks):
-                raise RuntimeError("Reply completed before the spoken fixture finished; discard timings")
-            result = {"call_id": location.rsplit("/", 1)[-1] if location else None}
-            for label, event_name in [
-                ("endpoint", "input_audio_buffer.speech_stopped"),
-                ("transcript", "conversation.item.input_audio_transcription.completed"),
-                ("audio_event", "output_audio_buffer.started"),
-                ("audible_rtp", "first_audible_rtp"),
-            ]:
-                if event_name in times:
-                    result[label + "_after_speech_s"] = round(times[event_name] - microphone.last_voice_at, 3)
-            result["response_count"] = sum(e.get("type") == "response.done" for e in events)
-            result["audio_response_count"] = len(audio_response_ids)
-            result["reasoning"] = reasoning
-            answer = completion_text(completion["response"])
-            result["answer_word_count"] = len(answer.split())
-            if show_answer:
-                result["answer"] = answer
-            return result
+            results, previous_responses = [], set()
+            for index in range(turns):
+                if time.monotonic() - last_audible_at < 0.5:
+                    raise RuntimeError("Previous audio has not settled; discard timings")
+                measurement = VoiceTurn(ignored_response_ids=previous_responses)
+                microphone.begin_turn()
+                await asyncio.wait_for(measurement.done.wait(), 90)
+                results.append({"turn": index + 1, **measurement.result(
+                    last_voice_at=microphone.last_voice_at,
+                    fixture_complete=microphone.index == len(microphone.chunks),
+                    reasoning=reasoning, show_answer=show_answer,
+                )})
+                previous_responses.update(
+                    e["response"]["id"] for e in measurement.events
+                    if e.get("type") == "response.done" and e.get("response", {}).get("id")
+                )
+                measurement = None
+                if index + 1 < turns:
+                    # Keep the connection/noise floor live; let receiver tail and
+                    # gateway echo suppression settle before the next utterance.
+                    await asyncio.sleep(1)
+            identity = {"call_id": location.rsplit("/", 1)[-1] if location else None,
+                        "fixture_sha256": hashlib.sha256(fixture).hexdigest()}
+            return {**identity, **results[0]} if turns == 1 else {**identity, "turns": results}
     finally:
         if microphone is not None:
             microphone.stop()
@@ -289,6 +351,8 @@ def parse_args(argv=None):
                         help="Optional override in this isolated call only; never changes profile config")
     parser.add_argument("--show-answer", action="store_true",
                         help="Include up to 500 characters of the fixture's answer for manual review")
+    parser.add_argument("--turns", type=int, choices=range(1, 11), default=1,
+                        help="Replay the same PCM fixture on one connection to compare cold and warm turns")
     return parser.parse_args(argv)
 
 
@@ -296,7 +360,7 @@ def main():
     args = parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
     result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, prompt=PROMPTS[args.case],
-                              reasoning=args.reasoning, show_answer=args.show_answer))
+                              reasoning=args.reasoning, show_answer=args.show_answer, turns=args.turns))
     print(json.dumps({"case": args.case, **result}, sort_keys=True))
 
 
