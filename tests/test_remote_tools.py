@@ -116,6 +116,42 @@ def conference_tools(*names: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+async def test_worker_tool_invocation_keeps_rpc_and_binary_state_on_owner_loop():
+    owner_loop = asyncio.get_running_loop()
+
+    class Participant(FakeLocalParticipant):
+        async def perform_rpc(self, **kwargs):
+            assert asyncio.get_running_loop() is owner_loop
+            return '{"type":"livekit-byte-stream"}'
+
+    adapter = adapter_with_client(Participant())
+
+    async def receive(*args, **kwargs):
+        assert asyncio.get_running_loop() is owner_loop
+        return {"binary_result": {"available_to_model": False}}
+
+    adapter._receive_binary_result = receive
+    handler = adapter._build_tool_handler("client-1", "desktop_notify")
+    result = await asyncio.to_thread(lambda: asyncio.run(handler({})))
+    assert json.loads(result) == {"binary_result": {"available_to_model": False}}
+
+
+@pytest.mark.asyncio
+async def test_small_rpc_result_is_rejected_after_room_replacement():
+    participant = FakeLocalParticipant()
+    adapter = adapter_with_client(participant)
+
+    async def replace_room(**kwargs):
+        adapter._room = object()
+        return '{"ok":true}'
+
+    participant.perform_rpc = replace_room
+    handler = adapter._build_tool_handler("client-1", "desktop_notify")
+    with pytest.raises(RuntimeError, match="room was replaced"):
+        await handler({})
+
+
+@pytest.mark.asyncio
 async def test_portable_catalog_registers_and_acknowledges_on_shared_topic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,8 +405,9 @@ async def test_queued_registration_after_disconnect_cannot_install_orphan(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replace_before_receipt", [True, False])
 async def test_old_generation_registration_cannot_mutate_replacement_room(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, replace_before_receipt: bool,
 ) -> None:
     adapter = adapter_for_registration()
     scheduled: list[object] = []
@@ -385,14 +422,21 @@ async def test_old_generation_registration_cannot_mutate_replacement_room(
 
     old_room = adapter._room
     old_generation = adapter._room_generation
-    adapter._room = SimpleNamespace(remote_participants={"client-a": object()})
-    adapter._room_generation = 2
+    replacement = SimpleNamespace(remote_participants={"client-a": object()})
+    if replace_before_receipt:
+        adapter._room = replacement
+        adapter._room_generation = 2
     adapter._on_data_received(
         tool_packet(),
         receiving_room=old_room,
         receiving_generation=old_generation,
     )
-    await scheduled.pop()
+    if replace_before_receipt:
+        assert not scheduled
+    else:
+        adapter._room = replacement
+        adapter._room_generation = 2
+        await scheduled.pop()
     assert registered == {}
 
     adapter._on_data_received(tool_packet())

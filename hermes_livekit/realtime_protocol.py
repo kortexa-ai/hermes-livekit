@@ -86,6 +86,11 @@ class RealtimeProtocol:
         self._speaking = False
         self._pending_tool: dict[str, Any] | None = None
         self._closed = False
+        # Both transports schedule a task per incoming packet. Keep item
+        # creation and response requests in arrival order across publish awaits.
+        # Transport callbacks dispatch Hermes work and return; tool execution
+        # waits independently, so client tool results can still arrive here.
+        self._client_message_lock = asyncio.Lock()
 
     @property
     def active_response_id(self) -> str | None:
@@ -109,6 +114,10 @@ class RealtimeProtocol:
         self._pending_text_inputs.pop(identity, None)
 
     async def handle_client_message(self, raw: bytes | str, identity: str) -> None:
+        async with self._client_message_lock:
+            await self._handle_client_message(raw, identity)
+
+    async def _handle_client_message(self, raw: bytes | str, identity: str) -> None:
         if self._closed:
             return
         if isinstance(raw, bytes):
@@ -122,12 +131,20 @@ class RealtimeProtocol:
                 return
         else:
             text = raw
-            if len(text.encode("utf-8")) > MAX_EVENT_BYTES:
+            try:
+                size = len(text.encode("utf-8"))
+            except UnicodeEncodeError:
+                await self._error("invalid_event_json", "Client event must be UTF-8 JSON", identity, param="event")
+                return
+            if size > MAX_EVENT_BYTES:
                 await self._error("event_too_large", "Client event is too large", identity, param="event")
                 return
         try:
             event = json.loads(text)
-        except (TypeError, ValueError):
+            # JSON escapes can contain lone surrogates even in valid UTF-8
+            # packets. Reject them (and NaN/Infinity) before field validation.
+            json.dumps(event, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except (RecursionError, TypeError, ValueError, UnicodeError):
             event = None
         if not isinstance(event, dict):
             await self._error("invalid_event_json", "Client event must be a JSON object", identity, param="event")
@@ -227,7 +244,7 @@ class RealtimeProtocol:
                 triggering_event_id=event_id,
             )
             return
-        if session.get("type") != "realtime":
+        if session.get("type", "realtime") != "realtime":
             await self._error(
                 "unsupported_session_type",
                 "Only realtime sessions are supported",
@@ -277,7 +294,7 @@ class RealtimeProtocol:
             }
         )
 
-    async def speech_stopped(self, identity: str) -> None:
+    async def speech_stopped(self, identity: str) -> str:
         item_id = self._input_items.get(identity) or self._new_input_item(identity)
         await self._emit(
             {
@@ -286,9 +303,15 @@ class RealtimeProtocol:
                 "item_id": item_id,
             }
         )
+        return item_id
 
-    async def user_transcript(self, transcript: str, identity: str) -> None:
-        item_id = self._input_items.pop(identity, None) or self._new_item_id("input")
+    async def user_transcript(
+        self, transcript: str, identity: str, *, item_id: str | None = None
+    ) -> None:
+        if item_id is None:
+            item_id = self._input_items.pop(identity, None) or self._new_item_id("input")
+        elif self._input_items.get(identity) == item_id:
+            self._input_items.pop(identity, None)
         item = {
             "id": item_id,
             "type": "message",
@@ -371,16 +394,35 @@ class RealtimeProtocol:
         response_id = self._active_response_id
         await self._finish_audio_output_item("completed")
         await self._complete_response("completed")
+        await self.output_playback_stopped(response_id)
+
+    async def output_playback_stopped(self, response_id: str | None = None) -> None:
+        """Finish playout while keeping the response open for Hermes's text.
+
+        Hermes sends its transcript after play_tts returns. Completing the
+        response here would turn that transcript into a second response.
+        """
         if self._speaking:
             self._speaking = False
-            await self._emit({"type": "output_audio_buffer.stopped", "response_id": response_id})
+            await self._emit({"type": "output_audio_buffer.stopped", "response_id": response_id or self._active_response_id})
 
     async def response_failed(self) -> None:
         await self._finish_audio_output_item("incomplete")
+        await self.output_playback_stopped()
         await self._complete_response("failed")
 
     async def request_client_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Emit one OpenAI function call and await its client-owned result."""
+        try:
+            return await self._request_client_tool(name, arguments)
+        finally:
+            pending = self._pending_tool
+            if pending is not None and pending["task"] is asyncio.current_task():
+                self._pending_tool = None
+                if not pending["future"].done():
+                    pending["future"].cancel()
+
+    async def _request_client_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self._closed:
             raise RuntimeError("Realtime session is closed")
         if self._pending_tool is not None:
@@ -406,6 +448,7 @@ class RealtimeProtocol:
             "name": name,
             "future": future,
             "output": None,
+            "task": asyncio.current_task(),
         }
         self._pending_tool = pending
         item = {
@@ -601,8 +644,11 @@ class RealtimeProtocol:
         if not self._active_response_id:
             await self._error("no_active_response", "There is no active response to cancel", identity, param="response", triggering_event_id=event_id)
             return
-        response_id = self._active_response_id
         await _call(self._on_response_cancelled, identity)
+        await self.response_cancelled()
+
+    async def response_cancelled(self) -> None:
+        response_id = self._active_response_id
         await self._finish_audio_output_item("incomplete")
         await self._complete_response("cancelled")
         if self._speaking:

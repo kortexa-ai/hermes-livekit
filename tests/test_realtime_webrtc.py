@@ -9,14 +9,14 @@ import hmac
 import json
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from aiohttp import ClientSession, FormData, web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platform_registry import PlatformEntry, platform_registry
 from hermes_livekit.realtime_webrtc import (
     AdaptiveRmsGate,
@@ -35,6 +35,7 @@ from hermes_livekit.realtime_webrtc import (
     check_realtime_requirements,
 )
 from tools.registry import registry
+import hermes_livekit.realtime_webrtc as webrtc_module
 
 
 @pytest.fixture
@@ -474,7 +475,7 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
         protocol=protocol,
         output_track=output_track,
         paused=False,
-        tts_completed=False,
+        closed=False,
     )
     adapter = object.__new__(RealtimeWebRTCAdapter)
     adapter._calls = {"call": call}
@@ -482,7 +483,7 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
     async def guarded_sleep(delay: float) -> None:
         assert delay == OUTPUT_ECHO_GUARD_SECONDS
         assert call.paused is True
-        protocol.output_stopped.assert_not_awaited()
+        protocol.output_playback_stopped.assert_not_awaited()
 
     with (
         patch(
@@ -501,8 +502,8 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
     output_track.enqueue_pcm.assert_awaited_once()
     output_track.drained.assert_awaited_once_with()
     protocol.output_started.assert_awaited_once_with()
-    protocol.output_stopped.assert_awaited_once_with()
-    assert call.tts_completed is True
+    protocol.output_playback_stopped.assert_awaited_once_with()
+    protocol.output_stopped.assert_not_awaited()
     assert call.paused is False
 
 
@@ -510,7 +511,7 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
 async def test_direct_send_completes_transcript_response() -> None:
     protocol = AsyncMock()
     adapter = object.__new__(RealtimeWebRTCAdapter)
-    call = SimpleNamespace(protocol=protocol, tts_completed=True)
+    call = SimpleNamespace(protocol=protocol)
     adapter._calls = {"call": call}
 
     result = await adapter.send(chat_id="call", content="hello")
@@ -518,7 +519,6 @@ async def test_direct_send_completes_transcript_response() -> None:
     assert result.success is True
     protocol.assistant_transcript.assert_awaited_once_with("hello")
     protocol.output_stopped.assert_awaited_once_with()
-    assert call.tts_completed is False
 
 
 def test_direct_adapter_supports_async_completion_delivery() -> None:
@@ -557,7 +557,7 @@ async def test_direct_internal_wake_waits_for_silence() -> None:
 @pytest.mark.asyncio
 async def test_direct_mute_finalizes_and_unmute_resets_vad() -> None:
     protocol = AsyncMock()
-    adapter = SimpleNamespace(process_voice=AsyncMock())
+    adapter = SimpleNamespace(process_voice=AsyncMock(), cancel_call_response=AsyncMock())
     call = RealtimeCall(
         adapter=adapter,
         call_id="call-a",
@@ -583,3 +583,166 @@ async def test_direct_mute_finalizes_and_unmute_resets_vad() -> None:
 
     for task in list(call.tasks):
         task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_audio_clear_discards_the_frame_already_waiting_for_its_deadline(monkeypatch):
+    track = QueuedAudioTrack()
+    await track.enqueue_pcm(b"\x01\x00" * 960)
+    track._next_frame_at = asyncio.get_running_loop().time() + 10
+
+    async def clear_during_pacing(delay):
+        track.clear()
+
+    monkeypatch.setattr(webrtc_module.asyncio, "sleep", clear_during_pacing)
+    frame = await track.recv()
+    assert bytes(frame.planes[0]) == b"\x00\x00" * 960
+    await track.drained()
+
+
+@pytest.mark.asyncio
+async def test_call_close_does_not_transcribe_buffered_audio():
+    entered = asyncio.Event()
+
+    async def receive():
+        entered.set()
+        await asyncio.Future()
+
+    adapter = SimpleNamespace(process_voice=AsyncMock(), cancel_call_response=AsyncMock())
+    call = RealtimeCall(adapter, "call", AsyncMock(), QueuedAudioTrack(), AsyncMock())
+    call.speaking = True
+    call.audio_buffer.extend(b"\x00\x00" * 48_000)
+    call.spawn(call.consume_audio(SimpleNamespace(recv=receive)))
+    await entered.wait()
+    tasks = list(call.tasks)
+    await call.close()
+    adapter.process_voice.assert_not_awaited()
+    assert call.audio_buffer == b""
+    assert all(task.done() for task in tasks)
+    call.peer.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tts_clears_queued_audio():
+    track = SimpleNamespace(
+        enqueue_pcm=AsyncMock(),
+        drained=AsyncMock(side_effect=asyncio.CancelledError),
+        clear=Mock(),
+    )
+    call = SimpleNamespace(protocol=AsyncMock(), output_track=track, paused=False, closed=False)
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter._calls = {"call": call}
+    with patch("hermes_livekit.adapter.LiveKitAdapter._decode_audio_to_pcm", return_value=b"\x00\x00" * 960):
+        with pytest.raises(asyncio.CancelledError):
+            await adapter.play_tts("call", "unused.wav")
+    track.clear.assert_called_once()
+    assert not call.paused
+
+
+@pytest.mark.asyncio
+async def test_completed_transcription_is_dropped_after_call_closes(monkeypatch):
+    call = SimpleNamespace(protocol=AsyncMock(), closed=False, client_identity="client")
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter._dispatch_text = AsyncMock()
+
+    def transcribe(*args):
+        call.closed = True
+        return "late transcript"
+
+    monkeypatch.setattr(webrtc_module, "transcribe_pcm", transcribe)
+    await adapter.process_voice(call, b"\x00\x00", item_id="first")
+    adapter._dispatch_text.assert_not_awaited()
+    call.protocol.user_transcript.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("bad offer"), asyncio.CancelledError()])
+async def test_failed_or_cancelled_setup_releases_call_and_peer(monkeypatch, realtime_platform, failure):
+    adapter = RealtimeWebRTCAdapter(PlatformConfig(extra={"api_key": "test-token"}))
+    adapter._read_offer = AsyncMock(return_value=("sdp", {}, "{}"))
+    peer = SimpleNamespace(
+        on=lambda event: lambda callback: callback,
+        addTrack=Mock(),
+        setRemoteDescription=AsyncMock(side_effect=failure),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(webrtc_module, "RTCPeerConnection", lambda config: peer)
+    request = SimpleNamespace(headers={"Authorization": "Bearer test-token"})
+    if isinstance(failure, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._create_call(request)
+    else:
+        response = await adapter._create_call(request)
+        assert response.status == 400
+    assert adapter._calls == {}
+    assert adapter._pending_calls == 0
+    peer.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_setup_deadline_releases_pending_slot(monkeypatch, realtime_platform):
+    adapter = RealtimeWebRTCAdapter(PlatformConfig(extra={"api_key": "test-token"}))
+
+    async def read_forever(request):
+        await asyncio.Future()
+
+    adapter._read_offer = read_forever
+    monkeypatch.setattr(webrtc_module, "CALL_SETUP_TIMEOUT_SECONDS", 0)
+    response = await adapter._create_call(SimpleNamespace(headers={"Authorization": "Bearer test-token"}))
+    assert response.status == 400
+    assert adapter._pending_calls == 0
+    assert adapter._calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome,method", [
+    (ProcessingOutcome.SUCCESS, "output_stopped"),
+    (ProcessingOutcome.FAILURE, "response_failed"),
+    (ProcessingOutcome.CANCELLED, "response_cancelled"),
+])
+async def test_direct_processing_hook_finishes_audio_only_and_failed_turns(outcome, method):
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    protocol = AsyncMock()
+    adapter._calls = {"call": SimpleNamespace(protocol=protocol)}
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="call"))
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, outcome)
+    getattr(protocol, method).assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_covers_calls_added_by_finishing_http_handlers():
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter._mark_disconnected = Mock()
+    adapter._calls = {}
+    call = SimpleNamespace(close=AsyncMock())
+
+    async def finish_handlers():
+        adapter._calls["last"] = call
+
+    adapter._runner = SimpleNamespace(cleanup=finish_handlers)
+    await adapter.disconnect()
+    call.close.assert_awaited_once()
+    assert adapter._calls == {}
+
+
+@pytest.mark.asyncio
+async def test_setup_releases_peer_if_audio_track_construction_fails(monkeypatch, realtime_platform):
+    adapter = RealtimeWebRTCAdapter(PlatformConfig(extra={"api_key": "test-token"}))
+    adapter._read_offer = AsyncMock(return_value=("sdp", {}, "{}"))
+    peer = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(webrtc_module, "RTCPeerConnection", lambda config: peer)
+    monkeypatch.setattr(webrtc_module, "QueuedAudioTrack", Mock(side_effect=RuntimeError("track failure")))
+    response = await adapter._create_call(SimpleNamespace(headers={"Authorization": "Bearer test-token"}))
+    assert response.status == 400
+    assert adapter._pending_calls == 0
+    peer.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_transcription_does_not_start_after_call_close(monkeypatch):
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    transcribe = Mock()
+    monkeypatch.setattr(webrtc_module, "transcribe_pcm", transcribe)
+    await adapter.process_voice(SimpleNamespace(closed=True), b"\x00\x00")
+    transcribe.assert_not_called()

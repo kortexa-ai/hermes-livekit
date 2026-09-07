@@ -16,7 +16,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -53,6 +52,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     SendResult,
 )
 from gateway.session import build_session_key
@@ -68,6 +68,7 @@ from .adapter import (
 from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
 from .vad import AdaptiveRmsGate
+from .media import transcribe_pcm
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
@@ -76,6 +77,7 @@ MAX_SDP_BYTES = 256 * 1024
 MAX_SESSION_BYTES = 512 * 1024
 DEFAULT_MAX_CALLS = 8
 DEFAULT_MAX_CALL_SECONDS = 2 * 60 * 60
+CALL_SETUP_TIMEOUT_SECONDS = 30.0
 # Queued RTP frames have left the server when ``drained()`` returns, but the
 # remote jitter buffer and speaker can still be playing their tail.  Keep
 # capture suppressed briefly so that tail cannot become a new user turn.
@@ -194,9 +196,11 @@ class QueuedAudioTrack(MediaStreamTrack):
         self._queue: asyncio.Queue[bytes] = asyncio.Queue()
         self._timestamp = 0
         self._next_frame_at: float | None = None
+        self._generation = 0
 
     async def recv(self) -> Any:
         chunk = await self._queue.get()
+        generation = self._generation
         try:
             samples = len(chunk) // 2
             duration = samples / SAMPLE_RATE
@@ -216,6 +220,11 @@ class QueuedAudioTrack(MediaStreamTrack):
             delay = deadline - now
             if delay > 0:
                 await asyncio.sleep(delay)
+            if generation != self._generation:
+                # clear() can race the paced frame already removed from the
+                # queue. Do not emit that cancelled reply's final frame.
+                chunk = b"\x00" * len(chunk)
+                deadline = loop.time()
             self._next_frame_at = deadline + duration
 
             frame = AudioFrame(format="s16", layout="mono", samples=samples)
@@ -241,6 +250,7 @@ class QueuedAudioTrack(MediaStreamTrack):
         await self._queue.join()
 
     def clear(self) -> None:
+        self._generation += 1
         self._next_frame_at = None
         while True:
             try:
@@ -267,7 +277,6 @@ class RealtimeCall:
     speaking: bool = False
     paused: bool = False
     input_muted: bool = False
-    tts_completed: bool = False
     closed: bool = False
     vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
     vad_calibration_pcm: list[bytes] = field(default_factory=list)
@@ -323,7 +332,7 @@ class RealtimeCall:
             if not self.closed:
                 logger.debug("[%s] inbound audio ended: %s", self.call_id, exc)
         finally:
-            if self.speaking and self.audio_buffer:
+            if not self.closed and self.speaking and self.audio_buffer:
                 await self.finish_utterance()
 
     async def accept_pcm(self, pcm: bytes) -> None:
@@ -367,11 +376,12 @@ class RealtimeCall:
         self.audio_buffer.clear()
         self.last_speech_at = None
         was_speaking, self.speaking = self.speaking, False
+        item_id = None
         if was_speaking:
-            await self.protocol.speech_stopped(self.client_identity)
+            item_id = await self.protocol.speech_stopped(self.client_identity)
         duration = len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)
-        if duration >= MIN_SPEECH_DURATION:
-            self.spawn(self.adapter.process_voice(self, pcm))
+        if not self.closed and duration >= MIN_SPEECH_DURATION:
+            self.spawn(self.adapter.process_voice(self, pcm, item_id=item_id))
 
     async def set_input_audio_state(self, muted: bool) -> None:
         """Apply an explicit client mute boundary to capture and endpointing."""
@@ -402,14 +412,20 @@ class RealtimeCall:
         if self.closed:
             return
         self.closed = True
+        self.audio_buffer.clear()
+        self.speaking = False
+        self.vad_calibration_pcm.clear()
         current = asyncio.current_task()
-        for task in list(self.tasks):
-            if task is not current:
-                task.cancel()
+        tasks = [task for task in self.tasks if task is not current]
+        for task in tasks:
+            task.cancel()
         self.output_track.clear()
         if self.tool_bridge is not None:
             self.tool_bridge.close()
         await self.protocol.close()
+        await self.adapter.cancel_call_response(self)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         try:
             await self.peer.close()
         except Exception:
@@ -489,11 +505,13 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+        # Stop admission and finish/cancel HTTP setup handlers before taking
+        # the call snapshot, or a negotiating peer can escape shutdown.
+        if self._runner is not None:
+            await self._runner.cleanup()
         calls, self._calls = list(self._calls.values()), {}
         for call in calls:
             await call.close()
-        if self._runner is not None:
-            await self._runner.cleanup()
         self._runner = None
         self._site = None
 
@@ -630,8 +648,13 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         if len(self._calls) + self._pending_calls >= self._max_calls:
             return web.Response(status=429, text="too many active calls", headers=headers)
         self._pending_calls += 1
+        call: RealtimeCall | None = None
+        peer: Any = None
+        admitted = False
+        setup_timeout = asyncio.timeout(CALL_SETUP_TIMEOUT_SECONDS)
         try:
-            sdp, session, session_json = await self._read_offer(request)
+            async with setup_timeout:
+                sdp, session, session_json = await self._read_offer(request)
             client_identity = self._client_identity(request, sdp, session_json)
             if session.get("type", "realtime") != "realtime":
                 raise web.HTTPBadRequest(text="only realtime sessions are supported")
@@ -645,7 +668,6 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
             call_id = f"call_{uuid.uuid4().hex}"
             peer = RTCPeerConnection(RTCConfiguration(iceServers=self._ice_servers))
             output_track = QueuedAudioTrack()
-            call: RealtimeCall
 
             async def publish(event: dict[str, Any], recipient: str | None) -> bool:
                 return await call.publish(event, recipient)
@@ -684,9 +706,9 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                     session_id=self._session_key_for_call(call),
                     protocol=protocol,
                 )
+                call.tool_bridge = bridge
                 bridge.register(tools)
                 bridge.set_tool_choice(tool_choice)
-                call.tool_bridge = bridge
             self._calls[call_id] = call
             peer.addTrack(output_track)
 
@@ -706,70 +728,63 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
                     await call.close()
 
             call.spawn(self._expire_call(call))
-            await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
-            await peer.setLocalDescription(await peer.createAnswer())
+            # Share one deadline across request upload and ICE negotiation.
+            async with asyncio.timeout_at(setup_timeout.when()):
+                await peer.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+                await peer.setLocalDescription(await peer.createAnswer())
+            if call.closed:
+                raise RuntimeError("call closed during setup")
             response_headers = {
                 **headers,
                 "Location": f"/v1/realtime/calls/{call_id}",
             }
-            return web.Response(
+            response = web.Response(
                 status=201,
                 text=peer.localDescription.sdp,
                 content_type="application/sdp",
                 headers=response_headers,
             )
+            admitted = True
+            return response
         except DirectToolError as exc:
-            if "call" in locals():
-                await call.close()
             return web.Response(status=400, text=str(exc), headers=headers)
         except web.HTTPException:
             raise
         except Exception as exc:
             logger.warning("[%s] rejected WebRTC offer: %s", self.name, exc)
-            if "call_id" in locals():
-                failed = self._calls.pop(call_id, None)
-                if failed is None and "call" in locals():
-                    failed = call
-                if failed is not None:
-                    await failed.close()
             return web.Response(status=400, text="invalid WebRTC offer", headers=headers)
         finally:
+            # Cancelled HTTP handlers bypass Exception. Every unsuccessful
+            # setup must release its peer, tools, expiry task, and call slot.
             self._pending_calls -= 1
+            if not admitted and call is not None:
+                self._calls.pop(call.call_id, None)
+                await call.close()
+            elif not admitted and peer is not None:
+                await peer.close()
 
     async def _expire_call(self, call: RealtimeCall) -> None:
         await asyncio.sleep(self._max_call_seconds)
         self._calls.pop(call.call_id, None)
         await call.close()
 
-    async def process_voice(self, call: RealtimeCall, pcm: bytes) -> None:
-        path = ""
+    async def process_voice(
+        self, call: RealtimeCall, pcm: bytes, *, item_id: str | None = None
+    ) -> None:
+        if call.closed:
+            return
         try:
-            from .adapter import _pcm_to_wav
-            from tools.transcription_tools import transcribe_audio
-
-            directory = os.path.join(tempfile.gettempdir(), "hermes_livekit")
-            os.makedirs(directory, exist_ok=True)
-            path = os.path.join(directory, f"utterance_{uuid.uuid4().hex[:12]}.wav")
-            with open(path, "wb") as file:
-                file.write(_pcm_to_wav(pcm, SAMPLE_RATE, NUM_CHANNELS))
-            result = await asyncio.to_thread(transcribe_audio, path)
-            transcript = (
-                (result.get("transcript") or result.get("text") or "").strip()
-                if isinstance(result, dict)
-                else ""
+            transcript = await asyncio.to_thread(
+                transcribe_pcm, pcm, SAMPLE_RATE, NUM_CHANNELS
             )
-            if transcript:
-                await call.protocol.user_transcript(transcript, call.client_identity)
+            if transcript and not call.closed:
+                await call.protocol.user_transcript(
+                    transcript, call.client_identity, item_id=item_id
+                )
                 await self._dispatch_text(call, transcript, MessageType.VOICE)
         except Exception as exc:
             logger.error("[%s] voice processing failed: %s", call.call_id, exc)
             await call.protocol.response_failed()
-        finally:
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
 
     async def process_text(self, call: RealtimeCall, text: str) -> None:
         await self._dispatch_text(call, text, MessageType.TEXT)
@@ -830,6 +845,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         )
 
     async def cancel_call_response(self, call: RealtimeCall) -> None:
+        call.output_track.clear()
         await self.cancel_session_processing(self._session_key_for_call(call))
         call.output_track.clear()
         call.paused = False
@@ -845,9 +861,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         if call is None:
             return SendResult(success=False, error="Realtime call is closed")
         await call.protocol.assistant_transcript(content)
-        if call.tts_completed:
-            call.tts_completed = False
-            await call.protocol.output_stopped()
+        await call.protocol.output_stopped()
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def play_tts(
@@ -865,19 +879,22 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         from .adapter import LiveKitAdapter
 
         pcm = await asyncio.to_thread(LiveKitAdapter._decode_audio_to_pcm, audio_path)
+        if self._calls.get(chat_id) is not call or call.closed:
+            return SendResult(success=False, error="Realtime call is closed")
         if not pcm:
             await call.protocol.response_failed()
             return SendResult(success=False, error="Failed to decode audio")
         try:
             call.paused = True
-            call.tts_completed = False
             await call.protocol.output_started()
             await call.output_track.enqueue_pcm(pcm)
             await call.output_track.drained()
             await asyncio.sleep(OUTPUT_ECHO_GUARD_SECONDS)
-            await call.protocol.output_stopped()
-            call.tts_completed = True
+            await call.protocol.output_playback_stopped()
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+        except asyncio.CancelledError:
+            call.output_track.clear()
+            raise
         finally:
             call.paused = False
 
@@ -907,6 +924,29 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
 
     async def send_typing(self, chat_id: str, metadata: Any = None) -> None:
         return None
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        call = self._calls.get(event.source.chat_id)
+        if call is None:
+            return
+        await call.protocol.response_started()
+        event._hermes_realtime_response = (call.protocol, call.protocol.active_response_id)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        """Finish turns that deliver only audio, fail, or are cancelled by Hermes."""
+        call = self._calls.get(event.source.chat_id)
+        if call is None:
+            return
+        if getattr(event, "_hermes_realtime_response", None) != (
+            call.protocol, call.protocol.active_response_id
+        ):
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            await call.protocol.response_cancelled()
+        elif outcome == ProcessingOutcome.FAILURE:
+            await call.protocol.response_failed()
+        else:
+            await call.protocol.output_stopped()
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         call = self._calls.get(chat_id)

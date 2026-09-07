@@ -26,6 +26,109 @@ def protocol_fixture(**callbacks):
 
 
 @pytest.mark.asyncio
+async def test_playout_then_transcript_completes_one_response():
+    protocol, sent = protocol_fixture()
+    await protocol.output_started()
+    response_id = protocol.active_response_id
+    await protocol.output_playback_stopped()
+    assert protocol.active_response_id == response_id
+    assert not any(event["type"] == "response.done" for event, _ in sent)
+    await protocol.assistant_transcript("hello")
+    await protocol.output_stopped()
+    responses = [event["response"] for event, _ in sent if event["type"] == "response.done"]
+    assert len(responses) == 1
+    assert responses[0]["id"] == response_id
+    assert responses[0]["output"][0]["content"][0]["transcript"] == "hello"
+    assert sum(event["type"] == "response.created" for event, _ in sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_transcription_keeps_utterance_id_when_next_speech_has_started():
+    protocol, sent = protocol_fixture()
+    await protocol.speech_started("client")
+    first = await protocol.speech_stopped("client")
+    await protocol.speech_started("client")
+    second = await protocol.speech_stopped("client")
+    # Even out-of-order worker completion must not consume another input ID.
+    await protocol.user_transcript("second", "client", item_id=second)
+    await protocol.user_transcript("first", "client", item_id=first)
+    transcripts = [event for event, _ in sent if event["type"] == "conversation.item.input_audio_transcription.completed"]
+    assert [(event["transcript"], event["item_id"]) for event in transcripts] == [
+        ("second", second), ("first", first)
+    ]
+    assert first != second
+
+
+@pytest.mark.asyncio
+async def test_item_publish_cannot_be_overtaken_by_response_create():
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    inputs = []
+    protocol, sent = protocol_fixture(on_text_input=lambda text, identity: inputs.append(text))
+    publish = protocol._publish
+
+    async def slow_publish(event, recipient):
+        if event["type"] == "conversation.item.added":
+            blocked.set()
+            await release.wait()
+        return await publish(event, recipient)
+
+    protocol._publish = slow_publish
+    item = asyncio.create_task(protocol.handle_client_message(json.dumps({
+        "type": "conversation.item.create",
+        "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+    }), "client"))
+    await asyncio.wait_for(blocked.wait(), timeout=1)
+    response = asyncio.create_task(protocol.handle_client_message('{"type":"response.create"}', "client"))
+    await asyncio.sleep(0)
+    assert inputs == []
+    release.set()
+    await asyncio.gather(item, response)
+    assert inputs == ["hello"]
+    assert not any(event["type"] == "error" for event, _ in sent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [
+    '\ud800',
+    '{"type":"session.update","session":{"instructions":"\\ud800"}}',
+    '{"type":"session.update","session":{"instructions":NaN}}',
+    '[' * 2000 + ']' * 2000,
+])
+async def test_malformed_unicode_and_nested_json_get_protocol_errors(raw):
+    protocol, sent = protocol_fixture()
+    await protocol.handle_client_message(raw, "client")
+    assert sent[-1][0]["error"]["code"] == "invalid_event_json"
+    await protocol.handle_client_message('{"type":"session.update","session":{"instructions":"hello"}}', "client")
+    assert protocol.instructions == "hello"
+
+
+@pytest.mark.asyncio
+async def test_response_failure_stops_playback_state():
+    protocol, sent = protocol_fixture()
+    await protocol.output_started()
+    await protocol.response_failed()
+    assert not protocol._speaking
+    assert sent[-1][0]["response"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [RuntimeError("publish failed"), asyncio.CancelledError()])
+async def test_tool_emission_failure_releases_pending_call(failure):
+    protocol, sent = protocol_fixture()
+
+    async def publish(event, recipient):
+        if event["type"] == "response.output_item.added":
+            raise failure
+        return True
+
+    protocol._publish = publish
+    with pytest.raises(type(failure)):
+        await protocol.request_client_tool("fixture", {})
+    assert protocol._pending_tool is None
+
+
+@pytest.mark.asyncio
 async def test_routes_namespaced_input_audio_state_and_acknowledges_it() -> None:
     states: list[tuple[bool, str]] = []
 

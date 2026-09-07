@@ -131,7 +131,9 @@ HERMES_REALTIME_ALLOW_ALL_USERS=true
 
 Send `HERMES_REALTIME_API_KEY` as a Bearer token. Startup fails closed if it is
 missing. `HERMES_REALTIME_MAX_CALLS` defaults to 8 and
-`HERMES_REALTIME_MAX_CALL_SECONDS` defaults to 7200. The current direct edge
+`HERMES_REALTIME_MAX_CALL_SECONDS` defaults to 7200. Offer upload and ICE
+negotiation share a 30-second setup deadline; unsuccessful setup releases its
+call slot, peer, and tools. The current direct edge
 advertises host ICE candidates; deployments across NAT still need a TURN-aware
 front door before they are internet-ready.
 
@@ -373,11 +375,11 @@ with apps that share the same data channel for unrelated control traffic.
 
 ### Video / camera-frame semantics
 
-The agent does **not** consume video tracks continuously. When you
-publish a camera as a video track, the adapter just subscribes to it —
-no frames are decoded until you ask. Send
+The LiveKit SDK receives and decodes a subscribed camera continuously. The
+adapter keeps only the newest frame, so idle video does not accumulate an
+unbounded queue or make later snapshots stale. Send
 `{"type": "conference.capture_frame"}` on `conference.extensions` and the
-agent samples the **very next** frame, encodes
+agent samples the **latest available** frame (or waits for one), encodes
 it as JPEG (quality 85), and queues it locally.
 
 The frame attaches to **the next user message** dispatched by the adapter
@@ -389,6 +391,9 @@ other platforms.
 Frames captured but never claimed by a message are cleaned up on
 disconnect. Frames attached to a message stay on disk through the agent
 turn (the agent loop is fire-and-forget after `handle_message`).
+
+For source-review findings and deferred verification, see
+[`docs/code-review.md`](docs/code-review.md).
 
 ## Status
 
