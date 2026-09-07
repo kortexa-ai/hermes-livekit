@@ -593,11 +593,7 @@ class RealtimeProtocol:
 
     async def close(self) -> None:
         self._closed = True
-        pending, self._pending_tool = self._pending_tool, None
-        if pending is not None:
-            future = pending["future"]
-            if not future.done():
-                future.cancel()
+        self._cancel_pending_tool()
         self._clients.clear()
         self._input_items.clear()
         self._pending_text_inputs.clear()
@@ -608,6 +604,13 @@ class RealtimeProtocol:
         self._active_transcript = None
         self._output_item_announced = False
         self._speaking = False
+
+    def _cancel_pending_tool(self) -> None:
+        pending, self._pending_tool = self._pending_tool, None
+        if pending is not None:
+            future = pending["future"]
+            if not future.done():
+                future.cancel()
 
     async def _accept_conversation_item(
         self,
@@ -718,11 +721,26 @@ class RealtimeProtocol:
         )
 
     async def _accept_response_cancel(self, identity: str, event_id: str | None) -> None:
-        if not self._active_response_id:
+        if not self._active_response_id and self._processing_turn_id is None and self._pending_tool is None:
             await self._error("no_active_response", "There is no active response to cancel", identity, param="response", triggering_event_id=event_id)
             return
+        # Function-call responses are sealed while Hermes awaits the client.
+        # Give cancellation its own terminal continuation, not a second seal
+        # for the completed function response. The transport stops core work.
+        processing_turn, pending_tool = self._processing_turn_id, self._pending_tool
+        prior_response_id = self._active_response_id
+        await self.response_started()
+        if (self._processing_turn_id is not processing_turn
+                or prior_response_id is not None and self._active_response_id != prior_response_id):
+            return
+        response_id = self._active_response_id
         await _call(self._on_response_cancelled, identity)
-        await self.response_cancelled()
+        if self._pending_tool is pending_tool:
+            self._cancel_pending_tool()
+        # Transport cleanup may yield while speech starts a replacement turn.
+        if (self._active_response_id == response_id
+                or processing_turn is not None and self._processing_turn_id is processing_turn):
+            await self.response_cancelled()
 
     async def response_cancelled(self) -> None:
         response_id = self._active_response_id

@@ -154,6 +154,47 @@ async def test_scoped_handler_checks_hermes_session_before_proxying(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replace", [False, True])
+async def test_queued_tools_cannot_resume_after_their_turn_is_cancelled(replace):
+    from hermes_livekit.realtime_protocol import RealtimeProtocol
+
+    events, sealed = [], asyncio.Event()
+    async def publish(event, recipient):
+        events.append(event)
+        if event["type"] == "response.done":
+            sealed.set()
+        return True
+
+    protocol = RealtimeProtocol(session_id="cancel", model="test", voice="test", publish=publish)
+    bridge = DirectToolBridge(session_id="owned", protocol=protocol)
+    await protocol.processing_started()
+    first = asyncio.create_task(bridge._request("first", {}))
+    second = None
+    try:
+        await asyncio.wait_for(sealed.wait(), 1)
+        second = asyncio.create_task(bridge._request("second", {}))
+        await asyncio.sleep(0)  # Second invocation is now queued on the bridge lock.
+        await protocol.response_cancelled()
+        # Core cancellation also stops the first worker; this isolates the
+        # queued invocation's turn fence from the protocol's pending future.
+        first.cancel()
+        if replace:
+            await protocol.processing_started()
+        response_id = protocol.active_response_id
+        results = await asyncio.wait_for(asyncio.gather(first, second, return_exceptions=True), 1)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        calls = [e for e in events if e["type"] == "response.function_call_arguments.done"]
+        assert [e["name"] for e in calls] == ["first"]
+        assert protocol.active_response_id == response_id
+        assert protocol._pending_tool is None
+    finally:
+        for task in (first, second):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_parallel_direct_invocations_are_serialized_deterministically() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()

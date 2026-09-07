@@ -74,6 +74,8 @@ class ToolTurn:
                     and error.get("event_id") == "fixture-late-result"):
                 self.errors.append(code)
                 return []
+            if code in {"no_active_response", "conversation_already_has_active_response"}:
+                self.errors.append(code)
             raise RuntimeError("Unexpected protocol error")
         if kind in {"conversation.item.added", "conversation.item.done"}:
             item = event.get("item", {})
@@ -165,12 +167,70 @@ class ToolTurn:
                            "timed_out": c["timed_out"]} for c in self.calls.values()]}
 
 
+class CancelledToolTurn(ToolTurn):
+    """Cancel beta while pending, then require rejection of its late result."""
+
+    def __init__(self, case, values):
+        super().__init__(case, values)
+        self.cancel_sent_at = self.cancelled_at = None
+
+    def result_events(self, call_id, now):
+        if self.calls[call_id]["name"] != NAMES[1]:
+            return super().result_events(call_id, now)
+        if self.cancel_sent_at is None:
+            self.cancel_sent_at = now
+            return [{"type": "response.cancel", "event_id": "fixture-cancel"}]
+        if self.cancelled_at is None or self.calls[call_id]["sent_at"] is not None:
+            raise RuntimeError("Late fixture result requires confirmed cancellation")
+        self.calls[call_id]["sent_at"] = now
+        return [{"type": "conversation.item.create", "event_id": "fixture-late-result",
+                 "item": {"type": "function_call_output", "call_id": call_id,
+                          "output": json.dumps({"value": self.values[NAMES[1]]})}}]
+
+    def accept(self, event, now):
+        response = event.get("response", {})
+        if event.get("type") == "response.done" and response.get("status") == "cancelled":
+            pending = [key for key, call in self.calls.items() if call["name"] == NAMES[1]]
+            if self.cancel_sent_at is None or self.cancelled_at is not None or len(pending) != 1:
+                raise RuntimeError("Unrequested or duplicate cancellation")
+            self.final, self.cancelled_at = response, now
+            return pending
+        error = event.get("error", {})
+        if event.get("type") == "error" and error.get("code") == "unknown_tool_call":
+            if (self.cancelled_at is None or self.errors
+                    or error.get("event_id") != "fixture-late-result"
+                    or not any(c["name"] == NAMES[1] and c["sent_at"] is not None for c in self.calls.values())):
+                raise RuntimeError("Uncorrelated stale-result rejection")
+            self.errors.append("unknown_tool_call")
+            self.done.set()
+            return []
+        return super().accept(event, now)
+
+    def result(self):
+        if self.failure:
+            raise RuntimeError(self.failure)
+        if (self.final is None or self.final.get("status") != "cancelled" or self.audio
+                or self.cancel_sent_at is None or self.cancelled_at is None
+                or self.errors != ["unknown_tool_call"]):
+            raise RuntimeError("Cancellation did not settle without audio and reject the stale result")
+        if {c["name"] for c in self.calls.values()} != set(NAMES):
+            raise RuntimeError("Cancellation fixture omitted a required call")
+        for call in self.calls.values():
+            if call["name"] == NAMES[0] and (call["acked_at"] is None or call["acked_at"] > self.cancel_sent_at):
+                raise RuntimeError("Cancellation lost the earlier tool acknowledgement")
+            if call["name"] == NAMES[1] and (call["sent_at"] is None or call["acked_at"] is not None):
+                raise RuntimeError("Cancelled result was unsent or incorrectly acknowledged")
+        return {"case": self.case, "cancel_s": round(self.cancelled_at - self.cancel_sent_at, 3),
+                "errors": self.errors, "audio_responses": len(self.audio)}
+
+
 async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 120) -> dict:
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     peer.addTransceiver("audio", direction="recvonly")
     channel = peer.createDataChannel("oai-events")
     ready, jobs = asyncio.Event(), set()
-    turn = ToolTurn(case, dict(zip(NAMES, random.sample(range(100, 1000), 2))))
+    turn_type = CancelledToolTurn if case == "cancel" else ToolTurn
+    turn = turn_type(case, dict(zip(NAMES, random.sample(range(100, 1000), 2))))
     location = None
 
     def fail(_exc):
@@ -252,6 +312,9 @@ async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 
             channel.send(json.dumps({"type": "response.create"}))
             try:
                 await asyncio.wait_for(turn.done.wait(), timeout)
+                if case == "cancel":
+                    # Observe immediate late work without ever opening playback.
+                    await asyncio.sleep(2)
                 result = turn.result()
             except (RuntimeError, asyncio.TimeoutError) as exc:
                 # Retain routing and fixture-only state when a real model does
@@ -274,7 +337,7 @@ def main():
     parser.add_argument("--gateway", default="http://192.168.2.6:8092")
     parser.add_argument("--config-host", default="snappy")
     parser.add_argument("--profile", default="mira")
-    parser.add_argument("--case", choices=("success", "parallel", "mixed", "timeout"), default="success")
+    parser.add_argument("--case", choices=("success", "parallel", "mixed", "timeout", "cancel"), default="success")
     args = parser.parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
     result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, case=args.case))

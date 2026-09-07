@@ -25,9 +25,23 @@ physical playback quality, native LiveKit SDK timeout timing, or LLM prefill.
 Direct client functions currently serialize against one pending protocol slot;
 removing only that lock is not a valid parallel-tool implementation.
 
+The tool probe sends `input_text`. Hermes currently enables streaming TTS only
+for voice input, so this probe's caption-to-audio gap includes whole-file TTS.
+Use `voice_latency_probe.py` for the actual synthetic-speech streaming path;
+do not treat these typed fixture timings as a streaming-TTS regression.
+
 A server-side tool timeout must open the continuation response before Hermes
 can publish native captions. Unlike a successful client result, it receives no
 `response.create` from the client. Preserve the processing-turn identity and
 reject stale continuation after cancellation or replacement. Cover caption
 finalization both before and after the first TTS PCM; do not require audio to
 open the response. Keep the tool deadline unchanged by this lifecycle repair.
+
+`--case cancel` cancels while beta is pending, requires a separate cancelled
+continuation response, submits a late beta result, and checks its rejection.
+It watches a two-second quiet window for spurious audio. Offline tests also
+cover cancellation between a received result and `response.create`, reentrant
+processing-complete hooks, and queued sibling invocations. A queued invocation
+must retain its processing-turn identity across the bridge lock and must not
+join a replacement turn after cancellation. Stopping the turn must leave the
+call usable for a fresh response without waiting for the tool deadline.

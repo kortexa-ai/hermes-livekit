@@ -119,3 +119,43 @@ def test_unexpected_calls_or_uncorrelated_results_are_rejected(probe_module, inv
         event = {"type": "error", "error": {"code": "unknown_tool_call", "event_id": "other"}}
     with pytest.raises(RuntimeError):
         turn.accept(event, 3)
+
+
+def cancelled_turn(module):
+    turn = module.CancelledToolTurn("cancel", dict(zip(module.NAMES, (713, 829))))
+    turn.started = 1
+    turn.accept(sealed(module.NAMES[0], "alpha"), 2)
+    first = turn.result_events("alpha", 2.4)
+    turn.accept({"type": "conversation.item.done", "item": first[0]["item"]}, 2.5)
+    turn.accept(sealed(module.NAMES[1], "beta"), 3)
+    assert turn.result_events("beta", 3.1) == [{"type": "response.cancel", "event_id": "fixture-cancel"}]
+    assert turn.accept({"type": "response.done", "response": {"id": "cancelled", "status": "cancelled", "output": []}}, 3.2) == ["beta"]
+    late = turn.result_events("beta", 3.3)
+    assert len(late) == 1 and late[0]["item"]["type"] == "function_call_output"
+    assert not turn.done.is_set()
+    turn.accept({"type": "error", "error": {"code": "unknown_tool_call", "event_id": late[0]["event_id"]}}, 3.4)
+    return turn
+
+
+def test_cancel_requires_terminal_response_and_correlated_stale_rejection(probe_module):
+    turn = cancelled_turn(probe_module)
+    assert turn.done.is_set()
+    assert turn.result() == {"case": "cancel", "cancel_s": 0.1,
+                             "errors": ["unknown_tool_call"], "audio_responses": 0}
+
+
+@pytest.mark.parametrize("failure", ["audio", "alpha-ack", "beta-ack", "stale-rejection", "status"])
+def test_cancellation_cannot_report_incomplete_or_spurious_delivery(probe_module, failure):
+    turn = cancelled_turn(probe_module)
+    if failure == "audio":
+        turn.accept({"type": "output_audio_buffer.started", "response_id": "stale"}, 4)
+    elif failure == "alpha-ack":
+        turn.calls["alpha"]["acked_at"] = None
+    elif failure == "beta-ack":
+        turn.calls["beta"]["acked_at"] = 4
+    elif failure == "stale-rejection":
+        turn.errors.clear()
+    else:
+        turn.final["status"] = "completed"
+    with pytest.raises(RuntimeError):
+        turn.result()

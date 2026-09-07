@@ -325,6 +325,105 @@ async def test_routes_typed_input_and_cancellation_to_transport_callbacks() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("result_received", [False, True])
+@pytest.mark.parametrize("hook_completes", [False, True])
+async def test_wire_cancel_stops_pending_tool_and_rejects_late_result(result_received, hook_completes):
+    cancelled = []
+
+    async def on_cancel(identity):
+        cancelled.append(identity)
+        if hook_completes:
+            await protocol.response_cancelled()
+
+    protocol, sent = protocol_fixture(on_response_cancelled=on_cancel)
+    await protocol.processing_started()
+    pending = asyncio.create_task(protocol.request_client_tool("fixture", {}))
+    try:
+        async def sealed():
+            while not any(e["type"] == "response.done" for e, _ in sent):
+                await asyncio.sleep(0)
+            return next(e["response"] for e, _ in sent if e["type"] == "response.done")
+        first = await asyncio.wait_for(sealed(), 1)
+        result = json.dumps({"type": "conversation.item.create", "event_id": "fixture-result",
+            "item": {"type": "function_call_output", "call_id": first["output"][0]["call_id"], "output": "ok"}})
+        if result_received:
+            await protocol.handle_client_message(result, "client")
+        assert protocol.active_response_id is None
+        await protocol.handle_client_message('{"type":"response.cancel"}', "client")
+        assert cancelled == ["client"]
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 1)
+        done = [e["response"] for e, _ in sent if e["type"] == "response.done"]
+        assert len(done) == 2
+        assert done[-1]["status"] == "cancelled"
+        assert done[-1]["id"] != first["id"]  # Do not re-seal the completed function response.
+        assert protocol.active_response_id is None
+        assert protocol.processing_turn_id is None
+        assert protocol._pending_tool is None
+        await protocol.handle_client_message(result, "client")
+        assert sent[-1][0]["error"]["code"] == "unknown_tool_call"
+        assert sent[-1][0]["error"]["event_id"] == "fixture-result"
+        # The same transport can own a fresh turn after cancellation.
+        await protocol.processing_started()
+        await protocol.assistant_transcript("New answer.")
+        await protocol.output_stopped()
+        assert sent[-1][0]["response"]["output"][0]["content"][0]["transcript"] == "New answer."
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_delayed_cancel_callback_cannot_cancel_a_replacement_turn():
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def on_cancel(identity):
+        entered.set()
+        await release.wait()
+
+    protocol, sent = protocol_fixture(on_response_cancelled=on_cancel)
+    await protocol.processing_started()
+    cancel = asyncio.create_task(protocol.handle_client_message('{"type":"response.cancel"}', "client"))
+    replacement = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        await protocol.response_cancelled()
+        await protocol.processing_started()
+        replacement_turn = protocol.processing_turn_id
+        replacement = asyncio.create_task(protocol.request_client_tool("new", {}))
+        async def tool_pending():
+            while protocol._pending_tool is None:
+                await asyncio.sleep(0)
+            return protocol._pending_tool["call_id"]
+        call_id = await asyncio.wait_for(tool_pending(), 1)
+        release.set()
+        await asyncio.wait_for(cancel, 1)
+        assert protocol.processing_turn_id is replacement_turn
+        assert protocol._pending_tool is not None
+        assert not replacement.done()
+        await protocol.handle_client_message(json.dumps({"type": "conversation.item.create",
+            "item": {"type": "function_call_output", "call_id": call_id, "output": "new result"}}), "client")
+        await protocol.handle_client_message('{"type":"response.create"}', "client")
+        assert await asyncio.wait_for(replacement, 1) == "new result"
+    finally:
+        release.set()
+        for task in (cancel, replacement):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*(task for task in (cancel, replacement) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_idle_wire_cancel_does_not_create_a_response():
+    cancelled = []
+    protocol, sent = protocol_fixture(on_response_cancelled=lambda identity: cancelled.append(identity))
+    await protocol.handle_client_message('{"type":"response.cancel","event_id":"idle-cancel"}', "client")
+    assert cancelled == []
+    assert len(sent) == 1
+    assert sent[0][0]["error"]["code"] == "no_active_response"
+    assert sent[0][0]["error"]["event_id"] == "idle-cancel"
+
+
+@pytest.mark.asyncio
 async def test_response_create_requires_a_new_queued_input() -> None:
     inputs: list[tuple[str, str]] = []
 

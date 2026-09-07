@@ -256,7 +256,12 @@ class DirectToolBridge:
         return key if isinstance(key, str) and key else None
 
     async def _request(self, name: str, arguments: dict[str, Any]) -> str:
+        processing_turn = self.protocol.processing_turn_id
         async with self._call_lock:
+            # A sibling may have been waiting behind a cancelled tool. Never
+            # let that queued invocation reopen or join a replacement turn.
+            if processing_turn is None or self.protocol.processing_turn_id is not processing_turn:
+                raise asyncio.CancelledError()
             return await self.protocol.request_client_tool(name, arguments)
 
     @staticmethod
