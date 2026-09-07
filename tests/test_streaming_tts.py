@@ -1,0 +1,458 @@
+"""Real PCM conversion and Hermes consumer integration, with fake output devices."""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import os
+import struct
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from gateway.platforms.base import AudioFormat
+from gateway.streaming_tts_consumer import StreamingTTSConsumer
+from hermes_livekit.adapter import LiveKitAdapter
+from hermes_livekit.realtime_protocol import RealtimeProtocol
+from hermes_livekit.realtime_webrtc import QueuedAudioTrack, RealtimeWebRTCAdapter
+from hermes_livekit.streaming_tts import FRAME_BYTES, PcmFramer
+
+
+@pytest.fixture(autouse=True)
+def isolated_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+
+def tone(rate=24000, seconds=0.2):
+    return b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate)))
+                    for i in range(int(rate * seconds)))
+
+
+class Sink:
+    def __init__(self):
+        self.frames = []
+        self.first = asyncio.Event()
+        self.played = asyncio.Event()
+        self.played.set()
+        self.clears = 0
+
+    async def enqueue_pcm(self, pcm):
+        self.frames.append(pcm)
+        self.first.set()
+
+    async def capture_frame(self, frame):
+        await self.enqueue_pcm(bytes(frame.data))
+
+    async def drained(self):
+        await self.played.wait()
+
+    async def wait_for_playout(self):
+        await self.drained()
+
+    def clear(self):
+        self.clears += 1
+        self.played.set()
+
+    clear_queue = clear
+
+
+def voice_adapter(kind):
+    events = []
+
+    async def publish(event, recipient):
+        events.append(event)
+        return True
+
+    protocol = RealtimeProtocol(session_id="fixture", model="test", voice="test", publish=publish)
+    sink = Sink()
+    if kind == "realtime":
+        adapter = object.__new__(RealtimeWebRTCAdapter)
+        owner = SimpleNamespace(protocol=protocol, output_track=sink, closed=False, paused=False)
+        adapter._calls = {"chat": owner}
+    else:
+        adapter = object.__new__(LiveKitAdapter)
+        adapter._room = owner = object()
+        adapter._room_name = "chat"
+        adapter._audio_source = sink
+        adapter._realtime_protocol = protocol
+        adapter._paused = False
+    adapter._tts_streams = {}
+    adapter._tts_lifecycle_lock = asyncio.Lock()
+    adapter._tts_echo_guard = 0
+    return adapter, owner, protocol, sink, events
+
+
+@pytest.mark.parametrize("rate", [8000, 16000, 24000, 44100, 48000])
+def test_resampling_is_independent_of_http_chunk_boundaries(rate):
+    pcm = tone(rate)
+    whole, split = PcmFramer(AudioFormat(sample_rate=rate)), PcmFramer(AudioFormat(sample_rate=rate))
+    expected = list(whole.feed(pcm)) + list(whole.finish())
+    actual = []
+    for offset in range(0, len(pcm), 137):
+        actual.extend(split.feed(pcm[offset:offset + 137]))
+    actual.extend(split.finish())
+    assert b"".join(actual) == b"".join(expected)
+    assert all(len(frame) == FRAME_BYTES for frame in actual)
+    assert len(b"".join(actual)) == 48000 * 2 // 5
+
+
+def test_truncated_pcm_sample_is_not_silently_padded():
+    framer = PcmFramer(AudioFormat())
+    assert list(framer.feed(b"\x01")) == []
+    with pytest.raises(ValueError, match="incomplete PCM16"):
+        list(framer.finish())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_stream_starts_before_text_finishes_and_completes_one_response(kind, monkeypatch):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+
+    class Provider:
+        sample_rate, channels, sample_width = 24000, 1, 2
+
+        def stream(self, text):
+            pcm = tone()
+            for offset in range(0, len(pcm), 137):
+                yield pcm[offset:offset + 137]
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    task = consumer.start()
+    try:
+        consumer.on_delta("This first sentence can play now. ")
+        await asyncio.wait_for(sink.first.wait(), 5)
+        assert not consumer.done
+        assert protocol.active_response_id is not None
+        assert owner.paused if kind == "realtime" else adapter._paused
+        consumer.on_delta("This second sentence follows.")
+        consumer.finish()
+        assert await consumer.wait_complete(timeout=5)
+        assert consumer.suppress_whole_file
+        assert not adapter._tts_streams
+        assert not (owner.paused if kind == "realtime" else adapter._paused)
+        assert not any(event["type"] == "response.done" for event in events)
+        await protocol.assistant_transcript("Both sentences.")
+        await protocol.output_stopped()
+        assert sum(e["type"] == "response.created" for e in events) == 1
+        assert sum(e["type"] == "response.done" for e in events) == 1
+        assert sum(e["type"] == "output_audio_buffer.started" for e in events) == 1
+        assert sum(e["type"] == "output_audio_buffer.stopped" for e in events) == 1
+        assert all(len(frame) == FRAME_BYTES for frame in sink.frames)
+    finally:
+        consumer.abort()
+        await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("partial", [False, True])
+async def test_provider_failure_falls_back_only_before_pcm_delivery(kind, partial, monkeypatch):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+
+    class Provider:
+        sample_rate, channels, sample_width = 24000, 1, 2
+
+        def stream(self, text):
+            if partial:
+                yield tone()
+            raise RuntimeError("synthetic provider failure")
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    task = consumer.start()
+    consumer.on_delta("A sentence with an injected failure. ")
+    consumer.finish()
+    await asyncio.wait_for(task, 5)
+    assert not consumer.completed
+    assert consumer.suppress_whole_file is partial
+    assert consumer.partial is partial
+    assert not adapter._tts_streams
+    assert not (owner.paused if kind == "realtime" else adapter._paused)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_abort_is_idempotent_and_late_old_chunks_cannot_touch_new_stream(kind):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    old = await adapter.begin_streaming_tts("chat", AudioFormat())
+    await adapter.write_streaming_tts(old, tone())
+    await adapter.abort_streaming_tts(old)
+    await protocol.response_cancelled()
+    new = await adapter.begin_streaming_tts("chat", AudioFormat())
+    await adapter.write_streaming_tts(new, tone())
+    clears, frames = sink.clears, len(sink.frames)
+    await adapter.abort_streaming_tts(old)
+    await adapter.write_streaming_tts(old, tone())
+    await adapter.finish_streaming_tts(old)
+    assert sink.clears == clears and len(sink.frames) == frames
+    assert owner.paused if kind == "realtime" else adapter._paused
+    assert adapter._tts_streams["chat"] is new
+    await adapter.finish_streaming_tts(new)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_abort_racing_output_started_does_not_leave_playback_active(kind):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat())
+    starting, release = asyncio.Event(), asyncio.Event()
+    original_start = protocol.output_started
+
+    async def start():
+        await original_start()
+        starting.set()
+        await release.wait()
+
+    protocol.output_started = start
+    writing = asyncio.create_task(adapter.write_streaming_tts(handle, tone()))
+    await asyncio.wait_for(starting.wait(), 5)
+    aborting = asyncio.create_task(adapter.abort_streaming_tts(handle))
+    # Let cancellation race the in-flight start notification.
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(asyncio.gather(writing, aborting, return_exceptions=True), 5)
+    assert handle.aborted and handle.finished
+    assert not adapter._tts_streams
+    assert not (owner.paused if kind == "realtime" else adapter._paused)
+    assert sum(e["type"] == "output_audio_buffer.started" for e in events) == 1
+    assert sum(e["type"] == "output_audio_buffer.stopped" for e in events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_finish_waits_for_playout_and_abort_releases_waiter(kind):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat())
+    await adapter.write_streaming_tts(handle, tone())
+    sink.played.clear()
+    waiting = asyncio.Event()
+    original_drain = adapter._tts_drain
+
+    async def drain(h):
+        waiting.set()
+        await original_drain(h)
+
+    adapter._tts_drain = drain
+    task = asyncio.create_task(adapter.finish_streaming_tts(handle))
+    await asyncio.wait_for(waiting.wait(), 5)
+    assert owner.paused if kind == "realtime" else adapter._paused
+    assert not task.done()
+    await adapter.abort_streaming_tts(handle)
+    await asyncio.wait_for(task, 5)
+    assert handle.aborted and handle.finished
+    assert not adapter._tts_streams
+
+
+@pytest.mark.asyncio
+async def test_direct_queue_bounds_backpressure_and_clear_releases_old_producer():
+    track = QueuedAudioTrack()
+    task = asyncio.create_task(track.enqueue_pcm(tone(48000, 2)))
+
+    async def full():
+        while not track._queue.full():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(full(), 5)
+    assert not task.done()
+    assert track._queue.qsize() * FRAME_BYTES <= 48000
+    track.clear()
+    await asyncio.wait_for(task, 5)
+    await asyncio.wait_for(track.drained(), 5)
+    assert track._queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_aborts_blocked_pcm_writer():
+    adapter, owner, protocol, sink, events = voice_adapter("realtime")
+    owner.output_track = QueuedAudioTrack()
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat())
+    task = asyncio.create_task(adapter.write_streaming_tts(handle, tone(seconds=2)))
+
+    async def full():
+        while not owner.output_track._queue.full():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(full(), 5)
+    owner.closed = True
+    await adapter._abort_tts_for_chat("chat")
+    await asyncio.gather(task, return_exceptions=True)
+    assert handle.aborted and handle.finished
+    assert owner.output_track._queue.empty()
+    assert not owner.paused and not adapter._tts_streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_unsupported_format_or_destination_declines_before_output(kind):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    for audio_format in (AudioFormat(channels=2), AudioFormat(sample_width=4), AudioFormat(sample_rate=0)):
+        assert await adapter.begin_streaming_tts("chat", audio_format) is None
+    assert await adapter.begin_streaming_tts("missing", AudioFormat()) is None
+    assert not sink.frames and not events and not adapter._tts_streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_incomplete_first_sample_does_not_suppress_fallback(kind, monkeypatch):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+
+    class Provider:
+        sample_rate, channels, sample_width = 24000, 1, 2
+
+        def stream(self, text):
+            yield b"\x01"
+            raise RuntimeError("failed before a playable sample")
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    task = consumer.start()
+    consumer.on_delta("This reply should still get a fallback. ")
+    consumer.finish()
+    await asyncio.wait_for(task, 5)
+    assert not sink.frames
+    assert not consumer.audible
+    assert not consumer.suppress_whole_file
+
+
+@pytest.mark.asyncio
+async def test_gateway_finalizer_allows_a_long_reply_to_finish_playing(monkeypatch):
+    from gateway.run_turn import GatewayTurnMixin
+
+    adapter, owner, protocol, sink, events = voice_adapter("realtime")
+    owner.output_track = QueuedAudioTrack()
+
+    class Provider:
+        sample_rate, channels, sample_width = 24000, 1, 2
+
+        def stream(self, text):
+            yield tone(seconds=12)
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    context = SimpleNamespace(
+        streaming_tts_consumer_holder=[consumer], session_key="chat", run_generation=1,
+    )
+    samples = 0
+
+    async def play():
+        nonlocal samples
+        while True:
+            samples += (await owner.output_track.recv()).samples
+
+    playing = asyncio.create_task(play())
+    task = consumer.start()
+    try:
+        consumer.on_delta("A longer spoken answer must not be cut off while playback is progressing. ")
+        await asyncio.wait_for(
+            GatewayTurnMixin()._run_agent_finalize_streaming_tts(context, adapter), 30,
+        )
+        assert consumer.completed
+        assert samples == 12 * 48000
+        assert consumer.suppress_whole_file and not adapter._tts_streams
+    finally:
+        consumer.abort()
+        await adapter._abort_tts_for_chat("chat")
+        playing.cancel()
+        task.cancel()
+        await asyncio.gather(playing, task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("production", [False, True, True], ids=[
+    "synthetic", "smarty-opt-in-first", "smarty-opt-in-repeat",
+])
+async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, monkeypatch):
+    """Opt in with HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml.
+
+    The production variant uses the configured provider without logging secrets
+    or playing audio on a device. Both peers are private, in-process test peers.
+    """
+    from aiortc import RTCConfiguration, RTCPeerConnection
+
+    config = {}
+    if production:
+        path = os.environ.get("HERMES_TTS_CANARY_CONFIG")
+        if not path:
+            pytest.skip("production TTS canary is explicitly opt-in")
+        import yaml
+
+        with open(path) as file:
+            config = yaml.safe_load(file)["tts"]
+        # Provider availability consults the profile loader separately from
+        # the supplied config. Keep HERMES_HOME isolated and secrets in memory.
+        monkeypatch.setattr("tools.tts_streaming._load_tts_config", lambda: config)
+    else:
+        class Provider:
+            sample_rate, channels, sample_width = 24000, 1, 2
+
+            def stream(self, text):
+                yield tone(seconds=0.4)
+
+        monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+
+    adapter, owner, protocol, sink, events = voice_adapter("realtime")
+    owner.output_track = QueuedAudioTrack()
+    sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    receiver = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+    sender.addTrack(owner.output_track)
+    first_pcm, first_rtp = asyncio.Event(), asyncio.Event()
+    timing = {}
+    tasks = []
+    consumer = None
+    original_write = adapter._tts_write_frame
+
+    async def write(handle, pcm):
+        await original_write(handle, pcm)
+        if not first_pcm.is_set():
+            timing["first_pcm_s"] = time.monotonic() - started
+            first_pcm.set()
+
+    adapter._tts_write_frame = write
+
+    @receiver.on("track")
+    def receive(track):
+        async def drain():
+            while True:
+                frame = await track.recv()
+                if not first_rtp.is_set() and frame.to_ndarray().any():
+                    timing["first_rtp_s"] = time.monotonic() - started
+                    first_rtp.set()
+
+        tasks.append(asyncio.create_task(drain()))
+
+    try:
+        await sender.setLocalDescription(await sender.createOffer())
+        await receiver.setRemoteDescription(sender.localDescription)
+        await receiver.setLocalDescription(await receiver.createAnswer())
+        await sender.setRemoteDescription(receiver.localDescription)
+
+        async def connected():
+            while sender.connectionState != "connected" or receiver.connectionState != "connected":
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(connected(), 10)
+        consumer = StreamingTTSConsumer(adapter, "chat", config, asyncio.get_running_loop())
+        assert consumer.active
+        tasks.append(consumer.start())
+        started = time.monotonic()
+        consumer.on_delta("Streaming audio should reach the receiver before the rest of this reply is ready. ")
+        await asyncio.wait_for(first_rtp.wait(), 30)
+        assert first_pcm.is_set() and not consumer.done
+        handle = adapter._tts_streams["chat"]
+        consumer.finish()
+        assert await consumer.wait_complete(timeout=60)
+        timing["complete_s"] = time.monotonic() - started
+        timing["audio_s"] = handle.pcm_bytes / 96000
+        assert consumer.suppress_whole_file and not adapter._tts_streams
+        print({"streaming_tts_rtp": "production" if production else "synthetic", **timing})
+    finally:
+        if consumer is not None:
+            consumer.abort()
+        await adapter._abort_tts_for_chat("chat")
+        await sender.close()
+        await receiver.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

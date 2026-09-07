@@ -186,6 +186,31 @@ Or run the interactive prompt:
 hermes config
 ```
 
+### Streaming speech
+
+Both transports implement Hermes Agent's streaming-TTS audio sink. For voice
+turns with auto-TTS enabled and a supported streaming provider, completed text
+clauses can play while the rest of the reply is still being generated. The
+configured provider and voice are preserved; no TTS-server or client changes
+are needed. Unsupported providers retain whole-file playback.
+
+PCM is resampled incrementally to 48 kHz mono and published in paced 20 ms
+frames. Direct WebRTC queues at most 500 ms of audio ahead of the sender;
+LiveKit uses its audio source's playout backpressure. A failure before playable
+audio permits whole-file fallback. After playback starts, failure or cancellation
+must not replay the reply from the beginning.
+
+Streaming requires a Hermes Agent consumer that preserves adapter-owned
+`handle.audible` and allows more than ten seconds to finish a long spoken reply.
+The companion fixes are tracked in
+[the streaming integration issue](https://github.com/kortexa-ai/hermes-livekit/issues/40).
+
+Run the transport tests with `uv run --no-sync pytest -q tests/test_streaming_tts.py`.
+To test the configured TTS service through real local RTP peers, explicitly opt
+in with `HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml` and select
+`-k smarty-opt-in -s`. The canary prints timings, not credentials, and does not
+play sound on a physical device.
+
 ## Verify
 
 ```bash

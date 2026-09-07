@@ -69,6 +69,7 @@ from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
 from .vad import AdaptiveRmsGate
 from .media import transcribe_pcm
+from .streaming_tts import RealtimeStreamingTTSMixin
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
@@ -193,13 +194,18 @@ class QueuedAudioTrack(MediaStreamTrack):
 
     def __init__(self) -> None:
         super().__init__()
-        self._queue: asyncio.Queue[bytes] = asyncio.Queue()
+        # At most 500 ms of PCM ahead of RTP. Producers wait for space rather
+        # than copying an entire generated response into the output queue.
+        self._queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=25)
+        self._space = asyncio.Event()
+        self._space.set()
         self._timestamp = 0
         self._next_frame_at: float | None = None
         self._generation = 0
 
     async def recv(self) -> Any:
         chunk = await self._queue.get()
+        self._space.set()
         generation = self._generation
         try:
             samples = len(chunk) // 2
@@ -238,19 +244,26 @@ class QueuedAudioTrack(MediaStreamTrack):
             self._queue.task_done()
 
     async def enqueue_pcm(self, pcm: bytes) -> None:
+        generation = self._generation
         samples_per_frame = SAMPLE_RATE // 50
         bytes_per_frame = samples_per_frame * 2
         for offset in range(0, len(pcm), bytes_per_frame):
+            while self._queue.full() and generation == self._generation:
+                self._space.clear()
+                await self._space.wait()
+            if generation != self._generation:
+                return
             chunk = pcm[offset : offset + bytes_per_frame]
             if len(chunk) < bytes_per_frame:
                 chunk += b"\x00" * (bytes_per_frame - len(chunk))
-            await self._queue.put(chunk)
+            self._queue.put_nowait(chunk)
 
     async def drained(self) -> None:
         await self._queue.join()
 
     def clear(self) -> None:
         self._generation += 1
+        self._space.set()
         self._next_frame_at = None
         while True:
             try:
@@ -432,7 +445,7 @@ class RealtimeCall:
             pass
 
 
-class RealtimeWebRTCAdapter(BasePlatformAdapter):
+class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
     """Hermes platform serving direct OpenAI-compatible WebRTC calls."""
 
     # An active call is a persistent outbound channel: Hermes may inject a
@@ -845,6 +858,7 @@ class RealtimeWebRTCAdapter(BasePlatformAdapter):
         )
 
     async def cancel_call_response(self, call: RealtimeCall) -> None:
+        await self._abort_tts_for_chat(call.call_id)
         call.output_track.clear()
         await self.cancel_session_processing(self._session_key_for_call(call))
         call.output_track.clear()

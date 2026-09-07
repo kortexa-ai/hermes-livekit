@@ -101,6 +101,7 @@ from .tool_safety import (
 )
 from .vad import AdaptiveRmsGate
 from .media import transcribe_pcm
+from .streaming_tts import LiveKitStreamingTTSMixin
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -206,7 +207,7 @@ def _compute_rms(pcm_data: bytes) -> float:
     return math.sqrt(sum(s * s for s in samples) / n_samples)
 
 
-class LiveKitAdapter(BasePlatformAdapter):
+class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
     """LiveKit voice adapter using WebRTC.
 
     Joins a LiveKit room, captures participant audio, transcribes to text,
@@ -701,6 +702,7 @@ class LiveKitAdapter(BasePlatformAdapter):
         )
 
     async def _cancel_realtime_response(self, identity: str) -> None:
+        await self._abort_tts_for_chat(self._room_name)
         source = self.build_source(
             chat_id=self._room_name,
             chat_name=self._room_name,
@@ -886,6 +888,7 @@ class LiveKitAdapter(BasePlatformAdapter):
 
     async def _close_capture_streams(self) -> None:
         """Stop silence detection and release the SDK's media receivers."""
+        await self._abort_tts_for_chat(getattr(self, "_room_name", ""))
         tasks = list(getattr(self, "_audio_streams", {}).values())
         silence = getattr(self, "_silence_task", None)
         if silence is not None:
