@@ -72,7 +72,6 @@ from .vad import AdaptiveRmsGate, configured_silence_duration
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
                     transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import RealtimeStreamingTTSMixin
-from .native_transcript import NativeTranscriptMixin
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
@@ -462,7 +461,7 @@ class RealtimeCall:
             pass
 
 
-class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, BasePlatformAdapter):
+class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
     """Hermes platform serving direct OpenAI-compatible WebRTC calls."""
 
     # An active call is a persistent outbound channel: Hermes may inject a

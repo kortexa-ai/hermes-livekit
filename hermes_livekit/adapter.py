@@ -101,7 +101,6 @@ from .vad import AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_d
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
                     transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import LiveKitStreamingTTSMixin
-from .native_transcript import NativeTranscriptMixin
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -196,7 +195,7 @@ def check_livekit_requirements() -> bool:
     return LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE
 
 
-class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatformAdapter):
+class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
     """LiveKit voice adapter using WebRTC.
 
     Joins a LiveKit room, captures participant audio, transcribes to text,
