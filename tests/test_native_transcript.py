@@ -34,6 +34,58 @@ def endpoint(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_setup_notice_cannot_end_the_processing_turn_before_native_audio(kind, tmp_path, monkeypatch):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+    from gateway.run_notifications import GatewayNotificationsMixin
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter, protocol, events, updated = endpoint(kind)
+    BasePlatformAdapter.__init__(adapter, PlatformConfig(), SimpleNamespace(value=kind))
+    source = adapter.build_source(chat_id="chat", chat_type="dm", user_id="fixture")
+    event = MessageEvent(text="Hello", message_type=MessageType.VOICE, source=source)
+    runner = SimpleNamespace(
+        _adapter_for_source=lambda source: adapter,
+        _thread_metadata_for_source=lambda source: None,
+    )
+    consumer = GatewayStreamConsumer(
+        adapter, "chat", config=StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1, cursor=""),
+    )
+    response_ids = []
+
+    async def handler(event):
+        response_ids.append(protocol.active_response_id)
+        # The real first-contact notice is delivered before TurnRunner starts
+        # its native consumer. It is not the final answer to the user's turn.
+        await GatewayNotificationsMixin._deliver_platform_notice(runner, source, "Setup notice")
+        task = asyncio.create_task(consumer.run())
+        try:
+            consumer.on_delta("I am Mira.")
+            await asyncio.wait_for(updated.wait(), 2)
+            await protocol.output_started()
+            consumer.finish("I am Mira.")
+            await asyncio.wait_for(task, 2)
+            await protocol.output_playback_stopped()
+            assert consumer._final_content_delivered
+            return None  # Core suppresses normal final delivery after a native final.
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    adapter._message_handler = handler
+    # Real base lifecycle, including the processing-complete hook; no manual
+    # protocol.output_stopped() hiding a missing terminal event.
+    await adapter._process_message_background(event, "fixture-session")
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert len(done) == 1
+    assert done[0]["id"] == response_ids[0]
+    assert done[0]["status"] == "completed"
+    assert done[0]["output"][0]["content"][0]["transcript"] == "I am Mira."
+    assert protocol.active_response_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
 @pytest.mark.parametrize("override", [None, True])
 async def test_runner_routes_text_only_when_profile_streaming_policy_enables_it(kind, override):
     from gateway.config import StreamingConfig
