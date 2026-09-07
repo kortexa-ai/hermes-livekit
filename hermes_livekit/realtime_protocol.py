@@ -82,6 +82,7 @@ class RealtimeProtocol:
         self._active_response_id: str | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
+        self._transcript_turn_id: str | None = None
         self._output_item_announced = False
         self._speaking = False
         self._pending_tool: dict[str, Any] | None = None
@@ -356,6 +357,7 @@ class RealtimeProtocol:
         self._active_response_id = f"resp_{self.session_id}_{self._response_sequence}"
         self._active_output_item_id = None
         self._active_transcript = None
+        self._transcript_turn_id = None
         self._output_item_announced = False
         await self._emit(
             {
@@ -371,6 +373,42 @@ class RealtimeProtocol:
             self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
             await self._announce_audio_output_item()
         await self._emit({"type": "output_audio_buffer.started", "response_id": self._active_response_id})
+
+    async def stream_transcript(self, transcript: str, *, turn_id: str, finalize: bool = False) -> None:
+        """Bind the consumer's seed to this response; drop late/replaced frames.
+
+        Text completion does not stop audio or complete the response. The TTS
+        sink and processing lifecycle still own those transitions.
+        """
+        if self._closed or not self._active_response_id or not turn_id:
+            return
+        if not transcript and not finalize:
+            self._transcript_turn_id = self._transcript_turn_id or turn_id
+            return
+        if turn_id != self._transcript_turn_id:
+            return
+        if finalize:
+            await self.assistant_transcript(transcript)
+            return
+        previous = self._active_transcript or ""
+        if transcript == previous:
+            return
+        self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
+        self._active_transcript = transcript
+        await self._announce_audio_output_item()
+        event = {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": self._active_response_id,
+            "item_id": self._active_output_item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": transcript[len(previous):] if transcript.startswith(previous) else "",
+        }
+        if not transcript.startswith(previous):
+            # Native frames are snapshots: tool boundaries or display cleanup
+            # can revise a draft. This extension lets clients replace it safely.
+            event["transcript"] = transcript
+        await self._emit(event)
 
     async def assistant_transcript(self, transcript: str) -> None:
         await self.response_started()
