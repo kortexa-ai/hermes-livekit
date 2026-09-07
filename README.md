@@ -271,6 +271,9 @@ one fixed question, and sends a real voice turn through ASR, Hermes, and TTS.
 Choose `--case greeting`, `fact`, or `calculation`. The session requests no tools,
 but that does not disable Hermes's own tools: inspect gateway API counts before
 treating any case as a single model request.
+The probe rejects split or premature endpoint detections instead of reporting
+latency for mixed turns. Keep failed samples when evaluating endpoint quality;
+do not treat them as valid latency results.
 It neither captures the microphone nor plays audio. The configuration host
 must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
 the speech fixture expects the configured service's 24 kHz mono PCM format.

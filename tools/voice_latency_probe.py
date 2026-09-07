@@ -28,8 +28,8 @@ RATE = 48000
 SAMPLES = 960
 PROMPT = "Please tell me what two plus two equals in one short sentence."
 PROMPTS = {
-    "greeting": "Hello Hermes. Please greet me in one short sentence.",
-    "fact": "What color is a clear daytime sky? Please answer in one short sentence.",
+    "greeting": "Please greet me in one short sentence, Hermes.",
+    "fact": "Please tell me the color of a clear daytime sky in one short sentence.",
     "calculation": PROMPT,
 }
 
@@ -101,6 +101,16 @@ class SyntheticMicrophone(MediaStreamTrack):
         frame.sample_rate, frame.pts, frame.time_base = RATE, self.timestamp, Fraction(1, RATE)
         self.timestamp += SAMPLES
         return frame
+
+
+def validate_single_turn(events: list, times: dict, last_voice_at: float) -> None:
+    """Reject split/cut-off fixtures rather than mixing unrelated turn timestamps."""
+    for name in ("input_audio_buffer.speech_stopped",
+                 "conversation.item.input_audio_transcription.completed"):
+        if sum(e.get("type") == name for e in events) != 1:
+            raise RuntimeError("Probe fixture was split or not transcribed as one turn; discard timings")
+        if times[name] < last_voice_at:
+            raise RuntimeError("Probe endpoint preceded the end of the spoken fixture; discard timings")
 
 
 async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dict:
@@ -176,6 +186,9 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dic
                 raise RuntimeError("No synthesized response audio received: " + json.dumps({
                     "event_types": [e.get("type") for e in events],
                 }))
+            validate_single_turn(events, times, microphone.last_voice_at)
+            if microphone.index < len(microphone.chunks):
+                raise RuntimeError("Reply completed before the spoken fixture finished; discard timings")
             result = {"call_id": location.rsplit("/", 1)[-1] if location else None}
             for label, event_name in [
                 ("endpoint", "input_audio_buffer.speech_stopped"),
