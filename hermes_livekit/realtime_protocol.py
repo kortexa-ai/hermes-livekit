@@ -726,6 +726,12 @@ class RealtimeProtocol:
         continue_processing: bool = False,
     ) -> None:
         response_id = self._active_response_id
+        # A client function call seals one wire response, not the Hermes turn.
+        # Its result resumes the same text consumer and processing-complete hook.
+        # Clear failed/cancelled ownership even while waiting between responses.
+        if not continue_processing:
+            self._processing_turn_id = None
+            self._transcript_turn_id = None
         if not response_id:
             return
         output: list[dict[str, Any]] = list(explicit_output or [])
@@ -740,11 +746,6 @@ class RealtimeProtocol:
                 }
             )
         self._active_response_id = None
-        # A client function call seals one wire response, not the Hermes turn.
-        # Its result resumes the same text consumer and processing-complete hook.
-        if not continue_processing:
-            self._processing_turn_id = None
-            self._transcript_turn_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False

@@ -548,7 +548,17 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
 
 @pytest.mark.asyncio
 async def test_direct_send_completes_transcript_response() -> None:
-    protocol = AsyncMock()
+    from hermes_livekit.realtime_protocol import RealtimeProtocol
+
+    events = []
+
+    async def publish(event, recipient):
+        events.append(event)
+        return True
+
+    protocol = RealtimeProtocol(
+        session_id="standalone", model="test", voice="test", publish=publish,
+    )
     adapter = object.__new__(RealtimeWebRTCAdapter)
     call = SimpleNamespace(protocol=protocol)
     adapter._calls = {"call": call}
@@ -556,8 +566,11 @@ async def test_direct_send_completes_transcript_response() -> None:
     result = await adapter.send(chat_id="call", content="hello")
 
     assert result.success is True
-    protocol.assistant_transcript.assert_awaited_once_with("hello")
-    protocol.output_stopped.assert_awaited_once_with()
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert len(done) == 1
+    assert done[0]["status"] == "completed"
+    assert done[0]["output"][0]["content"][0]["transcript"] == "hello"
+    assert protocol.active_response_id is None
 
 
 def test_direct_adapter_supports_async_completion_delivery() -> None:
