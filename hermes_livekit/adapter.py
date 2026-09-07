@@ -15,9 +15,7 @@ Requires:
 import asyncio
 import hashlib
 import logging
-import math
 import os
-import struct
 import subprocess
 import tempfile
 import time
@@ -100,7 +98,8 @@ from .tool_safety import (
     valid_tool_name,
 )
 from .vad import AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_duration
-from .media import transcribe_pcm
+from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
+                    transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import LiveKitStreamingTTSMixin
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
@@ -196,17 +195,6 @@ def check_livekit_requirements() -> bool:
     return LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE
 
 
-def _compute_rms(pcm_data: bytes) -> float:
-    """Compute RMS energy of 16-bit PCM samples."""
-    if len(pcm_data) < 2:
-        return 0.0
-    n_samples = len(pcm_data) // 2
-    samples = struct.unpack(f"<{n_samples}h", pcm_data[:n_samples * 2])
-    if not samples:
-        return 0.0
-    return math.sqrt(sum(s * s for s in samples) / n_samples)
-
-
 class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
     """LiveKit voice adapter using WebRTC.
 
@@ -223,6 +211,8 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self.config.extra = extra
         self._silence_duration = configured_silence_duration(extra)
+        self._asr_prefetch_silence = configured_asr_prefetch(extra, self._silence_duration)
+        self._early_asr: Dict[str, EarlyTranscription] = {}
         # Realtime Conference owns one conversation per room. Participant
         # identity remains available on MessageEvent for attribution and tool
         # ownership, but it must not split the Hermes conversation history.
@@ -910,6 +900,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         getattr(self, "_audio_buffers", {}).clear()
         getattr(self, "_last_audio_time", {}).clear()
         getattr(self, "_audio_gates", {}).clear()
+        for prefetch in getattr(self, "_early_asr", {}).values():
+            prefetch.discard()
+        getattr(self, "_early_asr", {}).clear()
         getattr(self, "_muted_inputs", set()).clear()
         getattr(self, "_speaking_participants", set()).clear()
 
@@ -1064,6 +1057,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         self._audio_buffers.pop(identity, None)
         self._last_audio_time.pop(identity, None)
         getattr(self, "_audio_gates", {}).pop(identity, None)
+        prefetch = getattr(self, "_early_asr", {}).pop(identity, None)
+        if prefetch is not None:
+            prefetch.discard()
         getattr(self, "_muted_inputs", set()).discard(identity)
         self._speaking_participants.discard(identity)
 
@@ -1133,7 +1129,7 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
 
                     # Check RMS of the most recent chunk to detect speech/silence
                     tail = bytes(buf[-bytes_per_tick:]) if buf_len >= bytes_per_tick else bytes(buf)
-                    rms = _compute_rms(tail)
+                    rms = pcm_rms(tail)
 
                     gate = self._audio_gates.get(identity)
                     if gate is None:
@@ -1159,6 +1155,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
                         speaking=identity in self._speaking_participants,
                         frame_seconds=POLL_INTERVAL,
                     ):
+                        prefetch = getattr(self, "_early_asr", {}).get(identity)
+                        if prefetch is not None:
+                            prefetch.discard()
                         # Active speech — update timestamp
                         self._last_audio_time[identity] = time.monotonic()
                         # Emit listening-start on first loud chunk of an utterance
@@ -1179,6 +1178,15 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
                         continue
 
                     elapsed_silence = time.monotonic() - last_time
+                    prefetch_silence = getattr(self, "_asr_prefetch_silence", 0.0)
+                    if prefetch_silence and elapsed_silence >= prefetch_silence:
+                        prefetch = self._early_asr.get(identity)
+                        if prefetch is None:
+                            prefetch = self._early_asr[identity] = EarlyTranscription(
+                                lambda pcm: transcribe_pcm(pcm, SAMPLE_RATE, NUM_CHANNELS),
+                                SAMPLE_RATE, NUM_CHANNELS,
+                            )
+                        prefetch.start(buf, last_time)
                     if elapsed_silence < self._silence_duration:
                         continue
 
@@ -1210,6 +1218,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         duration = speech_end / (SAMPLE_RATE * NUM_CHANNELS * 2)
         if duration < MIN_SPEECH_DURATION:
             # Too short — discard as noise
+            prefetch = getattr(self, "_early_asr", {}).get(identity)
+            if prefetch is not None:
+                prefetch.discard()
             self._audio_buffers[identity] = bytearray()
             self._last_audio_time.pop(identity, None)
             # False alarm — revert the listening-start we sent
@@ -1222,14 +1233,19 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
 
         # Extract the utterance (speech portion only) and reset
         pcm_data = bytes(buf[:speech_end])
+        prefetch = getattr(self, "_early_asr", {}).get(identity)
+        gate = getattr(self, "_audio_gates", {}).get(identity)
+        prefetched = (prefetch.take(
+            pcm_data, self._last_audio_time.get(identity), gate.stop_threshold,
+        ) if prefetch is not None and gate is not None else None)
         self._audio_buffers[identity] = bytearray()
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)
         logger.info("[%s] Utterance from %s: %.1fs audio", self.name, identity, duration)
-        asyncio.create_task(self._process_voice_input(identity, pcm_data))
+        asyncio.create_task(self._process_voice_input(identity, pcm_data, prefetched=prefetched))
         return True
 
-    async def _process_voice_input(self, identity: str, pcm_data: bytes):
+    async def _process_voice_input(self, identity: str, pcm_data: bytes, *, prefetched=None):
         """Transcribe audio and feed into the agent loop."""
         protocol = self._realtime_protocol
         room = self._room
@@ -1240,11 +1256,12 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
             # the model from stt config internally when called with no model
             # arg — same pattern other gateway adapters use.
             item_id = await protocol.speech_stopped(identity)
-            transcript = await asyncio.to_thread(
-                transcribe_pcm, pcm_data, SAMPLE_RATE, NUM_CHANNELS
+            transcript, reused = await transcribe_with_prefetch(
+                pcm_data, SAMPLE_RATE, NUM_CHANNELS, prefetched=prefetched, transcribe=transcribe_pcm,
             )
             if room is not self._room or protocol is not self._realtime_protocol:
                 return
+            logger.info("[%s] ASR for %s reused early result: %s", self.name, identity, reused)
             if not transcript:
                 logger.info("[%s] Empty transcript from %s, skipping", self.name, identity)
                 return
@@ -1584,6 +1601,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
             ):
                 logger.info("[%s] input muted by %s; utterance finalized", self.name, identity)
             else:
+                prefetch = getattr(self, "_early_asr", {}).get(identity)
+                if prefetch is not None:
+                    prefetch.discard()
                 self._audio_buffers[identity] = bytearray()
                 self._last_audio_time.pop(identity, None)
                 self._speaking_participants.discard(identity)
@@ -1591,6 +1611,9 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
             return
 
         muted_inputs.discard(identity)
+        prefetch = getattr(self, "_early_asr", {}).get(identity)
+        if prefetch is not None:
+            prefetch.discard()
         self._audio_buffers[identity] = bytearray()
         self._last_audio_time.pop(identity, None)
         self._speaking_participants.discard(identity)

@@ -63,12 +63,12 @@ from .adapter import (
     RMS_SILENCE_FLOOR,
     SAMPLE_RATE,
     SILENCE_THRESHOLD_SECONDS,
-    _compute_rms,
 )
 from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
 from .vad import AdaptiveRmsGate, configured_silence_duration
-from .media import transcribe_pcm
+from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
+                    transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import RealtimeStreamingTTSMixin
 
 
@@ -294,6 +294,8 @@ class RealtimeCall:
     vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
     vad_calibration_pcm: list[bytes] = field(default_factory=list)
     silence_duration: float = SILENCE_THRESHOLD_SECONDS
+    asr_prefetch_silence: float = 0.0
+    early_asr: EarlyTranscription | None = None
 
     def spawn(self, coroutine: Any) -> None:
         task = asyncio.create_task(coroutine)
@@ -350,7 +352,7 @@ class RealtimeCall:
                 await self.finish_utterance()
 
     async def accept_pcm(self, pcm: bytes) -> None:
-        rms = _compute_rms(pcm)
+        rms = pcm_rms(pcm)
         if not self.vad.ready:
             self.vad_calibration_pcm.append(pcm)
             if not self.vad.calibrate(rms):
@@ -370,9 +372,11 @@ class RealtimeCall:
 
     async def _accept_calibrated_pcm(self, pcm: bytes) -> None:
         now = time.monotonic()
-        rms = _compute_rms(pcm)
+        rms = pcm_rms(pcm)
         if self.vad.is_speech(rms, speaking=self.speaking,
                               frame_seconds=len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)):
+            if self.early_asr is not None:
+                self.early_asr.discard()
             if not self.speaking:
                 self.audio_buffer.clear()
                 self.speaking = True
@@ -383,6 +387,9 @@ class RealtimeCall:
         if not self.speaking:
             return
         self.audio_buffer.extend(pcm)
+        if (self.early_asr is not None and self.last_speech_at is not None
+                and now - self.last_speech_at >= self.asr_prefetch_silence):
+            self.early_asr.start(self.audio_buffer, self.last_speech_at)
         if self.last_speech_at is not None and now - self.last_speech_at >= self.silence_duration:
             logger.info("[%s] voice endpoint: silence=%.3fs target=%.3fs noise_rms=%.1f",
                         self.call_id, now - self.last_speech_at, self.silence_duration, self.vad.noise_rms)
@@ -390,6 +397,8 @@ class RealtimeCall:
 
     async def finish_utterance(self) -> None:
         pcm = bytes(self.audio_buffer)
+        prefetched = (self.early_asr.take(pcm, self.last_speech_at, self.vad.stop_threshold)
+                      if self.early_asr is not None else None)
         self.audio_buffer.clear()
         self.last_speech_at = None
         was_speaking, self.speaking = self.speaking, False
@@ -398,7 +407,7 @@ class RealtimeCall:
             item_id = await self.protocol.speech_stopped(self.client_identity)
         duration = len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)
         if not self.closed and duration >= MIN_SPEECH_DURATION:
-            self.spawn(self.adapter.process_voice(self, pcm, item_id=item_id))
+            self.spawn(self.adapter.process_voice(self, pcm, item_id=item_id, prefetched=prefetched))
 
     async def set_input_audio_state(self, muted: bool) -> None:
         """Apply an explicit client mute boundary to capture and endpointing."""
@@ -412,6 +421,8 @@ class RealtimeCall:
                 self.audio_buffer.clear()
                 self.last_speech_at = None
                 self.speaking = False
+                if self.early_asr is not None:
+                    self.early_asr.discard()
             self.vad_calibration_pcm.clear()
             logger.info("[%s] input muted by client", self.call_id)
             return
@@ -421,6 +432,8 @@ class RealtimeCall:
         self.audio_buffer.clear()
         self.last_speech_at = None
         self.speaking = False
+        if self.early_asr is not None:
+            self.early_asr.discard()
         self.vad = AdaptiveRmsGate(minimum_floor=RMS_SILENCE_FLOOR)
         self.vad_calibration_pcm.clear()
         logger.info("[%s] input unmuted; adaptive VAD reset", self.call_id)
@@ -429,6 +442,8 @@ class RealtimeCall:
         if self.closed:
             return
         self.closed = True
+        if self.early_asr is not None:
+            self.early_asr.discard()
         self.audio_buffer.clear()
         self.speaking = False
         self.vad_calibration_pcm.clear()
@@ -462,6 +477,7 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         extra = config.extra or {}
         self.config.extra = extra
         self._silence_duration = configured_silence_duration(extra)
+        self._asr_prefetch_silence = configured_asr_prefetch(extra, self._silence_duration)
         self.config.extra["group_sessions_per_user"] = False
         self._host = str(extra.get("host") or os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"))
         self._port = _configured_int(
@@ -719,6 +735,10 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
                 protocol,
                 client_identity=client_identity,
                 silence_duration=self._silence_duration,
+                asr_prefetch_silence=self._asr_prefetch_silence,
+                early_asr=(EarlyTranscription(
+                    lambda pcm: transcribe_pcm(pcm, SAMPLE_RATE, NUM_CHANNELS), SAMPLE_RATE, NUM_CHANNELS,
+                ) if self._asr_prefetch_silence else None),
             )
             if tools:
                 bridge = DirectToolBridge(
@@ -788,15 +808,16 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         await call.close()
 
     async def process_voice(
-        self, call: RealtimeCall, pcm: bytes, *, item_id: str | None = None
+        self, call: RealtimeCall, pcm: bytes, *, item_id: str | None = None, prefetched=None
     ) -> None:
         if call.closed:
             return
         try:
-            transcript = await asyncio.to_thread(
-                transcribe_pcm, pcm, SAMPLE_RATE, NUM_CHANNELS
+            transcript, reused = await transcribe_with_prefetch(
+                pcm, SAMPLE_RATE, NUM_CHANNELS, prefetched=prefetched, transcribe=transcribe_pcm,
             )
             if transcript and not call.closed:
+                logger.info("[%s] ASR reused early result: %s", call.call_id, reused)
                 await call.protocol.user_transcript(
                     transcript, call.client_identity, item_id=item_id
                 )

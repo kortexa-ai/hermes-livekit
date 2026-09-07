@@ -747,3 +747,46 @@ async def test_queued_transcription_does_not_start_after_call_close(monkeypatch)
     monkeypatch.setattr(webrtc_module, "transcribe_pcm", transcribe)
     await adapter.process_voice(SimpleNamespace(closed=True), b"\x00\x00")
     transcribe.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+async def test_early_asr_waits_for_endpoint_and_discards_resumed_speech(monkeypatch, resume):
+    from hermes_livekit.media import EarlyTranscription
+
+    clock = [1.0]
+    monkeypatch.setattr(webrtc_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    worker = Mock(return_value="candidate")
+    prefetch = EarlyTranscription(worker, 48_000, 1)
+    adapter = SimpleNamespace(process_voice=AsyncMock(), cancel_call_response=AsyncMock())
+    call = RealtimeCall(adapter, "early-asr", AsyncMock(), QueuedAudioTrack(), AsyncMock(),
+                        vad=AdaptiveRmsGate(noise_rms=150), silence_duration=0.7,
+                        asr_prefetch_silence=0.35, early_asr=prefetch)
+    speech = b"\x00\x10" * 9600
+    quiet = b"\x10\x00" * 9600
+    try:
+        await call.accept_pcm(speech)
+        clock[0] = 1.2
+        await call.accept_pcm(quiet)
+        worker.assert_not_called()
+        clock[0] = 1.4
+        await call.accept_pcm(quiet)
+        candidate = prefetch._task
+        assert await candidate == "candidate"
+        adapter.process_voice.assert_not_awaited()
+        call.protocol.speech_stopped.assert_not_awaited()
+        if resume:
+            clock[0] = 1.5
+            await call.accept_pcm(speech)
+            # Mute can precede another silence tick; it must not reuse a prefix.
+            await call.set_input_audio_state(True)
+        else:
+            clock[0] = 1.71
+            await call.accept_pcm(quiet)
+        await asyncio.gather(*list(call.tasks))
+        adapter.process_voice.assert_awaited_once()
+        dispatched = adapter.process_voice.call_args.kwargs["prefetched"]
+        assert dispatched is (None if resume else candidate)
+        call.protocol.speech_stopped.assert_awaited_once()
+    finally:
+        await call.close()

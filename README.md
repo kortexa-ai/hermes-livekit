@@ -220,6 +220,24 @@ split thinking pauses. Validate with the actual room and microphone before
 lowering it further. Endpoint logs include observed silence, configured target,
 and learned noise RMS; they do not contain microphone recordings.
 
+To overlap transcription with that silence window, optionally set
+`asr_prefetch_silence: 0.35` beside `silence_duration: 0.7` in either platform's
+`extra` configuration. The default is `0` (disabled); enabled values must be
+at least 0.1 seconds and below `silence_duration`. Restart the affected gateway.
+This uses the existing Hermes STT provider, model and prompt. It is speculative
+batch ASR, not a persistent streaming-ASR connection.
+
+After a qualifying quiet pause, one early request runs in the background. The
+gateway still waits for its normal endpoint before dispatching a user turn.
+It reuses the early result only if speech has not resumed and the final input
+differs solely by quiet PCM at the tail; otherwise it transcribes the final
+audio normally. Empty or failed early results also fall back. Each input has
+at most one speculative worker in flight; invalidating a candidate does not
+cancel an active server request. A pause followed by more speech can therefore
+cost an extra ASR request. This is an energy-based safety check, not proof that
+very quiet speech was absent. Validate accuracy and load with the real mic.
+Gateway logs indicate whether each final transcription reused an early result.
+
 ### Streaming speech
 
 Both transports implement Hermes Agent's streaming-TTS audio sink. For voice

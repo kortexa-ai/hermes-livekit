@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -137,3 +137,57 @@ async def test_livekit_internal_wake_waits_for_silence() -> None:
         adapter._speaking_participants.clear()
         await asyncio.gather(*adapter._deferred_internal_wakes)
         dispatch.assert_awaited_once_with(event)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_before_poll", [False, True])
+async def test_livekit_prefetch_waits_for_endpoint_and_checks_unpolled_audio(monkeypatch, resume_before_poll):
+    import hermes_livekit.adapter as adapter_module
+    from hermes_livekit.vad import AdaptiveRmsGate
+
+    adapter = object.__new__(LiveKitAdapter)
+    adapter.platform = SimpleNamespace(value="livekit")
+    speech = b"\x00\x10" * 24000
+    quiet = b"\x10\x00" * 19200
+    adapter._audio_buffers = {"client": bytearray(speech + quiet)}
+    adapter._last_audio_time = {"client": 0.0}
+    adapter._speaking_participants = {"client"}
+    adapter._audio_gates = {"client": AdaptiveRmsGate(noise_rms=150)}
+    adapter._early_asr = {}
+    adapter._asr_prefetch_silence = 0.35
+    adapter._silence_duration = 0.7
+    adapter._running = True
+    adapter._paused = False
+    adapter._process_voice_input = AsyncMock()
+    worker = Mock(return_value="candidate")
+    monkeypatch.setattr(adapter_module, "transcribe_pcm", worker)
+    clock = [0.0]
+    candidate = None
+
+    async def poll_sleep(delay):
+        nonlocal candidate
+        if not clock[0]:
+            clock[0] = 0.4
+            return
+        candidate = adapter._early_asr["client"]._task
+        assert await candidate == "candidate"
+        adapter._process_voice_input.assert_not_awaited()
+        if resume_before_poll:
+            # The receive loop can append speech immediately before explicit
+            # end-of-turn, without the polling VAD updating the speech marker.
+            adapter._audio_buffers["client"].extend(speech)
+            assert adapter._flush_utterance("client", len(adapter._audio_buffers["client"]))
+        else:
+            adapter._audio_buffers["client"].extend(b"\x10\x00" * 19200)
+        clock[0] = 0.8
+        adapter._running = False  # Finish this tick, including the real endpoint.
+
+    monkeypatch.setattr(adapter_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    with monkeypatch.context() as polling:
+        polling.setattr(adapter_module.asyncio, "sleep", poll_sleep)
+        await adapter._check_silence_loop()
+    await asyncio.sleep(0)
+    worker.assert_called_once_with(speech + quiet, 48000, 1)
+    adapter._process_voice_input.assert_awaited_once()
+    dispatched = adapter._process_voice_input.call_args.kwargs["prefetched"]
+    assert dispatched is (None if resume_before_poll else candidate)
