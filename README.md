@@ -244,6 +244,10 @@ a pinned SHA-256. Missing dependencies or an invalid model fail startup; there
 is no automatic download, GPU fallback or silent change back to energy VAD.
 The confidence threshold accepts 0.2–0.9; lower values are more sensitive.
 The existing silence timeout still applies: this is not semantic endpointing.
+The timer starts at the detector's last positive decision, which can occur
+after audible speech has ended. Equal timer values do not guarantee equal
+endpoint latency across backends. Measure total endpoint delay and test
+mid-sentence pauses before lowering the timer; a shorter timer can split turns.
 The [model and its license](https://github.com/snakers4/silero-vad/tree/be95df9152c0d7618fa1edfeb296fc3dae32376f)
 are MIT-licensed by the Silero Team; the installer saves the license beside
 the model. Keep both outside the repository.
