@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from array import array
+import hashlib
 import json
 import random
 import time
@@ -20,10 +21,15 @@ from aiohttp import ClientSession, ClientTimeout, FormData
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from av import AudioResampler
 
-from voice_latency_probe import completion_text, profile_credentials
+from voice_latency_probe import (
+    MODEL_CHOICES, RATE, ModelSetup, SyntheticMicrophone, completion_text,
+    profile_credentials, speech_fixture, validate_single_turn,
+)
 
 
 NAMES = ("latency_alpha", "latency_beta")
+CASES = ("success", "parallel", "dependent", "mixed", "timeout", "cancel")
+SPOKEN_PROMPT = "Please check both fixture values and tell me the results."
 INSTRUCTIONS = (
     "This is an isolated client-tool latency test. Use both supplied functions "
     "exactly once, and no other tools. Their values are unknown until they return. "
@@ -31,6 +37,34 @@ INSTRUCTIONS = (
     "Use digits for values. If a function fails or times out, use unavailable "
     "for that value. Do not retry failed tools or speak before both settle."
 )
+
+
+def tool_session(case: str) -> dict:
+    """The dependent case cannot be solved without consuming alpha's result."""
+    instructions = INSTRUCTIONS
+    tools = [{"type": "function", "name": name,
+              "description": "Return the " + name.removeprefix("latency_") + " fixture value.",
+              "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
+             for name in NAMES]
+    if case == "parallel":
+        instructions += (
+            " Alpha and beta are independent. Request both in the same tool round, "
+            "in parallel; do not wait for alpha's result to request beta."
+        )
+    if case == "dependent":
+        instructions += " Call alpha first, then pass its returned value as beta's alpha_value argument."
+        tools[1]["parameters"].update(
+            properties={"alpha_value": {"type": "integer"}}, required=["alpha_value"],
+        )
+    return {"type": "realtime", "instructions": instructions, "tool_choice": "auto", "tools": tools}
+
+
+def validate_input(input_mode: str, fixture: bytes | None) -> None:
+    if input_mode not in {"text", "voice"}:
+        raise ValueError("Input must be text or voice")
+    if fixture is not None and (input_mode != "voice" or not isinstance(fixture, bytes)
+                               or not 0 < len(fixture) <= RATE * 2 * 30 or len(fixture) % 2):
+        raise ValueError("Fixture requires voice input and at most 30 seconds of mono 48 kHz int16 PCM")
 
 
 class ToolTurn:
@@ -46,6 +80,7 @@ class ToolTurn:
         self.errors = []
         self.failure = None
         self.final = None
+        self.input_events, self.input_times = [], {}
         self.done = asyncio.Event()
 
     def accept(self, event: dict, now: float) -> list[str]:
@@ -53,6 +88,11 @@ class ToolTurn:
         if self.started is None:
             return []
         kind = event.get("type")
+        if kind in {"input_audio_buffer.speech_stopped", "conversation.item.input_audio_transcription.completed"}:
+            if kind in self.input_times:
+                raise RuntimeError("Spoken fixture split into multiple turns; discard timings")
+            self.input_events.append({"type": kind})
+            self.input_times[kind] = now
         if (kind in {"response.output_audio_transcript.delta", "response.output_audio_transcript.done"}
                 and (event.get("delta") or event.get("transcript"))):
             response_id = event.get("response_id")
@@ -106,10 +146,19 @@ class ToolTurn:
 
     def _add_call(self, item: dict, now: float) -> str:
         name, call_id = item.get("name"), item.get("call_id")
+        arguments = json.loads(item.get("arguments", "null"))
+        expected = {}
+        if self.case == "dependent" and name == NAMES[1]:
+            alpha = next((c for c in self.calls.values() if c["name"] == NAMES[0]), None)
+            if alpha is None or alpha["acked_at"] is None:
+                raise RuntimeError("Dependent beta preceded alpha's acknowledged result")
+            expected = {"alpha_value": self.values[NAMES[0]]}
+            if not isinstance(arguments, dict) or type(arguments.get("alpha_value")) is not int:
+                raise RuntimeError("Dependent beta requires the returned integer alpha value")
         if (name not in NAMES or len(self.calls) >= 2
                 or not isinstance(call_id, str) or not 1 <= len(call_id) <= 128
                 or call_id in self.calls or any(c["name"] == name for c in self.calls.values())
-                or json.loads(item.get("arguments", "null")) != {}):
+                or arguments != expected):
             raise RuntimeError("Unexpected or duplicate fixture invocation")
         self.calls[call_id] = {"name": name, "received_at": now,
                                "sent_at": None, "acked_at": None, "timed_out": False}
@@ -135,33 +184,36 @@ class ToolTurn:
         if audio is not None and audio["rtp_at"] is None:
             audio["rtp_at"] = now
 
-    def result(self) -> dict:
+    def result(self, *, reference: float | None = None) -> dict:
+        reference = self.started if reference is None else reference
         if self.failure:
             raise RuntimeError(self.failure)
         if self.final is None or self.final.get("status") != "completed":
             raise RuntimeError("No completed spoken answer")
         if {c["name"] for c in self.calls.values()} != set(NAMES):
             raise RuntimeError("Answer omitted a required fixture call")
-        beta = self.values[NAMES[1]] if self.case in {"success", "parallel"} else "unavailable"
+        beta = self.values[NAMES[1]] if self.case in {"success", "parallel", "dependent"} else "unavailable"
         expected = f"Alpha {self.values[NAMES[0]]}. Beta {beta}."
         if completion_text(self.final).strip() != expected:
             raise RuntimeError("Answer did not preserve the fixture results")
         audio = self.audio[self.final["id"]]
         if audio["rtp_at"] is None:
             raise RuntimeError("No non-silent RTP received for the answer")
+        if len(self.audio) != 1 or min(audio["started_at"], audio["rtp_at"]) < reference:
+            raise RuntimeError("Unexpected or premature audio; discard timings")
         for call in self.calls.values():
             if not call["timed_out"] and (call["acked_at"] is None or call["acked_at"] > audio["started_at"]):
                 raise RuntimeError("Answer preceded a required tool result")
         if self.case == "timeout" and sorted(self.errors) != ["tool_timeout", "unknown_tool_call"]:
             raise RuntimeError("Timeout and stale-result rejection were not both observed")
         return {"case": self.case, "answer": expected,
-                "first_caption_s": (round(self.captions[self.final["id"]] - self.started, 3)
+                "first_caption_s": (round(self.captions[self.final["id"]] - reference, 3)
                                     if self.final["id"] in self.captions else None),
-                "audio_start_s": round(audio["started_at"] - self.started, 3),
-                "first_non_silent_rtp_s": round(audio["rtp_at"] - self.started, 3),
+                "audio_start_s": round(audio["started_at"] - reference, 3),
+                "first_non_silent_rtp_s": round(audio["rtp_at"] - reference, 3),
                 "errors": self.errors,
                 "tools": [{"name": c["name"],
-                           "requested_s": round(c["received_at"] - self.started, 3),
+                           "requested_s": round(c["received_at"] - reference, 3),
                            "client_wait_s": round(c["sent_at"] - c["received_at"], 3),
                            "acknowledged": c["acked_at"] is not None,
                            "timed_out": c["timed_out"]} for c in self.calls.values()]}
@@ -206,7 +258,7 @@ class CancelledToolTurn(ToolTurn):
             return []
         return super().accept(event, now)
 
-    def result(self):
+    def result(self, *, reference=None):
         if self.failure:
             raise RuntimeError(self.failure)
         if (self.final is None or self.final.get("status") != "cancelled" or self.audio
@@ -224,19 +276,43 @@ class CancelledToolTurn(ToolTurn):
                 "errors": self.errors, "audio_responses": len(self.audio)}
 
 
-async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 120) -> dict:
+def measured_result(turn, microphone):
+    if microphone is None:
+        return {"timing_reference": "text_submitted", **turn.result()}
+    reference = microphone.last_voice_at
+    if reference is None or microphone.index != len(microphone.chunks):
+        raise RuntimeError("Spoken fixture did not finish; discard timings")
+    validate_single_turn(turn.input_events, turn.input_times, reference)
+    return {"timing_reference": "speech_end", **turn.result(reference=reference),
+            "endpoint_s": round(turn.input_times["input_audio_buffer.speech_stopped"] - reference, 3),
+            "transcription_s": round(turn.input_times["conversation.item.input_audio_transcription.completed"] - reference, 3)}
+
+
+async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 120,
+                input_mode: str = "text", model: str = "profile", fixture: bytes | None = None) -> dict:
+    validate_input(input_mode, fixture)
+    if case not in CASES:
+        raise ValueError("Unsupported fixture case")
+    setup = None if model == "profile" else ModelSetup(model)
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
-    peer.addTransceiver("audio", direction="recvonly")
     channel = peer.createDataChannel("oai-events")
     ready, jobs = asyncio.Event(), set()
     turn_type = CancelledToolTurn if case == "cancel" else ToolTurn
     turn = turn_type(case, dict(zip(NAMES, random.sample(range(100, 1000), 2))))
     location = None
+    microphone = None
+
+    def identity():
+        return {"call_id": location, "case": case, "input": input_mode, "model": model,
+                "fixture_sha256": hashlib.sha256(fixture).hexdigest() if fixture is not None else None}
 
     def fail(_exc):
         # Provider/transport diagnostics may contain arbitrary text; do not echo them.
         turn.failure = "Tool probe event or transport failed"
         turn.done.set()
+        if setup is not None:
+            setup.error = turn.failure
+            setup.done.set()
 
     def spawn(coro):
         task = asyncio.create_task(coro)
@@ -264,6 +340,9 @@ async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 
             event = json.loads(raw)
             if event.get("type") == "session.created":
                 ready.set()
+            if setup is not None:
+                setup.accept(event)
+                return
             for call_id in turn.accept(event, time.monotonic()):
                 spawn(deliver(call_id))
         except Exception as exc:
@@ -283,20 +362,18 @@ async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 
 
     try:
         async with ClientSession(timeout=ClientTimeout(total=30)) as http:
+            if input_mode == "voice":
+                if fixture is None:
+                    fixture = await speech_fixture(http, credentials["tts"], SPOKEN_PROMPT)
+                validate_input(input_mode, fixture)
+                microphone = SyntheticMicrophone(fixture)
+                peer.addTrack(microphone)
+            else:
+                peer.addTransceiver("audio", direction="recvonly")
             await peer.setLocalDescription(await peer.createOffer())
             form = FormData(default_to_multipart=True)
             form.add_field("sdp", peer.localDescription.sdp)
-            instructions = INSTRUCTIONS
-            if case == "parallel":
-                instructions += (
-                    " Alpha and beta are independent. Request both in the same tool round, "
-                    "in parallel; do not wait for alpha's result to request beta."
-                )
-            form.add_field("session", json.dumps({"type": "realtime", "instructions": instructions,
-                "tool_choice": "auto", "tools": [{"type": "function", "name": name,
-                    "description": "Return the " + name.removeprefix("latency_") + " fixture value.",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False}}
-                    for name in NAMES]}))
+            form.add_field("session", json.dumps(tool_session(case)))
             async with http.post(gateway + "/v1/realtime/calls", data=form,
                                  headers={"Authorization": "Bearer " + credentials["gateway_key"]},
                                  allow_redirects=False) as response:
@@ -305,42 +382,66 @@ async def probe(gateway: str, credentials: dict, *, case: str, timeout: float = 
                 location = response.headers.get("Location", "").rsplit("/", 1)[-1]
                 await peer.setRemoteDescription(RTCSessionDescription(sdp=await response.text(), type="answer"))
             await asyncio.wait_for(ready.wait(), 15)
+            if setup is not None:
+                setup.send(channel)
+                await setup.wait()
+                setup = None
+            if microphone is not None:
+                await asyncio.sleep(1)  # Calibrate on the same synthetic room noise as the voice canary.
+            if turn.failure:
+                raise RuntimeError(turn.failure)
             turn.started = time.monotonic()
-            channel.send(json.dumps({"type": "conversation.item.create", "item": {
-                "type": "message", "role": "user", "content": [{"type": "input_text",
-                "text": "Use latency_alpha and latency_beta once each. Report both returned values."}]}}))
-            channel.send(json.dumps({"type": "response.create"}))
+            if microphone is not None:
+                microphone.begin_turn()
+            else:
+                channel.send(json.dumps({"type": "conversation.item.create", "item": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text",
+                    "text": "Use latency_alpha and latency_beta once each. Report both returned values."}]}}))
+                channel.send(json.dumps({"type": "response.create"}))
             try:
                 await asyncio.wait_for(turn.done.wait(), timeout)
                 if case == "cancel":
                     # Observe immediate late work without ever opening playback.
                     await asyncio.sleep(2)
-                result = turn.result()
+                result = measured_result(turn, microphone)
             except (RuntimeError, asyncio.TimeoutError) as exc:
                 # Retain routing and fixture-only state when a real model does
                 # not follow the contract; do not lose the failed call's identity.
-                return {"ok": False, "call_id": location, "case": case,
+                return {"ok": False, **identity(),
                         "failure": str(exc) if isinstance(exc, RuntimeError) else "Tool probe deadline expired",
                         "errors": turn.errors,
                         "tools": list(turn.calls.values()),
                         "answer": completion_text(turn.final or {})[:500]}
-            return {"ok": True, "call_id": location, **result}
+            return {"ok": True, **identity(), **result}
+    except (RuntimeError, asyncio.TimeoutError):
+        return {"ok": False, **identity(), "failure": "Tool probe setup or transport failed"}
     finally:
+        if microphone is not None:
+            microphone.stop()
         for task in list(jobs):
             task.cancel()
         await asyncio.gather(*jobs, return_exceptions=True)
         await peer.close()
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway", default="http://192.168.2.6:8092")
     parser.add_argument("--config-host", default="snappy")
     parser.add_argument("--profile", default="mira")
-    parser.add_argument("--case", choices=("success", "parallel", "mixed", "timeout", "cancel"), default="success")
-    args = parser.parse_args()
+    parser.add_argument("--case", choices=CASES, default="success")
+    parser.add_argument("--input", choices=("text", "voice"), default="text",
+                        help="Voice sends synthetic PCM through ASR; neither mode captures or plays audio")
+    parser.add_argument("--model", choices=MODEL_CHOICES, default="profile",
+                        help="Native session-only model override; never persists a profile change")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
-    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, case=args.case))
+    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, case=args.case,
+                              input_mode=args.input, model=args.model))
     print(json.dumps(result, sort_keys=True))
     raise SystemExit(0 if result["ok"] else 1)
 

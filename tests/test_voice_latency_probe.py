@@ -75,6 +75,94 @@ def completed(text, *, status="completed"):
     }]}}
 
 
+def model_confirmation(model="gpt-5.6-terra", provider="ChatGPT or Codex Subscription", scope="session only — add `--global` to persist"):
+    return completed(f"Model switched to `{model}`\nProvider: {provider}\n_({scope})_")
+
+
+@pytest.mark.asyncio
+async def test_model_override_is_explicitly_session_scoped(probe_module):
+    sent = []
+
+    class Channel:
+        def send(self, raw):
+            sent.append(json.loads(raw))
+
+    setup = probe_module.ModelSetup("gpt-5.6-terra")
+    setup.send(Channel())
+    assert sent[0]["item"]["content"] == [{"type": "input_text", "text":
+        "/model gpt-5.6-terra --provider openai-codex --session"}]
+    assert sent[1] == {"type": "response.create"}
+    setup.accept(completed("First-contact notice"))
+    assert not setup.done.is_set()
+    setup.accept(model_confirmation())
+    await setup.wait(timeout=0.01)
+
+
+@pytest.mark.parametrize("event", [
+    model_confirmation(model="gpt-6-astra"), model_confirmation(provider="OpenRouter"),
+    model_confirmation(scope="saved to config"), {"type": "error"},
+    {"type": "output_audio_buffer.started"},
+])
+@pytest.mark.asyncio
+async def test_model_override_requires_matching_provider_model_and_scope(probe_module, event):
+    setup = probe_module.ModelSetup("gpt-5.6-terra")
+    setup.accept(event)
+    with pytest.raises(RuntimeError):
+        await setup.wait(timeout=0.01)
+
+
+@pytest.mark.parametrize("confirmation", ["missing", "failed"])
+@pytest.mark.asyncio
+async def test_model_setup_does_not_infer_success_from_requested_id(probe_module, confirmation):
+    setup = probe_module.ModelSetup("gpt-5.6-terra")
+    if confirmation == "failed":
+        event = model_confirmation()
+        event["response"]["status"] = "failed"
+        setup.accept(event)
+    with pytest.raises(RuntimeError if confirmation == "failed" else asyncio.TimeoutError):
+        await setup.wait(timeout=0.01)
+
+
+@pytest.mark.parametrize("model", ["profile", "", "gpt-5.6-terra --global", "--global", "unknown"])
+def test_model_override_rejects_unbounded_command_arguments(probe_module, model):
+    with pytest.raises(ValueError):
+        probe_module.ModelSetup(model)
+
+
+@pytest.mark.asyncio
+async def test_speech_fixture_is_synthesized_without_redirecting_credentials(probe_module, monkeypatch):
+    requests = []
+
+    class Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        def raise_for_status(self):
+            requests.append("checked")
+
+        async def read(self):
+            return b"input-pcm"
+
+    class HTTP:
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(probe_module, "converted_pcm", lambda pcm: pcm + b"-48k")
+    result = await probe_module.speech_fixture(HTTP(), {
+        "base_url": "http://fixture.invalid/v1/", "api_key": "dummy", "model": "fixture", "voice": "default",
+    }, "Synthetic test only")
+    assert result == b"input-pcm-48k"
+    assert requests == [("http://fixture.invalid/v1/audio/speech", {
+        "headers": {"Authorization": "Bearer dummy"},
+        "json": {"model": "fixture", "voice": "default", "input": "Synthetic test only", "response_format": "pcm"},
+        "allow_redirects": False,
+    }), "checked"]
+
+
 @pytest.mark.parametrize("effort", ["low", "medium"])
 @pytest.mark.asyncio
 async def test_reasoning_command_is_session_only_and_confirmed(probe_module, effort):

@@ -3,7 +3,7 @@
 Owning issue: https://github.com/kortexa-ai/hermes-livekit/issues/15
 
 Test the actual Hermes client-tool continuation before changing timeout policy.
-Use isolated receive-only WebRTC calls, two no-side-effect fixture functions,
+Use isolated WebRTC calls with no physical capture or playback, two no-side-effect fixture functions,
 and fresh returned values that are absent from the prompt. Require both tool
 calls, acknowledged results, the matching final transcript, and non-silent RTP.
 Welcome notices and function-call response seals are not final spoken answers.
@@ -25,10 +25,22 @@ physical playback quality, native LiveKit SDK timeout timing, or LLM prefill.
 Direct client functions currently serialize against one pending protocol slot;
 removing only that lock is not a valid parallel-tool implementation.
 
-The tool probe sends `input_text`. Hermes currently enables streaming TTS only
-for voice input, so this probe's caption-to-audio gap includes whole-file TTS.
-Use `voice_latency_probe.py` for the actual synthetic-speech streaming path;
-do not treat these typed fixture timings as a streaming-TTS regression.
+The tool probe defaults to `--input text`. Hermes currently enables streaming
+TTS only for voice input, so typed timings include whole-file TTS. Use
+`--input voice` to send synthetic PCM through ASR and the actual streaming voice
+path. Require exactly one endpoint and transcription, both after the last voiced
+fixture frame; report times relative to speech end, not speech submission.
+The same in-memory PCM fixture can be passed across model comparisons, with its
+hash in the result. Never persist the fixture or capture room audio.
+
+`--case dependent` requires alpha to settle before beta receives its exact
+returned integer as `alpha_value`; unknown values remain absent from the prompt.
+`--model` is an explicit isolated-call override, confirmed through the native
+command's exact model/provider/session-only acknowledgement. No profile edits,
+service restarts, or reasoning overrides are part of this diagnostic. Retain
+failed samples and routing IDs. Compare serial, counterbalanced model runs and
+verify actual server API model IDs and tool-call counts before interpreting
+latency. These bounded fixtures are not a general agent-quality benchmark.
 
 A server-side tool timeout must open the continuation response before Hermes
 can publish native captions. Unlike a successful client result, it receives no

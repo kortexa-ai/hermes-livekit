@@ -39,6 +39,7 @@ PROMPTS = {
     "calculation": PROMPT,
     "first_sentence": "Please explain the benefit of streaming speech.",
 }
+MODEL_CHOICES = ("profile", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra")
 
 
 def case_options(case: str) -> dict:
@@ -106,6 +107,44 @@ class ReasoningSetup:
             raise RuntimeError(self.error)
 
 
+class ModelSetup:
+    """Explicit Codex session override; never infer success from a requested ID."""
+
+    def __init__(self, model: str):
+        if model not in MODEL_CHOICES[1:]:
+            raise ValueError("Unsupported comparison model")
+        self.model = model
+        self.done = asyncio.Event()
+        self.error = None
+
+    def send(self, channel):
+        channel.send(json.dumps({"type": "conversation.item.create", "item": {
+            "type": "message", "role": "user", "content": [{"type": "input_text",
+                "text": f"/model {self.model} --provider openai-codex --session"}],
+        }}))
+        channel.send(json.dumps({"type": "response.create"}))
+
+    def accept(self, event):
+        if event.get("type") in {"error", "output_audio_buffer.started"}:
+            self.error = "Model setup failed or produced unexpected audio"
+            self.done.set()
+        if event.get("type") == "response.done":
+            response = event.get("response", {})
+            text = completion_text(response)
+            if "Model switched to" in text:
+                if (f"Model switched to `{self.model}`" not in text
+                        or "(session only — add `--global` to persist)" not in text
+                        or "Provider: ChatGPT or Codex Subscription" not in text.splitlines()
+                        or response.get("status") != "completed"):
+                    self.error = "Exact model/provider/session-only confirmation missing"
+                self.done.set()
+
+    async def wait(self, timeout=45):
+        await asyncio.wait_for(self.done.wait(), timeout)
+        if self.error:
+            raise RuntimeError(self.error)
+
+
 def profile_credentials(host: str, profile: str) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile) or host.startswith("-"):
         raise ValueError("Invalid profile or SSH host")
@@ -139,6 +178,17 @@ def converted_pcm(pcm: bytes) -> bytes:
     resampler = AudioResampler(format="s16", layout="mono", rate=RATE)
     return b"".join(bytes(f.planes[0])[:f.samples * 2]
                     for f in resampler.resample(frame) + resampler.resample(None))
+
+
+async def speech_fixture(http, tts: dict, prompt: str) -> bytes:
+    """Synthesize test input before timing; never capture the room microphone."""
+    async with http.post(tts["base_url"].rstrip("/") + "/audio/speech",
+                         headers={"Authorization": "Bearer " + tts["api_key"]},
+                         json={"model": tts["model"], "voice": tts["voice"],
+                               "input": prompt, "response_format": "pcm"},
+                         allow_redirects=False) as response:
+        response.raise_for_status()
+        return converted_pcm(await response.read())
 
 
 class SyntheticMicrophone(MediaStreamTrack):
@@ -288,14 +338,8 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
     headers = {"Authorization": "Bearer " + credentials["gateway_key"]}
     try:
         async with ClientSession(timeout=ClientTimeout(total=40)) as http:
-            tts = credentials["tts"]
-            async with http.post(tts["base_url"].rstrip("/") + "/audio/speech",
-                                 headers={"Authorization": "Bearer " + tts["api_key"]},
-                                 json={"model": tts["model"], "voice": tts["voice"],
-                                       "input": prompt, "response_format": "pcm"}) as response:
-                response.raise_for_status()
-                fixture = converted_pcm(await response.read())
-                microphone = SyntheticMicrophone(fixture)
+            fixture = await speech_fixture(http, credentials["tts"], prompt)
+            microphone = SyntheticMicrophone(fixture)
             peer.addTrack(microphone)
             channel = peer.createDataChannel("oai-events")
 

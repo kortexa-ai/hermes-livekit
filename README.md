@@ -392,6 +392,25 @@ network and receiver buffering, but not the kiosk's physical speaker latency.
 Compare several runs: model generation time can vary independently of the
 silence timeout or TTS transport.
 
+For tool continuations, use `tools/tool_latency_probe.py --input voice --case dependent`.
+This sends a synthetic spoken request through ASR and the streaming-TTS voice
+path. Two side-effect-free client functions return fresh values; the second
+requires the first result as an integer argument. The probe rejects missing,
+out-of-order or incorrect arguments, incomplete utterances and unmatched audio.
+Other cases cover independent tools (`parallel`), partial failure (`mixed`),
+the real server deadline (`timeout`), and cancellation (`cancel`). The default
+`--input text` retains the typed-input canary and its whole-file TTS path.
+Timings explicitly identify `speech_end` or `text_submitted` as their reference.
+An optional `--model gpt-5.6-terra` (also Astra or Sol) sends a native
+`/model ... --provider openai-codex --session` command and requires confirmation
+of the exact model, provider and session-only scope before the test starts.
+The default `--model profile` sends no override. Profile reasoning is unchanged.
+For matched comparisons, the Python `probe` function accepts the same in-memory
+48 kHz mono int16 `fixture` across calls; compare the returned SHA-256 hashes,
+counterbalance model order, and verify server-side model IDs and tool rounds.
+Do not infer general agent quality from these bounded tool fixtures or change
+the production model based only on faster canned answers.
+
 For local model timing logs, set
 `plugins.entries.livekit.settings.voice_latency_metrics: true` in the Hermes
 profile and restart its gateway. It defaults to off and uses existing plugin
