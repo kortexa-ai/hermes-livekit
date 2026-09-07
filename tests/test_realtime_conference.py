@@ -32,6 +32,7 @@ def conference_adapter() -> tuple[LiveKitAdapter, LocalParticipant]:
     )
     adapter._audio_source = None
     adapter._paused = False
+    adapter._silence_duration = 1.5
     adapter._audio_buffers = {"client-a": bytearray()}
     adapter._last_audio_time = {}
     adapter._speaking_participants = set()
@@ -312,6 +313,36 @@ async def test_idle_silence_detector_wakes_when_audio_subscribes(monkeypatch):
     finally:
         task.cancel()
         await task
+
+
+@pytest.mark.asyncio
+async def test_conference_endpoint_uses_configured_timeout_and_keeps_word_tail(monkeypatch):
+    from hermes_livekit.vad import AdaptiveRmsGate
+
+    adapter, _ = conference_adapter()
+    adapter._silence_duration = 0.7
+    adapter._running = True
+    adapter._audio_gates["client-a"] = AdaptiveRmsGate(noise_rms=150)
+    adapter._audio_buffers["client-a"] = bytearray(b"\x00\x00" * 48000)
+    adapter._last_audio_time["client-a"] = 0.0
+    adapter._speaking_participants.add("client-a")
+    clock = [0.0]
+    elapsed = iter([0.69, 0.71])
+
+    async def poll_sleep(delay):
+        clock[0] = next(elapsed)
+
+    def flush(identity, speech_end):
+        assert clock[0] > 0.7
+        assert identity == "client-a"
+        assert speech_end == 96000 - int(0.6 * 96000)
+        adapter._running = False
+
+    adapter._flush_utterance = Mock(side_effect=flush)
+    monkeypatch.setattr(adapter_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", poll_sleep)
+    await adapter._check_silence_loop()
+    adapter._flush_utterance.assert_called_once()
 
 
 @pytest.mark.asyncio

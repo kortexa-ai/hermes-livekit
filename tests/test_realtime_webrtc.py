@@ -60,7 +60,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
     adapter = RealtimeWebRTCAdapter(
         PlatformConfig(
             enabled=True,
-            extra={"host": "127.0.0.1", "port": 0, "api_key": "test-token"},
+            extra={"host": "127.0.0.1", "port": 0, "api_key": "test-token", "silence_duration": 0.7},
         )
     )
     peer = RTCPeerConnection()
@@ -122,6 +122,7 @@ async def test_direct_listener_negotiates_and_sends_session_created(
         assert received[0]["session"]["instructions"] == "Initial instructions."
         assert len(adapter._calls) == 1
         active_call = next(iter(adapter._calls.values()))
+        assert active_call.silence_duration == 0.7
         assert active_call.tool_bridge is not None
         registered_name = next(iter(active_call.tool_bridge._registered))
         assert registry.get_entry(registered_name) is not None

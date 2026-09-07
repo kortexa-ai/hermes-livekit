@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 
-VAD_NOISE_CEILING = 300.0
+# Permit calibration in louder rooms, but bound a bad calibration (e.g. a
+# clipped microphone) so it cannot permanently make all speech inaudible.
+VAD_NOISE_CEILING = 2000.0
 VAD_MIN_START_THRESHOLD = 300.0
 VAD_MIN_STOP_THRESHOLD = 220.0
 VAD_START_RATIO = 2.2
 VAD_START_MARGIN = 100.0
 VAD_STOP_RATIO = 1.5
 VAD_STOP_MARGIN = 60.0
-VAD_NOISE_ALPHA = 0.02
+DEFAULT_SILENCE_DURATION = 1.5
+NOISE_RISE_SECONDS = 2.0
+NOISE_FALL_SECONDS = 0.5
+
+
+def configured_silence_duration(extra: dict) -> float:
+    """Read seconds from the platform config, rejecting ambiguous values."""
+    value = extra.get("silence_duration", DEFAULT_SILENCE_DURATION)
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not 0.2 <= value <= 5.0 or not math.isfinite(value)):
+        raise ValueError("silence_duration must be a finite number from 0.2 to 5.0 seconds")
+    return float(value)
 
 
 @dataclass
@@ -62,15 +76,19 @@ class AdaptiveRmsGate:
         self.calibration.clear()
         return True
 
-    def is_speech(self, rms: float, *, speaking: bool) -> bool:
+    def is_speech(self, rms: float, *, speaking: bool, frame_seconds: float = 0.02) -> bool:
         threshold = self.stop_threshold if speaking else self.start_threshold
         speech = rms > threshold
-        if not speaking and not speech and self.noise_rms is not None:
-            # Follow slow changes such as a fan ramping up, but never learn a
-            # speech frame or allow an outlier to raise the floor indefinitely.
-            observed = min(rms, VAD_NOISE_CEILING)
-            self.noise_rms = (
-                (1.0 - VAD_NOISE_ALPHA) * self.noise_rms
-                + VAD_NOISE_ALPHA * observed
-            )
-        return speech
+        if speech or self.noise_rms is None:
+            return speech
+        if speaking and rms > self.noise_rms + max(30.0, self.noise_rms * 0.15):
+            # Near-threshold quiet phonemes must not inflate the noise floor.
+            return False
+        # Learn ambient sound in pauses too, but freeze for speech frames.
+        # Time-based coefficients keep 20 ms WebRTC and 200 ms LiveKit
+        # observations consistent. Fall faster when a fan switches off.
+        observed = min(rms, VAD_NOISE_CEILING)
+        tau = NOISE_RISE_SECONDS if observed > self.noise_rms else NOISE_FALL_SECONDS
+        alpha = -math.expm1(-frame_seconds / tau)
+        self.noise_rms = max(1.0, self.noise_rms + alpha * (observed - self.noise_rms))
+        return False

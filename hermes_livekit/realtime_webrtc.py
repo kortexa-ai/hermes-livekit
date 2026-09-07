@@ -67,7 +67,7 @@ from .adapter import (
 )
 from .realtime_protocol import MAX_INSTRUCTIONS_BYTES, RealtimeProtocol
 from .direct_tools import DirectToolBridge, DirectToolError, parse_direct_tools
-from .vad import AdaptiveRmsGate
+from .vad import AdaptiveRmsGate, configured_silence_duration
 from .media import transcribe_pcm
 from .streaming_tts import RealtimeStreamingTTSMixin
 
@@ -293,6 +293,7 @@ class RealtimeCall:
     closed: bool = False
     vad: AdaptiveRmsGate = field(default_factory=AdaptiveRmsGate)
     vad_calibration_pcm: list[bytes] = field(default_factory=list)
+    silence_duration: float = SILENCE_THRESHOLD_SECONDS
 
     def spawn(self, coroutine: Any) -> None:
         task = asyncio.create_task(coroutine)
@@ -370,7 +371,8 @@ class RealtimeCall:
     async def _accept_calibrated_pcm(self, pcm: bytes) -> None:
         now = time.monotonic()
         rms = _compute_rms(pcm)
-        if self.vad.is_speech(rms, speaking=self.speaking):
+        if self.vad.is_speech(rms, speaking=self.speaking,
+                              frame_seconds=len(pcm) / (SAMPLE_RATE * NUM_CHANNELS * 2)):
             if not self.speaking:
                 self.audio_buffer.clear()
                 self.speaking = True
@@ -381,7 +383,9 @@ class RealtimeCall:
         if not self.speaking:
             return
         self.audio_buffer.extend(pcm)
-        if self.last_speech_at is not None and now - self.last_speech_at >= SILENCE_THRESHOLD_SECONDS:
+        if self.last_speech_at is not None and now - self.last_speech_at >= self.silence_duration:
+            logger.info("[%s] voice endpoint: silence=%.3fs target=%.3fs noise_rms=%.1f",
+                        self.call_id, now - self.last_speech_at, self.silence_duration, self.vad.noise_rms)
             await self.finish_utterance()
 
     async def finish_utterance(self) -> None:
@@ -457,6 +461,7 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         super().__init__(config, Platform("realtime"))
         extra = config.extra or {}
         self.config.extra = extra
+        self._silence_duration = configured_silence_duration(extra)
         self.config.extra["group_sessions_per_user"] = False
         self._host = str(extra.get("host") or os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"))
         self._port = _configured_int(
@@ -713,6 +718,7 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
                 output_track,
                 protocol,
                 client_identity=client_identity,
+                silence_duration=self._silence_duration,
             )
             if tools:
                 bridge = DirectToolBridge(

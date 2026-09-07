@@ -99,7 +99,7 @@ from .tool_safety import (
     valid_participant_identity,
     valid_tool_name,
 )
-from .vad import AdaptiveRmsGate
+from .vad import AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_duration
 from .media import transcribe_pcm
 from .streaming_tts import LiveKitStreamingTTSMixin
 
@@ -138,7 +138,7 @@ def _apply_env_log_level() -> None:
 _apply_env_log_level()
 
 # Voice detection
-SILENCE_THRESHOLD_SECONDS = 1.5   # seconds of silence → end of utterance
+SILENCE_THRESHOLD_SECONDS = DEFAULT_SILENCE_DURATION
 MIN_SPEECH_DURATION = 0.5         # minimum seconds to process (skip noise)
 RMS_SILENCE_FLOOR = 50            # PCM RMS below this is silence
 POLL_INTERVAL = 0.2               # silence check interval when active
@@ -222,6 +222,7 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
 
         extra = config.extra or {}
         self.config.extra = extra
+        self._silence_duration = configured_silence_duration(extra)
         # Realtime Conference owns one conversation per room. Participant
         # identity remains available on MessageEvent for attribution and tool
         # ownership, but it must not split the Hermes conversation history.
@@ -1156,6 +1157,7 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
                     if gate.is_speech(
                         rms,
                         speaking=identity in self._speaking_participants,
+                        frame_seconds=POLL_INTERVAL,
                     ):
                         # Active speech — update timestamp
                         self._last_audio_time[identity] = time.monotonic()
@@ -1177,12 +1179,14 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
                         continue
 
                     elapsed_silence = time.monotonic() - last_time
-                    if elapsed_silence < SILENCE_THRESHOLD_SECONDS:
+                    if elapsed_silence < self._silence_duration:
                         continue
 
-                    # Trim trailing silence from the buffer (keep only up to
-                    # SILENCE_THRESHOLD worth of trailing audio)
-                    silence_bytes = int(SILENCE_THRESHOLD_SECONDS * SAMPLE_RATE * NUM_CHANNELS * 2)
+                    # Keep a short tail for quiet word endings. Trimming uses
+                    # this platform's configured endpoint duration as well.
+                    silence_bytes = int(max(0, self._silence_duration - 0.1) * SAMPLE_RATE * NUM_CHANNELS * 2)
+                    logger.info("[%s] voice endpoint: silence=%.3fs target=%.3fs noise_rms=%.1f",
+                                identity, elapsed_silence, self._silence_duration, gate.noise_rms)
                     self._flush_utterance(identity, max(0, buf_len - silence_bytes))
         except asyncio.CancelledError:
             return

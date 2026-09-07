@@ -186,6 +186,40 @@ Or run the interactive prompt:
 hermes config
 ```
 
+### Voice endpointing and room noise
+
+Set `silence_duration` in each platform's configuration, in seconds:
+
+```yaml
+platforms:
+  realtime:
+    extra:
+      silence_duration: 0.7
+  livekit:
+    extra:
+      silence_duration: 0.7
+```
+
+The default remains 1.5 seconds. Values from 0.2 to 5.0 are accepted; invalid
+values fail configuration instead of silently changing voice behavior. Restart
+the affected profile's gateway after changing it. Hermes CLI's
+`voice.silence_duration` is a separate recorder setting and does not affect
+these transports. Direct WebRTC checks on received audio frames; LiveKit checks
+every 200 ms, so it can add up to one polling interval.
+
+The energy gate calibrates from the quieter half of the initial 400 ms, then
+tracks background noise continuously during idle audio and confident quiet
+pauses. It has separate speech-start and speech-stop thresholds. Noise rises
+slowly and falls faster, using audio duration rather than frame count. Detected
+speech and near-threshold phonemes during a turn are excluded from adaptation.
+Mute/unmute recalibrates the gate against the real microphone.
+
+This is still energy-based detection, not semantic turn detection. A loud new
+noise above the speech threshold can look like speech; a shorter timeout can
+split thinking pauses. Validate with the actual room and microphone before
+lowering it further. Endpoint logs include observed silence, configured target,
+and learned noise RMS; they do not contain microphone recordings.
+
 ### Streaming speech
 
 Both transports implement Hermes Agent's streaming-TTS audio sink. For voice
@@ -201,8 +235,9 @@ audio permits whole-file fallback. After playback starts, failure or cancellatio
 must not replay the reply from the beginning.
 
 Streaming requires a Hermes Agent consumer that preserves adapter-owned
-`handle.audible` and allows more than ten seconds to finish a long spoken reply.
-The companion fixes are tracked in
+`handle.audible` and supports `tts.streaming.completion_timeout` (default 120
+seconds, accepted range 1–600). This bounds the wait for a long reply to finish;
+it does not delay the start of playback. The companion fixes are tracked in
 [the streaming integration issue](https://github.com/kortexa-ai/hermes-livekit/issues/40).
 
 Run the transport tests with `uv run --no-sync pytest -q tests/test_streaming_tts.py`.
