@@ -240,6 +240,17 @@ seconds, accepted range 1–600). This bounds the wait for a long reply to finis
 it does not delay the start of playback. The companion fixes are tracked in
 [the streaming integration issue](https://github.com/kortexa-ai/hermes-livekit/issues/40).
 
+Generated PCM can itself start with a long near-silent prefix. To shorten that
+pause, set `platforms.realtime.extra.tts_trim_leading_silence: true` (or the
+equivalent `platforms.livekit.extra` key) and restart that profile's gateway.
+This boolean defaults to `false`. It removes only near-silent frames at the
+start of each streamed reply, retaining 80 ms before the first sample above
+PCM16 peak 16 (about -66 dBFS). It scans at most one second and buffers at most
+four 20 ms frames. Internal pauses, later clauses, and retained samples are
+unchanged. This is conservative amplitude trimming, not speech recognition;
+disable it when exact leading timing or unusually faint output must be kept.
+The provider's output contract and whole-file fallback are unchanged.
+
 Run the transport tests with `uv run --no-sync pytest -q tests/test_streaming_tts.py`.
 To test the configured TTS service through real local RTP peers, explicitly opt
 in with `HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml` and select
@@ -266,6 +277,13 @@ audio-start event, and first audible RTP received by the Pi. The latter includes
 network and receiver buffering, but not the kiosk's physical speaker latency.
 Compare several runs: model generation time can vary independently of the
 silence timeout or TTS transport.
+
+Use the same isolated dependencies with `python tools/tts_onset_probe.py` to
+measure provider first bytes versus audible PCM, then compare the identical
+waveform with and without onset trimming. Its sample-offset difference is a
+PCM-domain saving, not an end-to-end playback measurement. It also reports
+filter CPU cost on the machine running the probe and verifies that every
+retained sample is unchanged.
 
 ## Verify
 

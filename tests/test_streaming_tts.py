@@ -83,6 +83,92 @@ def voice_adapter(kind):
     return adapter, owner, protocol, sink, events
 
 
+@pytest.mark.parametrize("adapter_type", [RealtimeWebRTCAdapter, LiveKitAdapter])
+def test_onset_setting_is_opt_in_and_requires_a_boolean(adapter_type):
+    from gateway.config import PlatformConfig
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    name = "realtime" if adapter_type is RealtimeWebRTCAdapter else "livekit"
+    platform_registry.register(PlatformEntry(
+        # Register a test-owned factory, not the plugin class: earlier plugin
+        # discovery tests can bind that class to a different profile scope.
+        name=name, label=name, adapter_factory=lambda config: adapter_type(config),
+        check_fn=lambda: True,
+    ))
+    try:
+        assert platform_registry.is_registered(name)
+        assert not adapter_type(PlatformConfig())._tts_trim_leading_silence
+        for value in (False, True):
+            adapter = adapter_type(PlatformConfig(extra={"tts_trim_leading_silence": value}))
+            assert adapter._tts_trim_leading_silence is value
+        for value in ("true", "false", 1, 0, None, 0.5):
+            with pytest.raises(ValueError, match="tts_trim_leading_silence"):
+                adapter_type(PlatformConfig(extra={"tts_trim_leading_silence": value}))
+    finally:
+        platform_registry.unregister(name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_optional_onset_trim_preserves_pcm_across_provider_chunks(kind, enabled):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    adapter._tts_trim_leading_silence = enabled
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    source = b"\0" * (FRAME_BYTES * 30) + tone(rate=48000) + b"\0" * (FRAME_BYTES * 10)
+    for offset in range(0, len(source), 137):
+        await adapter.write_streaming_tts(handle, source[offset:offset + 137])
+    await adapter.finish_streaming_tts(handle)
+    removed = 26 * FRAME_BYTES if enabled else 0
+    assert b"".join(sink.frames) == source[removed:]
+    assert handle.audible and handle.finished
+    assert sum(e["type"] == "output_audio_buffer.started" for e in events) == 1
+    assert not adapter._tts_streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_quiet_prefix_failure_still_allows_whole_file_fallback(kind, monkeypatch):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    adapter._tts_trim_leading_silence = True
+
+    class Provider:
+        sample_rate, channels, sample_width = 48000, 1, 2
+
+        def stream(self, text):
+            yield b"\0" * FRAME_BYTES * 20
+            raise RuntimeError("failed before speech")
+
+    monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
+    consumer = StreamingTTSConsumer(adapter, "chat", {}, asyncio.get_running_loop())
+    task = consumer.start()
+    consumer.on_delta("The quiet prefix is not playable speech. ")
+    consumer.finish()
+    await asyncio.wait_for(task, 5)
+    assert not consumer.audible and not consumer.suppress_whole_file
+    assert not sink.frames and not events
+    assert not adapter._tts_streams
+    assert not (owner.paused if kind == "realtime" else adapter._paused)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_cancelled_prefix_does_not_leak_into_replacement(kind):
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    adapter._tts_trim_leading_silence = True
+    old = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    await adapter.write_streaming_tts(old, b"\0" * FRAME_BYTES * 20)
+    assert not events and not old.audible
+    await adapter.abort_streaming_tts(old)
+    assert not list(old.leading_silence.finish())
+    new = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    await adapter.finish_streaming_tts(old)
+    speech = tone(rate=48000)
+    await adapter.write_streaming_tts(new, speech)
+    await adapter.finish_streaming_tts(new)
+    assert b"".join(sink.frames) == speech
+
+
 @pytest.mark.parametrize("rate", [8000, 16000, 24000, 44100, 48000])
 def test_resampling_is_independent_of_http_chunk_boundaries(rate):
     pcm = tone(rate)
@@ -360,10 +446,11 @@ async def test_gateway_finalizer_allows_a_long_reply_to_finish_playing(monkeypat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("trim_onset", [False, True], ids=["raw-onset", "trimmed-onset"])
 @pytest.mark.parametrize("production", [False, True, True], ids=[
     "synthetic", "smarty-opt-in-first", "smarty-opt-in-repeat",
 ])
-async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, monkeypatch):
+async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, trim_onset, monkeypatch):
     """Opt in with HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml.
 
     The production variant uses the configured provider without logging secrets
@@ -388,11 +475,12 @@ async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, mo
             sample_rate, channels, sample_width = 24000, 1, 2
 
             def stream(self, text):
-                yield tone(seconds=0.4)
+                yield b"\0" * 28800 + tone(seconds=0.4)  # 600 ms generated quiet.
 
         monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda config: Provider())
 
     adapter, owner, protocol, sink, events = voice_adapter("realtime")
+    adapter._tts_trim_leading_silence = trim_onset
     owner.output_track = QueuedAudioTrack()
     sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     receiver = RTCPeerConnection(RTCConfiguration(iceServers=[]))
@@ -416,7 +504,8 @@ async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, mo
         async def drain():
             while True:
                 frame = await track.recv()
-                if not first_rtp.is_set() and frame.to_ndarray().any():
+                pcm = frame.to_ndarray()
+                if not first_rtp.is_set() and ((pcm > 40) | (pcm < -40)).any():
                     timing["first_rtp_s"] = time.monotonic() - started
                     first_rtp.set()
 
@@ -445,8 +534,15 @@ async def test_pcm_reaches_real_rtp_receiver_before_text_finishes(production, mo
         assert await consumer.wait_complete(timeout=60)
         timing["complete_s"] = time.monotonic() - started
         timing["audio_s"] = handle.pcm_bytes / 96000
+        timing["trimmed_ms"] = handle.leading_silence.trimmed_frames * 20 if trim_onset else 0
+        if not production:
+            # The 24->48 kHz resampler's pre-ringing starts in the preceding
+            # frame. Keep that frame as well as the 80 ms lead-in.
+            assert timing["trimmed_ms"] == (500 if trim_onset else 0)
+            assert timing["audio_s"] == pytest.approx(0.5 if trim_onset else 1.0)
         assert consumer.suppress_whole_file and not adapter._tts_streams
-        print({"streaming_tts_rtp": "production" if production else "synthetic", **timing})
+        print({"streaming_tts_rtp": "production" if production else "synthetic",
+               "trim_onset": trim_onset, **timing})
     finally:
         if consumer is not None:
             consumer.abort()

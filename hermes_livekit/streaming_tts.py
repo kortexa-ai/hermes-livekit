@@ -10,6 +10,8 @@ from typing import Any
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
 
+from .audio_onset import LeadingSilenceTrimmer
+
 logger = logging.getLogger("gateway.platforms.livekit.streaming_tts")
 OUTPUT_RATE = 48_000
 FRAME_SAMPLES = OUTPUT_RATE // 50
@@ -64,6 +66,7 @@ class AudioSinkHandle(StreamingTTSHandle):
     pending: asyncio.Task | None = None
     opened_at: float = field(default_factory=time.monotonic)
     pcm_bytes: int = 0
+    leading_silence: LeadingSilenceTrimmer | None = None
 
 
 class StreamingTTSMixin:
@@ -71,6 +74,11 @@ class StreamingTTSMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._tts_trim_leading_silence = (self.config.extra or {}).get(
+            "tts_trim_leading_silence", False,
+        )
+        if not isinstance(self._tts_trim_leading_silence, bool):
+            raise ValueError("tts_trim_leading_silence must be a boolean")
         self._tts_streams: dict[str, AudioSinkHandle] = {}
         self._tts_lifecycle_lock = asyncio.Lock()
 
@@ -96,6 +104,8 @@ class StreamingTTSMixin:
             handle = AudioSinkHandle(
                 chat_id=chat_id, audio_format=audio_format, owner=owner,
                 protocol=protocol, sink=sink, framer=PcmFramer(audio_format),
+                leading_silence=(LeadingSilenceTrimmer()
+                                 if getattr(self, "_tts_trim_leading_silence", False) else None),
             )
             self._tts_streams[chat_id] = handle
             return handle
@@ -133,14 +143,23 @@ class StreamingTTSMixin:
             if not self._tts_current(handle):
                 return
             if not handle.audible:
-                logger.info("[%s] streaming TTS first PCM: %.3fs from stream open",
-                            handle.chat_id, time.monotonic() - handle.opened_at)
+                trimmed_ms = handle.leading_silence.trimmed_frames * 20 if handle.leading_silence else 0
+                logger.info("[%s] streaming TTS first PCM: %.3fs from stream open; trimmed=%dms",
+                            handle.chat_id, time.monotonic() - handle.opened_at, trimmed_ms)
             handle.audible = True
             handle.pcm_bytes += len(pcm)
 
     async def write_streaming_tts(self, handle, chunk):
         if self._tts_current(handle):
-            await self._write_tts_frames(handle, handle.framer.feed(chunk))
+            await self._write_tts_frames(handle, self._tts_frames(handle, handle.framer.feed(chunk)))
+
+    def _tts_frames(self, handle, frames, *, final=False):
+        if handle.leading_silence is None:
+            yield from frames
+            return
+        yield from handle.leading_silence.feed(frames)
+        if final:
+            yield from handle.leading_silence.finish()
 
     async def finish_streaming_tts(self, handle, *, interrupted=False):
         if interrupted:
@@ -148,7 +167,7 @@ class StreamingTTSMixin:
             return
         if not self._tts_current(handle):
             return
-        await self._write_tts_frames(handle, handle.framer.finish())
+        await self._write_tts_frames(handle, self._tts_frames(handle, handle.framer.finish(), final=True))
         if not self._tts_current(handle):
             return
         await asyncio.wait_for(self._tts_drain(handle), timeout=SINK_TIMEOUT)
@@ -174,6 +193,8 @@ class StreamingTTSMixin:
         if handle.finished:
             return
         handle.aborted = True
+        if handle.leading_silence is not None:
+            handle.leading_silence.discard()
         if handle.pending is not None:
             handle.pending.cancel()
             await asyncio.gather(handle.pending, return_exceptions=True)
