@@ -2654,7 +2654,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         if protocol is None or event.source.chat_id != self._room_name:
             return
         await protocol.processing_started()
-        event._hermes_realtime_response = (protocol, protocol.active_response_id)
+        event._hermes_realtime_response = (protocol, protocol.processing_turn_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Finish turns that deliver only audio, fail, or are cancelled by Hermes."""
@@ -2664,7 +2664,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         # An old Hermes task can finish after a replacement response has
         # started. Its cleanup must not complete or cancel that newer reply.
         if getattr(event, "_hermes_realtime_response", None) != (
-            protocol, protocol.active_response_id
+            protocol, protocol.processing_turn_id
         ):
             return
         if outcome == ProcessingOutcome.CANCELLED:

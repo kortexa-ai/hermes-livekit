@@ -969,7 +969,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         if call is None:
             return
         await call.protocol.processing_started()
-        event._hermes_realtime_response = (call.protocol, call.protocol.active_response_id)
+        event._hermes_realtime_response = (call.protocol, call.protocol.processing_turn_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Finish turns that deliver only audio, fail, or are cancelled by Hermes."""
@@ -977,7 +977,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         if call is None:
             return
         if getattr(event, "_hermes_realtime_response", None) != (
-            call.protocol, call.protocol.active_response_id
+            call.protocol, call.protocol.processing_turn_id
         ):
             return
         if outcome == ProcessingOutcome.CANCELLED:

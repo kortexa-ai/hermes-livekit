@@ -80,7 +80,7 @@ class RealtimeProtocol:
         self._pending_text_inputs: dict[str, str] = {}
         self._clients: set[str] = set()
         self._active_response_id: str | None = None
-        self._processing_response_id: str | None = None
+        self._processing_turn_id: object | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
         self._transcript_turn_id: str | None = None
@@ -97,6 +97,10 @@ class RealtimeProtocol:
     @property
     def active_response_id(self) -> str | None:
         return self._active_response_id
+
+    @property
+    def processing_turn_id(self) -> object | None:
+        return self._processing_turn_id
 
     async def client_connected(self, identity: str) -> None:
         if self._closed or not identity or identity in self._clients:
@@ -358,7 +362,6 @@ class RealtimeProtocol:
         self._active_response_id = f"resp_{self.session_id}_{self._response_sequence}"
         self._active_output_item_id = None
         self._active_transcript = None
-        self._transcript_turn_id = None
         self._output_item_announced = False
         await self._emit(
             {
@@ -377,13 +380,14 @@ class RealtimeProtocol:
 
     async def processing_started(self) -> None:
         await self.response_started()
-        self._processing_response_id = self._active_response_id
+        if self._active_response_id:
+            self._processing_turn_id = object()
 
     async def text_delivery_complete(self) -> None:
         # Notices and interim messages use the same adapter.send() as final
         # text. Only the base processing hook knows when that turn is finished.
         # Standalone sends (for example an idle slash command) still complete.
-        if self._processing_response_id != self._active_response_id:
+        if self._processing_turn_id is None:
             await self.output_stopped()
 
     async def stream_transcript(self, transcript: str, *, turn_id: str, finalize: bool = False) -> None:
@@ -541,6 +545,7 @@ class RealtimeProtocol:
         })
         await self._complete_response(
             "completed",
+            continue_processing=True,
             explicit_output=[{
                 "id": item_id,
                 "type": "function_call",
@@ -583,7 +588,8 @@ class RealtimeProtocol:
         self._input_items.clear()
         self._pending_text_inputs.clear()
         self._active_response_id = None
-        self._processing_response_id = None
+        self._processing_turn_id = None
+        self._transcript_turn_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False
@@ -717,6 +723,7 @@ class RealtimeProtocol:
         status: str,
         *,
         explicit_output: list[dict[str, Any]] | None = None,
+        continue_processing: bool = False,
     ) -> None:
         response_id = self._active_response_id
         if not response_id:
@@ -733,7 +740,11 @@ class RealtimeProtocol:
                 }
             )
         self._active_response_id = None
-        self._processing_response_id = None
+        # A client function call seals one wire response, not the Hermes turn.
+        # Its result resumes the same text consumer and processing-complete hook.
+        if not continue_processing:
+            self._processing_turn_id = None
+            self._transcript_turn_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False
