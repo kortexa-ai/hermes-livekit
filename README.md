@@ -292,7 +292,7 @@ uv run --no-project --no-build \
 
 It fetches profile credentials over passwordless SSH into memory, synthesizes
 one fixed question, and sends a real voice turn through ASR, Hermes, and TTS.
-Choose `--case greeting`, `fact`, or `calculation`. The session requests no tools,
+Choose `--case greeting`, `fact`, `calculation`, or `first_sentence`. The session requests no tools,
 but that does not disable Hermes's own tools: inspect gateway API counts before
 treating any case as a single model request.
 The probe rejects split or premature endpoint detections instead of reporting
@@ -319,6 +319,18 @@ the measured latency. Correlate these identities with the opt-in gateway metrics
 to distinguish fresh-call prompt-cache misses from warm-session model time.
 Repeated requests share conversation history, so later answers can differ;
 this measures the conversation path, not identical model inputs or pure prefill.
+Native transcript frames add `caption_after_speech_s`, `caption_to_audio_event_s`
+and `caption_to_audible_rtp_s`. These use the first nonempty incremental frame
+or full-snapshot replacement for the answer's response ID. Empty frames,
+final-only setup notices and other responses do not start this clock. Older
+transports without these frames omit the fields. These are client receipt times,
+not the provider's first-token timestamps; a negative caption-to-audio interval
+means that audio started before the caption arrived.
+The `first_sentence` case requests a fixed two-sentence answer starting with
+“Yes.” and rejects a different final answer. Use it to measure the delay from
+buffering a short opening sentence into the next one. Its instructions belong
+only to the isolated test call; it does not change Mira's profile or speech
+chunking settings. Timing and text preservation do not establish voice quality.
 It neither captures the microphone nor plays audio. The configuration host
 must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
 the speech fixture expects the configured service's 24 kHz mono PCM format.

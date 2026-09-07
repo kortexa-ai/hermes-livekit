@@ -29,6 +29,15 @@ def test_default_avoids_calculation_and_retains_old_fixture(probe_module):
     assert probe_module.PROMPTS["calculation"] == probe_module.PROMPT
 
 
+def test_short_opening_case_binds_instructions_and_expected_answer(probe_module):
+    args = probe_module.parse_args(["--case", "first_sentence"])
+    options = probe_module.case_options(args.case)
+    assert options["prompt"] == probe_module.PROMPTS[args.case]
+    assert options["expected_answer"].startswith("Yes. ")
+    assert options["expected_answer"] in options["instructions"]
+    assert "expected_answer" not in probe_module.case_options("fact")
+
+
 def test_unknown_case_rejected(probe_module):
     with pytest.raises(SystemExit):
         probe_module.parse_args(["--case", "unknown"])
@@ -151,10 +160,47 @@ def test_voice_turn_correlates_completion_and_rejects_early_audio(probe_module, 
         with pytest.raises(RuntimeError, match="discard timings"):
             turn.result(last_voice_at=1.0, fixture_complete=True)
     else:
-        result = turn.result(last_voice_at=1.0, fixture_complete=True)
+        result = turn.result(last_voice_at=1.0, fixture_complete=True, expected_answer="current answer")
         assert result["response_id"] == "current"
         assert result["audible_rtp_after_speech_s"] == 2.1
         assert result["response_count"] == result["audio_response_count"] == 1
+        with pytest.raises(RuntimeError, match="Fixed-answer fixture"):
+            turn.result(last_voice_at=1.0, fixture_complete=True, expected_answer="different answer")
+
+
+@pytest.mark.parametrize("caption", [
+    {"delta": "Yes."}, {"delta": "", "transcript": "Yes."}, None,
+])
+def test_caption_metrics_use_nonempty_current_response_frames(probe_module, caption):
+    turn = probe_module.VoiceTurn(ignored_response_ids={"previous"})
+    delta = {"type": "response.output_audio_transcript.delta", "response_id": "current"}
+    turn.accept({**delta, "response_id": "previous", "delta": "Old"}, 0.1)
+    turn.accept({**delta, "response_id": "notice", "delta": "Unrelated"}, 0.2)
+    turn.accept({**delta, "delta": ""}, 0.3)
+    turn.accept({**delta, "delta": "ignored", "transcript": ""}, 0.4)
+    turn.accept({"type": "response.output_audio_transcript.done", "response_id": "current",
+                 "transcript": "First-contact setup notice"}, 0.5)
+    turn.accept({"type": "input_audio_buffer.speech_stopped"}, 1.7)
+    turn.accept({"type": "conversation.item.input_audio_transcription.completed"}, 1.8)
+    if caption is not None:
+        turn.accept({**delta, **caption}, 2.0)
+        turn.accept({**delta, "delta": " More text."}, 2.3)
+    turn.accept({"type": "output_audio_buffer.started", "response_id": "current"}, 3.0)
+    turn.accept_audio(3.2)
+    response = completed("Yes. More text.")
+    response["response"]["id"] = "current"
+    turn.accept(response, 4.0)
+    result = turn.result(last_voice_at=1.0, fixture_complete=True)
+    if caption is None:
+        assert "caption_after_speech_s" not in result
+        assert "caption_to_audio_event_s" not in result
+    else:
+        assert result["caption_after_speech_s"] == 1.0
+        assert result["caption_to_audio_event_s"] == 1.0
+        assert result["caption_to_audible_rtp_s"] == 1.2
+        turn.caption_times["current"] = 0.9
+        with pytest.raises(RuntimeError, match="caption preceded"):
+            turn.result(last_voice_at=1.0, fixture_complete=True)
 
 
 @pytest.mark.asyncio

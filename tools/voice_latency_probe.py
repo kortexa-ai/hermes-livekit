@@ -28,11 +28,29 @@ from av import AudioFrame, AudioResampler
 RATE = 48000
 SAMPLES = 960
 PROMPT = "Please tell me what two plus two equals in one short sentence."
+DEFAULT_INSTRUCTIONS = "This is a voice latency check. Reply with one short sentence and do not use tools."
+FIRST_SENTENCE_ANSWER = (
+    "Yes. Streaming speech begins playback before the whole answer is ready, "
+    "so the conversation can feel faster without waiting for a long response to finish."
+)
 PROMPTS = {
     "greeting": "Please greet me in one short sentence, Hermes.",
     "fact": "Please tell me the color of a clear daytime sky in one short sentence.",
     "calculation": PROMPT,
+    "first_sentence": "Please explain the benefit of streaming speech.",
 }
+
+
+def case_options(case: str) -> dict:
+    options = {"prompt": PROMPTS[case]}
+    if case == "first_sentence":
+        options.update(
+            instructions=("For this isolated latency check, answer the user's spoken question "
+                          "with exactly the following text, including both sentences. "
+                          "Do not use tools: " + FIRST_SENTENCE_ANSWER),
+            expected_answer=FIRST_SENTENCE_ANSWER,
+        )
+    return options
 
 
 def completion_text(response: dict) -> str:
@@ -180,6 +198,7 @@ class VoiceTurn:
 
     def __init__(self, *, ignored_response_ids=()):
         self.events, self.times = [], {}
+        self.caption_times = {}
         self.audio_response_ids = set()
         self.ignored_response_ids = set(ignored_response_ids)
         self.done = asyncio.Event()
@@ -192,6 +211,12 @@ class VoiceTurn:
             return
         self.events.append(event)
         self.times.setdefault(kind, now)
+        if kind == "response.output_audio_transcript.delta" and isinstance(response_id, str):
+            # A native frame can replace a draft with a full snapshot and an
+            # empty delta. Ignore empty frames and final-only setup notices.
+            caption = event.get("transcript", event.get("delta"))
+            if isinstance(caption, str) and caption.strip():
+                self.caption_times.setdefault(response_id, now)
         if kind == "output_audio_buffer.started":
             self.audio_response_ids.add(response_id)
         # First-contact notices are text-only, not completion of the voice answer.
@@ -204,7 +229,8 @@ class VoiceTurn:
     def accept_audio(self, now):
         self.times.setdefault("first_audible_rtp", now)
 
-    def result(self, *, last_voice_at, fixture_complete, reasoning="profile", show_answer=False):
+    def result(self, *, last_voice_at, fixture_complete, reasoning="profile", show_answer=False,
+               expected_answer=None):
         if any(e.get("type") == "error" for e in self.events):
             raise RuntimeError("Gateway emitted a protocol error")
         if self.completion is None or self.completion.get("status") != "completed":
@@ -229,7 +255,17 @@ class VoiceTurn:
         result["response_count"] = sum(e.get("type") == "response.done" for e in self.events)
         result["audio_response_count"] = len(self.audio_response_ids)
         result["reasoning"] = reasoning
+        if (caption_at := self.caption_times.get(self.completion["id"])) is not None:
+            if caption_at < last_voice_at:
+                raise RuntimeError("Response caption preceded the end of speech; discard timings")
+            result.update(
+                caption_after_speech_s=round(caption_at - last_voice_at, 3),
+                caption_to_audio_event_s=round(self.times["output_audio_buffer.started"] - caption_at, 3),
+                caption_to_audible_rtp_s=round(self.times["first_audible_rtp"] - caption_at, 3),
+            )
         answer = completion_text(self.completion)
+        if expected_answer is not None and answer != expected_answer:
+            raise RuntimeError("Fixed-answer fixture was not followed; discard timings")
         result["answer_word_count"] = len(answer.split())
         if show_answer:
             result["answer"] = answer
@@ -237,7 +273,8 @@ class VoiceTurn:
 
 
 async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
-                reasoning: str = "profile", show_answer: bool = False, turns: int = 1) -> dict:
+                reasoning: str = "profile", show_answer: bool = False, turns: int = 1,
+                instructions: str = DEFAULT_INSTRUCTIONS, expected_answer: str | None = None) -> dict:
     if type(turns) is not int or not 1 <= turns <= 10:
         raise ValueError("turns must be an integer from 1 to 10")
     audio_tasks = []
@@ -294,7 +331,7 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
             form.add_field("sdp", peer.localDescription.sdp)
             form.add_field("session", json.dumps({
                 "type": "realtime", "tools": [], "tool_choice": "none",
-                "instructions": "This is a voice latency check. Reply with one short sentence and do not use tools.",
+                "instructions": instructions,
             }))
             async with http.post(gateway + "/v1/realtime/calls", data=form, headers=headers) as response:
                 if response.status != 201:
@@ -317,7 +354,7 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
                 results.append({"turn": index + 1, **measurement.result(
                     last_voice_at=microphone.last_voice_at,
                     fixture_complete=microphone.index == len(microphone.chunks),
-                    reasoning=reasoning, show_answer=show_answer,
+                    reasoning=reasoning, show_answer=show_answer, expected_answer=expected_answer,
                 )})
                 previous_responses.update(
                     e["response"]["id"] for e in measurement.events
@@ -359,7 +396,7 @@ def parse_args(argv=None):
 def main():
     args = parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
-    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, prompt=PROMPTS[args.case],
+    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, **case_options(args.case),
                               reasoning=args.reasoning, show_answer=args.show_answer, turns=args.turns))
     print(json.dumps({"case": args.case, **result}, sort_keys=True))
 
