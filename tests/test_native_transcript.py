@@ -34,6 +34,49 @@ def endpoint(kind):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("override", [None, True])
+async def test_runner_routes_text_only_when_profile_streaming_policy_enables_it(kind, override):
+    from gateway.config import StreamingConfig
+    from gateway.display_config import resolve_display_setting
+    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run_turn_runner import TurnRunner
+
+    adapter, protocol, events, updated = endpoint(kind)
+    await protocol.response_started()
+    source = SimpleNamespace(platform=kind, chat_id="chat", chat_type="dm")
+    user_config = {"display": {"streaming": False, "platforms": {kind: {"streaming": override}}}}
+    runner = SimpleNamespace(config=SimpleNamespace(streaming=StreamingConfig(
+        enabled=False, edit_interval=0.01, buffer_threshold=1,
+    )), _adapter_for_source=lambda source: adapter)
+    runner._build_stream_consumer_config = lambda *args, **kwargs: GatewayTurnMixin._build_stream_consumer_config(
+        runner, *args, **kwargs,
+    )
+    ctx = SimpleNamespace(
+        source=source, streaming_tts_consumer_holder=[None],
+        resolve_display_setting=resolve_display_setting, user_config=user_config,
+        interim_assistant_messages_enabled=True, _status_thread_metadata=None,
+        progress_queue=None, stream_consumer_holder=[None], event_message_id="user",
+        _run_still_current=lambda: True,
+    )
+    consumer, callback, _, _ = TurnRunner(runner, ctx)._setup_stream_consumer(kind)
+    assert consumer is not None  # Interim-message capability alone is not text streaming.
+    if override is None:
+        assert callback is None
+        return
+    task = asyncio.create_task(consumer.run())
+    try:
+        callback("Actual runner delta")
+        await asyncio.wait_for(updated.wait(), 3)
+        assert events[-1]["delta"] == "Actual runner delta"
+        consumer.finish("Actual runner delta")
+        await asyncio.wait_for(task, 3)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
 async def test_actual_consumer_streams_and_finishes_text_without_finishing_audio(kind, tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     adapter, protocol, events, updated = endpoint(kind)
