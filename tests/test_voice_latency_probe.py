@@ -1,6 +1,8 @@
 """Offline probe case selection; no credentials or network used."""
 
 import importlib.util
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -54,3 +56,72 @@ def test_split_or_premature_turns_are_not_reported_as_latency(
 def test_missing_transcript_rejected(probe_module):
     with pytest.raises(RuntimeError, match="discard timings"):
         probe_module.validate_single_turn([], {}, 1.0)
+
+
+def completed(text, *, status="completed"):
+    return {"type": "response.done", "response": {"status": status, "output": [{
+        "type": "message", "role": "assistant", "content": [{
+            "type": "output_audio", "transcript": text,
+        }],
+    }]}}
+
+
+@pytest.mark.parametrize("effort", ["low", "medium"])
+@pytest.mark.asyncio
+async def test_reasoning_command_is_session_only_and_confirmed(probe_module, effort):
+    sent = []
+
+    class Channel:
+        def send(self, raw):
+            sent.append(json.loads(raw))
+
+    setup = probe_module.ReasoningSetup(effort)
+    setup.send(Channel())
+    assert sent[0]["item"]["content"] == [{"type": "input_text", "text": f"/reasoning {effort}"}]
+    assert sent[1] == {"type": "response.create"}
+    setup.accept(completed("Use /sethome to choose a home channel"))
+    assert not setup.done.is_set()
+    setup.accept(completed(f"🧠 ✓ Reasoning effort set to `{effort}` (session only — add --global to persist)"))
+    await setup.wait()
+
+
+@pytest.mark.parametrize("effort", ["none", "high", "low --global", "--global medium", ""])
+def test_only_bounded_test_efforts_are_accepted(probe_module, effort):
+    with pytest.raises(ValueError):
+        probe_module.ReasoningSetup(effort)
+
+
+@pytest.mark.parametrize("response", [
+    {"type": "error"}, {"type": "output_audio_buffer.started"},
+    completed("Reasoning effort set to `low` (saved to config)"),
+    completed("Reasoning effort set to `medium` (session only)"),
+    completed("Reasoning effort set to `low` (session only)", status="failed"),
+])
+@pytest.mark.asyncio
+async def test_unconfirmed_scope_or_setup_errors_fail(probe_module, response):
+    setup = probe_module.ReasoningSetup("low")
+    setup.accept(response)
+    with pytest.raises(RuntimeError):
+        await setup.wait()
+
+
+@pytest.mark.asyncio
+async def test_missing_confirmation_times_out(probe_module):
+    setup = probe_module.ReasoningSetup("low")
+    setup.accept(completed("Unrelated response"))
+    with pytest.raises(asyncio.TimeoutError):
+        await setup.wait(timeout=0.01)
+
+
+def test_bounded_answer_excludes_reasoning(probe_module):
+    response = completed("x" * 600)["response"]
+    response["output"].insert(0, {"type": "reasoning", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": "private"}]})
+    assert probe_module.completion_text(response) == "x" * 500
+
+
+def test_reasoning_and_answer_output_are_opt_in(probe_module):
+    args = probe_module.parse_args([])
+    assert args.reasoning == "profile" and not args.show_answer
+    args = probe_module.parse_args(["--reasoning", "low", "--show-answer"])
+    assert args.reasoning == "low" and args.show_answer

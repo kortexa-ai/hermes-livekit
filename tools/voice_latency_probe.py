@@ -34,6 +34,59 @@ PROMPTS = {
 }
 
 
+def completion_text(response: dict) -> str:
+    """Bounded text from this test call's completed response, never reasoning."""
+    parts = []
+    for item in response.get("output", []):
+        if item.get("type") != "message" or item.get("role") != "assistant":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") not in {"output_audio", "output_text"}:
+                continue
+            value = content.get("transcript") or content.get("text")
+            if isinstance(value, str):
+                parts.append(value[:500])
+    return " ".join(parts)[:500]
+
+
+class ReasoningSetup:
+    """Session-only native command, confirmed before any measured speech is sent."""
+
+    def __init__(self, effort: str):
+        if effort not in {"low", "medium"}:
+            raise ValueError("Only low and medium test overrides are allowed")
+        self.effort = effort
+        self.done = asyncio.Event()
+        self.error = None
+
+    def send(self, channel):
+        channel.send(json.dumps({"type": "conversation.item.create", "item": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": f"/reasoning {self.effort}"}],
+        }}))
+        channel.send(json.dumps({"type": "response.create"}))
+
+    def accept(self, event):
+        if event.get("type") in {"error", "output_audio_buffer.started"}:
+            self.error = "Reasoning setup failed or produced unexpected audio"
+            self.done.set()
+        if event.get("type") == "response.done":
+            response = event.get("response", {})
+            text = completion_text(response)
+            expected = f"Reasoning effort set to `{self.effort}` (session only"
+            # Ignore unrelated first-contact notices. Fail closed if the server
+            # reports a different scope, setting, or failed command response.
+            if "Reasoning effort set to" in text:
+                if expected not in text or response.get("status") != "completed":
+                    self.error = "Gateway did not confirm the requested session-only reasoning setting"
+                self.done.set()
+
+    async def wait(self, timeout=15):
+        await asyncio.wait_for(self.done.wait(), timeout)
+        if self.error:
+            raise RuntimeError(self.error)
+
+
 def profile_credentials(host: str, profile: str) -> dict:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", profile) or host.startswith("-"):
         raise ValueError("Invalid profile or SSH host")
@@ -113,10 +166,12 @@ def validate_single_turn(events: list, times: dict, last_voice_at: float) -> Non
             raise RuntimeError("Probe endpoint preceded the end of the spoken fixture; discard timings")
 
 
-async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dict:
+async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT,
+                reasoning: str = "profile", show_answer: bool = False) -> dict:
     events, times, audio_tasks = [], {}, []
     audio_response_ids = set()
     ready, done = asyncio.Event(), asyncio.Event()
+    setup = None if reasoning == "profile" else ReasoningSetup(reasoning)
     peer = RTCPeerConnection(RTCConfiguration(iceServers=[]))
     microphone = None
     location = None
@@ -136,11 +191,14 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dic
             @channel.on("message")
             def event(raw):
                 value = json.loads(raw)
-                events.append(value)
                 kind = value.get("type")
-                times.setdefault(kind, time.monotonic())
                 if kind == "session.created":
                     ready.set()
+                if setup is not None:
+                    setup.accept(value)
+                    return
+                events.append(value)
+                times.setdefault(kind, time.monotonic())
                 if kind == "output_audio_buffer.started":
                     audio_response_ids.add(value.get("response_id"))
                 # First-contact notices (e.g. /sethome guidance) are separate
@@ -174,6 +232,11 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dic
                 location = response.headers.get("Location")
                 await peer.setRemoteDescription(RTCSessionDescription(sdp=await response.text(), type="answer"))
             await asyncio.wait_for(ready.wait(), 15)
+            if setup is not None:
+                setup.send(channel)
+                await setup.wait()
+                setup = None
+                times.clear()  # Do not mix command/setup timing with speech timing.
             await asyncio.sleep(1)  # Calibrate on synthetic RMS-150 room noise first.
             microphone.started = True
             await asyncio.wait_for(done.wait(), 90)
@@ -200,6 +263,11 @@ async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dic
                     result[label + "_after_speech_s"] = round(times[event_name] - microphone.last_voice_at, 3)
             result["response_count"] = sum(e.get("type") == "response.done" for e in events)
             result["audio_response_count"] = len(audio_response_ids)
+            result["reasoning"] = reasoning
+            answer = completion_text(completion["response"])
+            result["answer_word_count"] = len(answer.split())
+            if show_answer:
+                result["answer"] = answer
             return result
     finally:
         if microphone is not None:
@@ -217,13 +285,18 @@ def parse_args(argv=None):
     parser.add_argument("--profile", default="mira")
     parser.add_argument("--case", choices=PROMPTS, default="greeting",
                         help="Keep simple replies separate from calculation/tool round trips")
+    parser.add_argument("--reasoning", choices=("profile", "medium", "low"), default="profile",
+                        help="Optional override in this isolated call only; never changes profile config")
+    parser.add_argument("--show-answer", action="store_true",
+                        help="Include up to 500 characters of the fixture's answer for manual review")
     return parser.parse_args(argv)
 
 
 def main():
     args = parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
-    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, prompt=PROMPTS[args.case]))
+    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, prompt=PROMPTS[args.case],
+                              reasoning=args.reasoning, show_answer=args.show_answer))
     print(json.dumps({"case": args.case, **result}, sort_keys=True))
 
 

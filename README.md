@@ -274,6 +274,16 @@ treating any case as a single model request.
 The probe rejects split or premature endpoint detections instead of reporting
 latency for mixed turns. Keep failed samples when evaluating endpoint quality;
 do not treat them as valid latency results.
+To compare reasoning effort on the same model, add `--reasoning medium` or
+`--reasoning low`. The probe sends Hermes's native session-only `/reasoning`
+command in its own new call and waits for an English acknowledgement before
+speaking. It never sends `--global`, changes the kiosk call, or changes the model
+or service tier. Command errors, unexpected audio and missing acknowledgements
+fail the probe. The default `--reasoning profile` sends no command. Add
+`--show-answer` to include at most 500 characters of the fixture answer for
+manual review; otherwise only its word count is reported. Counterbalance effort
+order and compare several serial runs. These simple questions do not establish
+general reasoning/tool quality, so do not promote a default from timing alone.
 It neither captures the microphone nor plays audio. The configuration host
 must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
 the speech fixture expects the configured service's 24 kHz mono PCM format.
