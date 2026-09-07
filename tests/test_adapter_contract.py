@@ -110,15 +110,28 @@ async def test_livekit_send_voice_uses_native_audio_track():
 
 @pytest.mark.asyncio
 async def test_livekit_send_completes_transcript_response():
+    from hermes_livekit.realtime_protocol import RealtimeProtocol
+
+    events = []
+
+    async def publish(event, recipient):
+        events.append(event)
+        return True
+
     adapter = object.__new__(LiveKitAdapter)
     adapter._room = object()
-    adapter._realtime_protocol = AsyncMock()
+    adapter._realtime_protocol = RealtimeProtocol(
+        session_id="standalone", model="test", voice="test", publish=publish,
+    )
 
     result = await adapter.send(chat_id="room", content="hello")
 
     assert result.success is True
-    adapter._realtime_protocol.assistant_transcript.assert_awaited_once_with("hello")
-    adapter._realtime_protocol.output_stopped.assert_awaited_once_with()
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert len(done) == 1
+    assert done[0]["status"] == "completed"
+    assert done[0]["output"][0]["content"][0]["transcript"] == "hello"
+    assert adapter._realtime_protocol.active_response_id is None
 
 
 @pytest.mark.asyncio

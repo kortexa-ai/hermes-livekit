@@ -80,8 +80,10 @@ class RealtimeProtocol:
         self._pending_text_inputs: dict[str, str] = {}
         self._clients: set[str] = set()
         self._active_response_id: str | None = None
+        self._processing_turn_id: object | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
+        self._transcript_turn_id: str | None = None
         self._output_item_announced = False
         self._speaking = False
         self._pending_tool: dict[str, Any] | None = None
@@ -95,6 +97,10 @@ class RealtimeProtocol:
     @property
     def active_response_id(self) -> str | None:
         return self._active_response_id
+
+    @property
+    def processing_turn_id(self) -> object | None:
+        return self._processing_turn_id
 
     async def client_connected(self, identity: str) -> None:
         if self._closed or not identity or identity in self._clients:
@@ -372,18 +378,72 @@ class RealtimeProtocol:
             await self._announce_audio_output_item()
         await self._emit({"type": "output_audio_buffer.started", "response_id": self._active_response_id})
 
+    async def processing_started(self) -> None:
+        await self.response_started()
+        if self._active_response_id:
+            self._processing_turn_id = object()
+
+    async def text_delivery_complete(self) -> None:
+        # Notices and interim messages use the same adapter.send() as final
+        # text. Only the base processing hook knows when that turn is finished.
+        # Standalone sends (for example an idle slash command) still complete.
+        if self._processing_turn_id is None:
+            await self.output_stopped()
+
+    async def stream_transcript(self, transcript: str, *, turn_id: str, finalize: bool = False) -> None:
+        """Bind the consumer's seed to this response; drop late/replaced frames.
+
+        Text completion does not stop audio or complete the response. The TTS
+        sink and processing lifecycle still own those transitions.
+        """
+        if self._closed or not self._active_response_id or not turn_id:
+            return
+        if not transcript and not finalize:
+            self._transcript_turn_id = self._transcript_turn_id or turn_id
+            return
+        if turn_id != self._transcript_turn_id:
+            return
+        if finalize:
+            await self.assistant_transcript(transcript)
+            return
+        previous = self._active_transcript or ""
+        if transcript == previous:
+            return
+        self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
+        self._active_transcript = transcript
+        response_id, item_id = self._active_response_id, self._active_output_item_id
+        await self._announce_audio_output_item()
+        if self._active_response_id != response_id or self._transcript_turn_id != turn_id:
+            return
+        event = {
+            "type": "response.output_audio_transcript.delta",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": transcript[len(previous):] if transcript.startswith(previous) else "",
+        }
+        if not transcript.startswith(previous):
+            # Native frames are snapshots: tool boundaries or display cleanup
+            # can revise a draft. This extension lets clients replace it safely.
+            event["transcript"] = transcript
+        await self._emit(event)
+
     async def assistant_transcript(self, transcript: str) -> None:
         await self.response_started()
         if not self._active_response_id:
             return
         self._active_output_item_id = self._active_output_item_id or f"item_{self._active_response_id}_audio"
         self._active_transcript = transcript
+        response_id, item_id = self._active_response_id, self._active_output_item_id
         await self._announce_audio_output_item()
+        if self._active_response_id != response_id:
+            return
         await self._emit(
             {
                 "type": "response.output_audio_transcript.done",
-                "response_id": self._active_response_id,
-                "item_id": self._active_output_item_id,
+                "response_id": response_id,
+                "item_id": item_id,
                 "output_index": 0,
                 "content_index": 0,
                 "transcript": transcript,
@@ -485,6 +545,7 @@ class RealtimeProtocol:
         })
         await self._complete_response(
             "completed",
+            continue_processing=True,
             explicit_output=[{
                 "id": item_id,
                 "type": "function_call",
@@ -527,6 +588,8 @@ class RealtimeProtocol:
         self._input_items.clear()
         self._pending_text_inputs.clear()
         self._active_response_id = None
+        self._processing_turn_id = None
+        self._transcript_turn_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False
@@ -660,8 +723,15 @@ class RealtimeProtocol:
         status: str,
         *,
         explicit_output: list[dict[str, Any]] | None = None,
+        continue_processing: bool = False,
     ) -> None:
         response_id = self._active_response_id
+        # A client function call seals one wire response, not the Hermes turn.
+        # Its result resumes the same text consumer and processing-complete hook.
+        # Clear failed/cancelled ownership even while waiting between responses.
+        if not continue_processing:
+            self._processing_turn_id = None
+            self._transcript_turn_id = None
         if not response_id:
             return
         output: list[dict[str, Any]] = list(explicit_output or [])
@@ -713,18 +783,23 @@ class RealtimeProtocol:
         item = self._audio_output_item("in_progress")
         if item is None:
             return
+        response_id, item_id = self._active_response_id, self._active_output_item_id
         self._output_item_announced = True
         await self._emit({
             "type": "response.output_item.added",
-            "response_id": self._active_response_id,
+            "response_id": response_id,
             "output_index": 0,
             "item": item,
         })
+        if self._active_response_id != response_id:
+            return
         await self._emit({"type": "conversation.item.added", "previous_item_id": None, "item": item})
+        if self._active_response_id != response_id:
+            return
         await self._emit({
             "type": "response.content_part.added",
-            "response_id": self._active_response_id,
-            "item_id": self._active_output_item_id,
+            "response_id": response_id,
+            "item_id": item_id,
             "output_index": 0,
             "content_index": 0,
             "part": {"type": "output_audio", "transcript": ""},

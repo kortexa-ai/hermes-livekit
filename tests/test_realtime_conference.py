@@ -369,6 +369,7 @@ async def test_old_processing_hook_does_not_finish_newer_response():
     event = SimpleNamespace(source=SimpleNamespace(chat_id="room-a"))
     await adapter.on_processing_start(event)
     await adapter.send("room-a", "first")
+    await adapter._realtime_protocol.response_cancelled()
     await adapter._realtime_protocol.response_started()
     new_id = adapter._realtime_protocol.active_response_id
     await adapter.on_processing_complete(event, ProcessingOutcome.CANCELLED)

@@ -383,9 +383,29 @@ joins. Room lifecycle events are broadcast:
 - `response.created` / `response.done`
 - `response.output_item.added` / `response.output_item.done`
 - `response.content_part.added` / `response.content_part.done`
-- `response.output_audio_transcript.done`
+- `response.output_audio_transcript.delta` / `.done`
 - `output_audio_buffer.started` / `stopped` / `cleared`
 - correlated `error` events
+
+When Hermes text streaming is enabled, captions arrive during generation,
+independently of audio. Append `delta` to the item identified by `item_id`;
+if a delta event includes the optional `transcript` snapshot, replace that
+item's draft instead (native text can be revised at a tool boundary). The
+final `.done` transcript replaces the draft, not a second message. Neither
+text update nor text completion indicates that audio playback has stopped.
+
+The adapter capability does not override a profile's disabled text-streaming
+policy. Enable only the voice platforms when other clients should stay final-only:
+
+```sh
+hermes --profile mira config set display.platforms.realtime.streaming true
+hermes --profile mira config set display.platforms.livekit.streaming true
+```
+
+Restart that profile's gateway after changing its configuration. The top-level
+`streaming.enabled` can remain false; `display.streaming` controls the CLI,
+not gateway delivery. A consumer created for interim messages alone does not
+receive model text deltas. Qualify a real voice turn, not just adapter methods.
 
 Clients send supported Realtime events on the same topic. Typed input uses a
 normal user conversation item:

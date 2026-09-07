@@ -72,6 +72,7 @@ from .vad import AdaptiveRmsGate, configured_silence_duration
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
                     transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import RealtimeStreamingTTSMixin
+from .native_transcript import NativeTranscriptMixin
 
 
 logger = logging.getLogger("gateway.platforms.realtime")
@@ -461,7 +462,7 @@ class RealtimeCall:
             pass
 
 
-class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
+class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, BasePlatformAdapter):
     """Hermes platform serving direct OpenAI-compatible WebRTC calls."""
 
     # An active call is a persistent outbound channel: Hermes may inject a
@@ -899,7 +900,7 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         if call is None:
             return SendResult(success=False, error="Realtime call is closed")
         await call.protocol.assistant_transcript(content)
-        await call.protocol.output_stopped()
+        await call.protocol.text_delivery_complete()
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def play_tts(
@@ -967,8 +968,8 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         call = self._calls.get(event.source.chat_id)
         if call is None:
             return
-        await call.protocol.response_started()
-        event._hermes_realtime_response = (call.protocol, call.protocol.active_response_id)
+        await call.protocol.processing_started()
+        event._hermes_realtime_response = (call.protocol, call.protocol.processing_turn_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Finish turns that deliver only audio, fail, or are cancelled by Hermes."""
@@ -976,7 +977,7 @@ class RealtimeWebRTCAdapter(RealtimeStreamingTTSMixin, BasePlatformAdapter):
         if call is None:
             return
         if getattr(event, "_hermes_realtime_response", None) != (
-            call.protocol, call.protocol.active_response_id
+            call.protocol, call.protocol.processing_turn_id
         ):
             return
         if outcome == ProcessingOutcome.CANCELLED:

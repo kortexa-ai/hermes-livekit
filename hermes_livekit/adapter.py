@@ -101,6 +101,7 @@ from .vad import AdaptiveRmsGate, DEFAULT_SILENCE_DURATION, configured_silence_d
 from .media import (EarlyTranscription, configured_asr_prefetch, pcm_rms,
                     transcribe_pcm, transcribe_with_prefetch)
 from .streaming_tts import LiveKitStreamingTTSMixin
+from .native_transcript import NativeTranscriptMixin
 
 # Use the ``gateway.platforms.livekit`` namespace rather than ``__name__``.
 # Hermes core's gateway.log handler installs a component filter that only
@@ -195,7 +196,7 @@ def check_livekit_requirements() -> bool:
     return LIVEKIT_AVAILABLE and LIVEKIT_API_AVAILABLE
 
 
-class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
+class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatformAdapter):
     """LiveKit voice adapter using WebRTC.
 
     Joins a LiveKit room, captures participant audio, transcribes to text,
@@ -2467,7 +2468,7 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
                 "agent:agent-transcript", {"transcript": content, "final": True}
             )
             if self._realtime_protocol:
-                await self._realtime_protocol.output_stopped()
+                await self._realtime_protocol.text_delivery_complete()
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         except Exception as e:
             logger.debug("[%s] Data channel send failed (non-critical): %s", self.name, e)
@@ -2652,8 +2653,8 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         protocol = self._realtime_protocol
         if protocol is None or event.source.chat_id != self._room_name:
             return
-        await protocol.response_started()
-        event._hermes_realtime_response = (protocol, protocol.active_response_id)
+        await protocol.processing_started()
+        event._hermes_realtime_response = (protocol, protocol.processing_turn_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Finish turns that deliver only audio, fail, or are cancelled by Hermes."""
@@ -2663,7 +2664,7 @@ class LiveKitAdapter(LiveKitStreamingTTSMixin, BasePlatformAdapter):
         # An old Hermes task can finish after a replacement response has
         # started. Its cleanup must not complete or cancel that newer reply.
         if getattr(event, "_hermes_realtime_response", None) != (
-            protocol, protocol.active_response_id
+            protocol, protocol.processing_turn_id
         ):
             return
         if outcome == ProcessingOutcome.CANCELLED:
