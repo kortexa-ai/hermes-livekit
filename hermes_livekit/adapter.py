@@ -2468,7 +2468,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                 "agent:agent-transcript", {"transcript": content, "final": True}
             )
             if self._realtime_protocol:
-                await self._realtime_protocol.output_stopped()
+                await self._realtime_protocol.text_delivery_complete()
             return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         except Exception as e:
             logger.debug("[%s] Data channel send failed (non-critical): %s", self.name, e)
@@ -2653,7 +2653,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         protocol = self._realtime_protocol
         if protocol is None or event.source.chat_id != self._room_name:
             return
-        await protocol.response_started()
+        await protocol.processing_started()
         event._hermes_realtime_response = (protocol, protocol.active_response_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:

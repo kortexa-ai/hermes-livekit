@@ -900,7 +900,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         if call is None:
             return SendResult(success=False, error="Realtime call is closed")
         await call.protocol.assistant_transcript(content)
-        await call.protocol.output_stopped()
+        await call.protocol.text_delivery_complete()
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
 
     async def play_tts(
@@ -968,7 +968,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         call = self._calls.get(event.source.chat_id)
         if call is None:
             return
-        await call.protocol.response_started()
+        await call.protocol.processing_started()
         event._hermes_realtime_response = (call.protocol, call.protocol.active_response_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:

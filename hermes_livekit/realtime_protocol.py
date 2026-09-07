@@ -80,6 +80,7 @@ class RealtimeProtocol:
         self._pending_text_inputs: dict[str, str] = {}
         self._clients: set[str] = set()
         self._active_response_id: str | None = None
+        self._processing_response_id: str | None = None
         self._active_output_item_id: str | None = None
         self._active_transcript: str | None = None
         self._transcript_turn_id: str | None = None
@@ -374,6 +375,17 @@ class RealtimeProtocol:
             await self._announce_audio_output_item()
         await self._emit({"type": "output_audio_buffer.started", "response_id": self._active_response_id})
 
+    async def processing_started(self) -> None:
+        await self.response_started()
+        self._processing_response_id = self._active_response_id
+
+    async def text_delivery_complete(self) -> None:
+        # Notices and interim messages use the same adapter.send() as final
+        # text. Only the base processing hook knows when that turn is finished.
+        # Standalone sends (for example an idle slash command) still complete.
+        if self._processing_response_id != self._active_response_id:
+            await self.output_stopped()
+
     async def stream_transcript(self, transcript: str, *, turn_id: str, finalize: bool = False) -> None:
         """Bind the consumer's seed to this response; drop late/replaced frames.
 
@@ -571,6 +583,7 @@ class RealtimeProtocol:
         self._input_items.clear()
         self._pending_text_inputs.clear()
         self._active_response_id = None
+        self._processing_response_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False
@@ -720,6 +733,7 @@ class RealtimeProtocol:
                 }
             )
         self._active_response_id = None
+        self._processing_response_id = None
         self._active_output_item_id = None
         self._active_transcript = None
         self._output_item_announced = False
