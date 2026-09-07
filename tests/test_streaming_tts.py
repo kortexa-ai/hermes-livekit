@@ -83,6 +83,28 @@ def voice_adapter(kind):
     return adapter, owner, protocol, sink, events
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+async def test_provider_pcm_time_precedes_onset_gating_and_excludes_stale_handles(kind, caplog):
+    caplog.set_level("INFO", logger="gateway.platforms.livekit.streaming_tts")
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    adapter._tts_trim_leading_silence = True
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    await adapter.write_streaming_tts(handle, b"")
+    assert handle.first_input_at is None
+    await adapter.write_streaming_tts(handle, b"\0" * FRAME_BYTES)
+    assert handle.first_input_at >= handle.opened_at
+    assert not handle.audible and not sink.frames
+    first = handle.first_input_at
+    await adapter.write_streaming_tts(handle, b"\0" * FRAME_BYTES)
+    assert handle.first_input_at == first
+    assert caplog.text.count("streaming TTS first provider PCM") == 1
+    replacement = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    await adapter.write_streaming_tts(handle, tone(rate=48000))
+    assert replacement.first_input_at is None
+    await adapter.abort_streaming_tts(replacement)
+
+
 @pytest.mark.parametrize("adapter_type", [RealtimeWebRTCAdapter, LiveKitAdapter])
 def test_onset_setting_is_opt_in_and_requires_a_boolean(adapter_type):
     from gateway.config import PlatformConfig

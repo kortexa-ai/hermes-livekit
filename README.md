@@ -263,11 +263,14 @@ For an end-to-end measurement from the Pi, run the isolated voice probe:
 uv run --no-project --no-build \
   --with aiortc==1.15.0 --with aiohttp==3.14.3 --with av==17.0.0 \
   python tools/voice_latency_probe.py \
-  --gateway http://192.168.2.6:8092 --config-host snappy --profile mira
+  --gateway http://192.168.2.6:8092 --config-host snappy --profile mira --case greeting
 ```
 
 It fetches profile credentials over passwordless SSH into memory, synthesizes
 one fixed question, and sends a real voice turn through ASR, Hermes, and TTS.
+Choose `--case greeting`, `fact`, or `calculation`. The session requests no tools,
+but that does not disable Hermes's own tools: inspect gateway API counts before
+treating any case as a single model request.
 It neither captures the microphone nor plays audio. The configuration host
 must have Hermes at `/Users/francip/src/hermes-agent` with its existing venv;
 the speech fixture expects the configured service's 24 kHz mono PCM format.
@@ -277,6 +280,20 @@ audio-start event, and first audible RTP received by the Pi. The latter includes
 network and receiver buffering, but not the kiosk's physical speaker latency.
 Compare several runs: model generation time can vary independently of the
 silence timeout or TTS transport.
+
+For local model timing logs, set
+`plugins.entries.livekit.settings.voice_latency_metrics: true` in the Hermes
+profile and restart its gateway. It defaults to off and uses existing plugin
+hooks, without changing model requests. `voice_timing` JSON logs contain the
+first observed visible text and each completed API request, token/cache counts,
+and tool-call count. Correlate `(session_id, turn_id, iteration)`; separate hook
+workers can log out of order. First-text time includes observer queue delay.
+Provider first-chunk time is `null` when unavailable (including current Codex
+Responses); neither metric isolates provider queueing, network or model prefill.
+Only timings and bounded identifiers are logged; no text, audio or credentials
+are retained by this observer. Deduplication holds at most 1,024 request keys.
+Existing audio logs distinguish first provider PCM entering the sink from the
+first published PCM frame, so resampling/onset gating is measured separately.
 
 Use the same isolated dependencies with `python tools/tts_onset_probe.py` to
 measure provider first bytes versus audible PCM, then compare the identical

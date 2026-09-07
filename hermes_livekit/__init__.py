@@ -11,6 +11,7 @@ from typing import Optional
 
 from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
 from .direct_tools import install_direct_toolsets
+from .voice_metrics import register_voice_metrics
 from .realtime_webrtc import (
     RealtimeWebRTCAdapter,
     check_realtime_requirements,
@@ -203,6 +204,7 @@ def register(ctx) -> None:
     auto-configures from ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
     ``LIVEKIT_API_SECRET`` env vars.
     """
+    register_voice_metrics(ctx)
     ctx.register_platform(
         name="livekit",
         label="LiveKit",

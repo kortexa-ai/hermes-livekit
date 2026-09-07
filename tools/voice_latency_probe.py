@@ -27,6 +27,11 @@ from av import AudioFrame, AudioResampler
 RATE = 48000
 SAMPLES = 960
 PROMPT = "Please tell me what two plus two equals in one short sentence."
+PROMPTS = {
+    "greeting": "Hello Hermes. Please greet me in one short sentence.",
+    "fact": "What color is a clear daytime sky? Please answer in one short sentence.",
+    "calculation": PROMPT,
+}
 
 
 def profile_credentials(host: str, profile: str) -> dict:
@@ -98,7 +103,7 @@ class SyntheticMicrophone(MediaStreamTrack):
         return frame
 
 
-async def probe(gateway: str, credentials: dict) -> dict:
+async def probe(gateway: str, credentials: dict, *, prompt: str = PROMPT) -> dict:
     events, times, audio_tasks = [], {}, []
     audio_response_ids = set()
     ready, done = asyncio.Event(), asyncio.Event()
@@ -112,7 +117,7 @@ async def probe(gateway: str, credentials: dict) -> dict:
             async with http.post(tts["base_url"].rstrip("/") + "/audio/speech",
                                  headers={"Authorization": "Bearer " + tts["api_key"]},
                                  json={"model": tts["model"], "voice": tts["voice"],
-                                       "input": PROMPT, "response_format": "pcm"}) as response:
+                                       "input": prompt, "response_format": "pcm"}) as response:
                 response.raise_for_status()
                 microphone = SyntheticMicrophone(converted_pcm(await response.read()))
             peer.addTrack(microphone)
@@ -192,14 +197,21 @@ async def probe(gateway: str, credentials: dict) -> dict:
         await asyncio.gather(*audio_tasks, return_exceptions=True)
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway", default="http://192.168.2.6:8092")
     parser.add_argument("--config-host", default="snappy")
     parser.add_argument("--profile", default="mira")
-    args = parser.parse_args()
+    parser.add_argument("--case", choices=PROMPTS, default="greeting",
+                        help="Keep simple replies separate from calculation/tool round trips")
+    return parser.parse_args(argv)
+
+
+def main():
+    args = parse_args()
     credentials = profile_credentials(args.config_host, args.profile)
-    print(json.dumps(asyncio.run(probe(args.gateway.rstrip("/"), credentials)), sort_keys=True))
+    result = asyncio.run(probe(args.gateway.rstrip("/"), credentials, prompt=PROMPTS[args.case]))
+    print(json.dumps({"case": args.case, **result}, sort_keys=True))
 
 
 if __name__ == "__main__":

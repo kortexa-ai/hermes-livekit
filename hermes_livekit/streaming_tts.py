@@ -66,6 +66,7 @@ class AudioSinkHandle(StreamingTTSHandle):
     pending: asyncio.Task | None = None
     opened_at: float = field(default_factory=time.monotonic)
     pcm_bytes: int = 0
+    first_input_at: float | None = None
     leading_silence: LeadingSilenceTrimmer | None = None
 
 
@@ -151,6 +152,10 @@ class StreamingTTSMixin:
 
     async def write_streaming_tts(self, handle, chunk):
         if self._tts_current(handle):
+            if chunk and handle.first_input_at is None:
+                handle.first_input_at = time.monotonic()
+                logger.info("[%s] streaming TTS first provider PCM: %.3fs from stream open",
+                            handle.chat_id, handle.first_input_at - handle.opened_at)
             await self._write_tts_frames(handle, self._tts_frames(handle, handle.framer.feed(chunk)))
 
     def _tts_frames(self, handle, frames, *, final=False):
