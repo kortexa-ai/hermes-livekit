@@ -6,6 +6,7 @@ import pytest
 
 from hermes_livekit.audio_onset import (
     FRAME_BYTES, LEAD_IN_FRAMES, MAX_SCAN_FRAMES, LeadingSilenceTrimmer,
+    PCM_ONSET_MAX_SAMPLES, PcmOnsetObserver,
 )
 
 
@@ -67,3 +68,47 @@ def test_discard_cannot_flush_buffered_audio_later():
 def test_invalid_frame_size_is_rejected():
     with pytest.raises(ValueError, match="complete 20 ms"):
         list(LeadingSilenceTrimmer().feed([b"\0\0"]))
+
+
+@pytest.mark.parametrize("sample", [-32768, -41, 41, 32767])
+@pytest.mark.parametrize("offset", [0, 959, 960, PCM_ONSET_MAX_SAMPLES - 1])
+def test_observer_reports_exact_first_sample_once(sample, offset):
+    observer = PcmOnsetObserver()
+    # Exactly +/-40 is below the observation threshold, not an onset.
+    source = (struct.pack("<hh", 40, -40) * ((offset + 1) // 2))[:offset * 2]
+    source += struct.pack("<h", sample) + frame(500)
+    results = [observer.feed(source[i:i + FRAME_BYTES])
+               for i in range(0, len(source), FRAME_BYTES)]
+    assert [result for result in results if result is not None] == [offset]
+    assert observer.offset_samples == offset
+    assert observer.scanned_samples == offset + 1
+    assert observer.feed(frame(1000)) is None
+    assert observer.scanned_samples == offset + 1
+
+
+def test_observer_bounds_scan_and_keeps_no_pcm(monkeypatch):
+    observer = PcmOnsetObserver()
+    sizes = []
+    unpack = struct.iter_unpack
+
+    def count(fmt, pcm):
+        sizes.append(len(pcm))
+        return unpack(fmt, pcm)
+
+    monkeypatch.setattr("hermes_livekit.audio_onset.struct.iter_unpack", count)
+    # Even an oversized input must not scan beyond one second.
+    assert observer.feed(b"\0\0" * PCM_ONSET_MAX_SAMPLES + frame(1000)) is None
+    assert observer.scanned_samples == PCM_ONSET_MAX_SAMPLES
+    assert observer.offset_samples is None
+    assert observer.feed(frame(1000)) is None
+    assert sizes == [PCM_ONSET_MAX_SAMPLES * 2]
+    assert all(not isinstance(v, (bytes, bytearray, memoryview)) for v in vars(observer).values())
+
+
+def test_observer_empty_and_short_quiet_input():
+    observer = PcmOnsetObserver()
+    assert observer.feed(b"") is None
+    assert observer.scanned_samples == 0
+    assert observer.feed(frame(10)) is None
+    assert observer.scanned_samples == FRAME_BYTES // 2
+    assert observer.offset_samples is None

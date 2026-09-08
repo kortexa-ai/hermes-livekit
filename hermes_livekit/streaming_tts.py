@@ -10,7 +10,7 @@ from typing import Any
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
 
-from .audio_onset import LeadingSilenceTrimmer
+from .audio_onset import PCM_ONSET_PEAK, LeadingSilenceTrimmer, PcmOnsetObserver
 
 logger = logging.getLogger("gateway.platforms.livekit.streaming_tts")
 OUTPUT_RATE = 48_000
@@ -68,6 +68,8 @@ class AudioSinkHandle(StreamingTTSHandle):
     pcm_bytes: int = 0
     first_input_at: float | None = None
     leading_silence: LeadingSilenceTrimmer | None = None
+    first_queued_at: float | None = None
+    pcm_onset: PcmOnsetObserver = field(default_factory=PcmOnsetObserver)
 
 
 class StreamingTTSMixin:
@@ -144,11 +146,23 @@ class StreamingTTSMixin:
             if not self._tts_current(handle):
                 return
             if not handle.audible:
+                handle.first_queued_at = time.monotonic()
                 trimmed_ms = handle.leading_silence.trimmed_frames * 20 if handle.leading_silence else 0
                 logger.info("[%s] streaming TTS first PCM: %.3fs from stream open; trimmed=%dms",
-                            handle.chat_id, time.monotonic() - handle.opened_at, trimmed_ms)
+                            handle.chat_id, handle.first_queued_at - handle.opened_at, trimmed_ms)
             handle.audible = True
             handle.pcm_bytes += len(pcm)
+            # Observe only accepted, current output. This does not redefine
+            # audible (sink ownership), alter trimming, or delay publication.
+            onset = handle.pcm_onset.feed(pcm)
+            if onset is not None:
+                now = time.monotonic()
+                logger.info(
+                    "[%s] streaming TTS non-quiet PCM: response_id=%s offset_samples=%d "
+                    "offset=%.3fs queued=%.3fs from first PCM; %.3fs from stream open; peak>%d",
+                    handle.chat_id, handle.response_id, onset, onset / OUTPUT_RATE,
+                    now - handle.first_queued_at, now - handle.opened_at, PCM_ONSET_PEAK,
+                )
 
     async def write_streaming_tts(self, handle, chunk):
         if self._tts_current(handle):
@@ -191,8 +205,11 @@ class StreamingTTSMixin:
             self._tts_pause(handle, False)
             self._tts_streams.pop(handle.chat_id)
         handle.finished = True
-        logger.info("[%s] streaming TTS finished: %.2fs PCM, aborted=%s",
-                    handle.chat_id, handle.pcm_bytes / (OUTPUT_RATE * 2), handle.aborted)
+        logger.info("[%s] streaming TTS finished: %.2fs PCM, aborted=%s; "
+                    "response_id=%s onset_sample=%s onset_scanned_samples=%d",
+                    handle.chat_id, handle.pcm_bytes / (OUTPUT_RATE * 2), handle.aborted,
+                    handle.response_id, handle.pcm_onset.offset_samples,
+                    handle.pcm_onset.scanned_samples)
 
     async def _abort_tts_handle(self, handle):
         if handle.finished:

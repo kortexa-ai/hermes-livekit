@@ -349,6 +349,102 @@ async def test_optional_onset_trim_preserves_pcm_across_provider_chunks(kind, en
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("rate", [24000, 48000])
+@pytest.mark.parametrize("prefix_peak", [0, 20])
+async def test_queued_pcm_onset_measures_retained_audio_only(kind, enabled, rate, prefix_peak, caplog):
+    caplog.set_level("INFO", logger="gateway.platforms.livekit.streaming_tts")
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    adapter._tts_trim_leading_silence = enabled
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=rate))
+    source = struct.pack("<h", prefix_peak) * (rate * 3 // 5) + tone(rate=rate)
+    for i in range(0, len(source), 137):
+        await adapter.write_streaming_tts(handle, source[i:i + 137])
+    await adapter.finish_streaming_tts(handle)
+    queued = b"".join(sink.frames)
+    expected = next(i for i, (s,) in enumerate(struct.iter_unpack("<h", queued)) if abs(s) > 40)
+    assert handle.pcm_onset.offset_samples == expected
+    assert handle.pcm_onset.scanned_samples == expected + 1
+    assert handle.first_queued_at >= handle.first_input_at >= handle.opened_at
+    assert handle.audible and handle.finished
+    assert handle.pcm_bytes == len(queued)
+    onset_logs = [r for r in caplog.records if "streaming TTS non-quiet PCM" in r.message]
+    assert len(onset_logs) == 1
+    assert f"response_id={handle.response_id}" in onset_logs[0].message
+    assert f"offset_samples={expected} " in onset_logs[0].message
+    assert "peak>40" in onset_logs[0].message
+    assert sum(e["type"] == "output_audio_buffer.started" for e in events) == 1
+    # Compare every queued byte with the original framing/trimming pipeline.
+    framer = PcmFramer(AudioFormat(sample_rate=rate))
+    reference = list(framer.feed(source)) + list(framer.finish())
+    if enabled:
+        from hermes_livekit.audio_onset import LeadingSilenceTrimmer
+        trimmer = LeadingSilenceTrimmer()
+        reference = list(trimmer.feed(reference)) + list(trimmer.finish())
+    assert queued == b"".join(reference)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("frames", [2, 60])
+async def test_silent_queued_pcm_keeps_audible_flag_and_reports_scan_bound(kind, frames, caplog):
+    caplog.set_level("INFO", logger="gateway.platforms.livekit.streaming_tts")
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    handle = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    source = b"\0" * FRAME_BYTES * frames
+    await adapter.write_streaming_tts(handle, source)
+    await adapter.finish_streaming_tts(handle)
+    assert b"".join(sink.frames) == source
+    assert handle.audible and handle.finished
+    assert handle.pcm_onset.offset_samples is None
+    expected = min(frames, 50) * 960
+    assert handle.pcm_onset.scanned_samples == expected
+    assert "streaming TTS non-quiet PCM" not in caplog.text
+    assert f"onset_sample=None onset_scanned_samples={expected}" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
+@pytest.mark.parametrize("failure", ["error", "replacement"])
+async def test_onset_does_not_observe_failed_or_cancelled_writes(kind, failure, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="gateway.platforms.livekit.streaming_tts")
+    adapter, owner, protocol, sink, events = voice_adapter(kind)
+    old = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+    entered = asyncio.Event()
+
+    async def write(handle, pcm):
+        entered.set()
+        if failure == "error":
+            raise RuntimeError("fixture sink failure")
+        await asyncio.Future()
+
+    original_write = adapter._tts_write_frame
+    monkeypatch.setattr(adapter, "_tts_write_frame", write)
+    task = asyncio.create_task(adapter.write_streaming_tts(old, tone(rate=48000)))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if failure == "error":
+            with pytest.raises(RuntimeError, match="fixture sink failure"):
+                await task
+        replacement = await adapter.begin_streaming_tts("chat", AudioFormat(sample_rate=48000))
+        await asyncio.gather(task, return_exceptions=True)
+        assert old.pcm_onset.scanned_samples == 0 and not old.audible
+        assert old.first_queued_at is None
+        assert "streaming TTS non-quiet PCM" not in caplog.text
+        monkeypatch.setattr(adapter, "_tts_write_frame", original_write)
+        await adapter.write_streaming_tts(old, tone(rate=48000))
+        assert replacement.pcm_onset.scanned_samples == 0
+        await adapter.write_streaming_tts(replacement, struct.pack("<h", 41) * 960)
+        assert replacement.pcm_onset.offset_samples == 0
+        assert caplog.text.count("streaming TTS non-quiet PCM") == 1
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await adapter._abort_tts_for_chat("chat")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["realtime", "livekit"])
 async def test_quiet_prefix_failure_still_allows_whole_file_fallback(kind, monkeypatch):
     adapter, owner, protocol, sink, events = voice_adapter(kind)
     adapter._tts_trim_leading_silence = True

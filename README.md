@@ -427,6 +427,16 @@ Only timings and bounded identifiers are logged; no text, audio or credentials
 are retained by this observer. Deduplication holds at most 1,024 request keys.
 Existing audio logs distinguish first provider PCM entering the sink from the
 first published PCM frame, so resampling/onset gating is measured separately.
+The `streaming TTS non-quiet PCM` log also records the first sample above absolute
+PCM16 amplitude 40 in queued, post-resample/post-trim audio. Its sample offset
+measures the retained quiet prefix; its queue time measures when that frame was
+accepted, not when the speaker played it. Correlate by `response_id`. Observation
+stops after that sample or one second of queued PCM and never changes audio.
+The final log includes `onset_sample` and `onset_scanned_samples`; a missing onset
+means no threshold crossing was observed within that prefix, not that the entire
+reply was silent. This amplitude threshold matches the silent RTP probe but is
+not speech detection, and lossy encoding can change the receiver's threshold
+crossing. Do not attribute every residual millisecond to receiver buffering.
 
 Use the same isolated dependencies with `python tools/tts_onset_probe.py` to
 measure provider first bytes versus audible PCM, then compare the identical

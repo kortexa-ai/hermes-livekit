@@ -1,4 +1,4 @@
-"""Conservative, bounded onset trimming for 48 kHz mono PCM16 playout."""
+"""Conservative, bounded onset trimming and observation for PCM16 playout."""
 
 from collections import deque
 from collections.abc import Iterable, Iterator
@@ -8,6 +8,28 @@ FRAME_BYTES = 1920  # One 20 ms frame at the gateway's fixed output format.
 QUIET_PEAK = 16  # About -66 dBFS; far below the microphone speech gate.
 LEAD_IN_FRAMES = 4  # Retain 80 ms before the first non-quiet frame.
 MAX_SCAN_FRAMES = 50  # Stop looking after one second, even for silent output.
+PCM_ONSET_PEAK = 40  # Match the silent RTP probe; this is not a speech gate.
+PCM_ONSET_MAX_SAMPLES = 48_000  # Observe at most one second of output.
+
+
+class PcmOnsetObserver:
+    """Measure a queued PCM prefix without retaining or changing any samples."""
+
+    def __init__(self):
+        self.scanned_samples = 0
+        self.offset_samples: int | None = None
+
+    def feed(self, pcm: bytes) -> int | None:
+        """Return the first matching sample's offset once, including offset zero."""
+        if self.offset_samples is not None or self.scanned_samples >= PCM_ONSET_MAX_SAMPLES:
+            return None
+        prefix = memoryview(pcm)[:(PCM_ONSET_MAX_SAMPLES - self.scanned_samples) * 2]
+        for (sample,) in struct.iter_unpack("<h", prefix):
+            self.scanned_samples += 1
+            if abs(sample) > PCM_ONSET_PEAK:
+                self.offset_samples = self.scanned_samples - 1
+                return self.offset_samples
+        return None
 
 
 class LeadingSilenceTrimmer:
