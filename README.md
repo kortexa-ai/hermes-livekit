@@ -207,7 +207,10 @@ the affected profile's gateway after changing it. Hermes CLI's
 these transports. Direct WebRTC checks on received audio frames; LiveKit checks
 every 200 ms, so it can add up to one polling interval.
 
-The energy gate calibrates from the quieter half of the initial 400 ms, then
+The energy gate calibrates from the quieter half of the initial 400 ms of
+actual audio, using 20 ms windows regardless of received packet size. Buffered
+calibration audio is retained for speech detection. The RMS detector checks all
+new audio in short windows, so speech before a quiet poll tail is not lost. It then
 tracks background noise continuously during idle audio and confident quiet
 pauses. It has separate speech-start and speech-stop thresholds. Noise rises
 slowly and falls faster, using audio duration rather than frame count. Detected

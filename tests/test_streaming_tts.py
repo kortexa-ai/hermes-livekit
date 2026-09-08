@@ -100,7 +100,7 @@ async def assert_livekit_capture(adapter, monkeypatch, *, paused):
     adapter._audio_buffers["client"] = bytearray(pcm)
     adapter._audio_processed = {}
     gate = Mock(ready=False)
-    gate.calibrate.return_value = False
+    gate.calibrate_pcm.return_value = False
     adapter._audio_gates = {"client": gate}
     adapter._running = True
 
@@ -110,7 +110,7 @@ async def assert_livekit_capture(adapter, monkeypatch, *, paused):
     with monkeypatch.context() as patch:
         patch.setattr("hermes_livekit.adapter.asyncio.sleep", one_tick)
         await adapter._check_silence_loop()
-    assert gate.calibrate.called is not paused
+    assert gate.calibrate_pcm.called is not paused
 
 
 @pytest.mark.asyncio

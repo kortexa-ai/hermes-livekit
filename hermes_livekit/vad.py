@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from functools import partial
 import math
 
+from .media import pcm_rms
+
 
 # Permit calibration in louder rooms, but bound a bad calibration (e.g. a
 # clipped microphone) so it cannot permanently make all speech inaudible.
@@ -19,6 +21,7 @@ VAD_STOP_MARGIN = 60.0
 DEFAULT_SILENCE_DURATION = 1.5
 NOISE_RISE_SECONDS = 2.0
 NOISE_FALL_SECONDS = 0.5
+PCM_FRAME_BYTES = 1920  # 20 ms of the transports' 48 kHz mono PCM16.
 
 
 def configured_vad_factory(extra: dict):
@@ -56,6 +59,7 @@ class AdaptiveRmsGate:
     minimum_floor: float = 50.0
     noise_rms: float | None = None
     calibration: list[float] = field(default_factory=list)
+    _calibration_pcm: bytearray = field(default_factory=bytearray, repr=False)
 
     @property
     def ready(self) -> bool:
@@ -95,8 +99,37 @@ class AdaptiveRmsGate:
         self.calibration.clear()
         return True
 
+    def calibrate_pcm(self, pcm: bytes) -> bool:
+        """Measure actual audio windows, not transport packets or poll ticks."""
+        if self.ready:
+            return True
+        needed = ((self.calibration_frames - len(self.calibration)) * PCM_FRAME_BYTES
+                  - len(self._calibration_pcm))
+        self._calibration_pcm.extend(pcm[:needed])
+        while len(self._calibration_pcm) >= PCM_FRAME_BYTES:
+            frame = bytes(self._calibration_pcm[:PCM_FRAME_BYTES])
+            del self._calibration_pcm[:PCM_FRAME_BYTES]
+            if self.calibrate(pcm_rms(frame)):
+                return True
+        return False
+
     def is_speech(self, rms: float, *, speaking: bool, frame_seconds: float = 0.02,
                   pcm: bytes | None = None) -> bool:
+        if pcm is None or len(pcm) <= PCM_FRAME_BYTES:
+            return self._is_speech_rms(rms, speaking, frame_seconds)
+        # A short word can precede a quiet poll tail. Classify every new frame
+        # without averaging speech into the noise floor. Preserve hysteresis
+        # once speech begins, and process quiet frames too so adaptation runs.
+        speech = False
+        for offset in range(0, len(pcm), PCM_FRAME_BYTES):
+            frame = pcm[offset:offset + PCM_FRAME_BYTES]
+            current = self._is_speech_rms(
+                pcm_rms(frame), speaking or speech, len(frame) / 96000,
+            )
+            speech = speech or current
+        return speech
+
+    def _is_speech_rms(self, rms: float, speaking: bool, frame_seconds: float) -> bool:
         threshold = self.stop_threshold if speaking else self.start_threshold
         speech = rms > threshold
         if speech or self.noise_rms is None:

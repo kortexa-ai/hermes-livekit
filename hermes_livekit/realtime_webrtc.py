@@ -356,9 +356,8 @@ class RealtimeCall:
         if self.closed or self.paused or self.input_muted:
             return
         if not self.vad.ready:
-            rms = pcm_rms(pcm)
             self.vad_calibration_pcm.append(pcm)
-            if not self.vad.calibrate(rms):
+            if not self.vad.calibrate_pcm(pcm):
                 return
             logger.info(
                 "[%s] adaptive VAD calibrated: noise_rms=%.1f start=%.1f stop=%.1f",

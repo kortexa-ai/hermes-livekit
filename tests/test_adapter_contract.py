@@ -163,6 +163,9 @@ async def test_livekit_prefetch_waits_for_endpoint_and_checks_unpolled_audio(mon
     speech = b"\x00\x10" * 24000
     quiet = b"\x10\x00" * 19200
     adapter._audio_buffers = {"client": bytearray(speech + quiet)}
+    # The speech marker represents already classified audio; only the quiet
+    # tail is new at this poll. Replaying speech would reset the endpoint.
+    adapter._audio_processed = {"client": (len(speech), True)}
     adapter._last_audio_time = {"client": 0.0}
     adapter._speaking_participants = {"client"}
     adapter._audio_gates = {"client": AdaptiveRmsGate(noise_rms=150)}

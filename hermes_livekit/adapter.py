@@ -1083,8 +1083,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
     def _new_audio_gate(self):
         factory = getattr(self, "_vad_factory", AdaptiveRmsGate)
-        return factory(calibration_frames=max(1, round(0.4 / POLL_INTERVAL)),
-                       minimum_floor=RMS_SILENCE_FLOOR)
+        return factory(minimum_floor=RMS_SILENCE_FLOOR)
 
     async def _capture_overflow(self, identity: str) -> None:
         self._audio_overflowed.add(identity)
@@ -1142,8 +1141,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
     async def _check_silence_loop(self):
         """Periodically check for completed utterances (silence after speech).
 
-        Each tick, we look at the tail of every participant's buffer to
-        decide whether they are currently speaking or silent.  When
+        Each tick, we classify the new audio in every participant's buffer to
+        decide whether they are currently speaking or silent. When
         silence exceeds the threshold, we extract the utterance and
         send it for transcription.
 
@@ -1151,9 +1150,6 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         A joining participant wakes the detector immediately, so a short
         first utterance cannot hide inside a multi-second idle polling gap.
         """
-        # bytes per poll interval (how much audio one tick represents)
-        bytes_per_tick = int(SAMPLE_RATE * NUM_CHANNELS * 2 * POLL_INTERVAL)
-
         try:
             self._audio_processed = getattr(self, "_audio_processed", {})
             self._audio_overflowed = getattr(self, "_audio_overflowed", set())
@@ -1182,16 +1178,12 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                         continue  # Never replay stale speech into a stateful detector.
                     self._audio_processed[identity] = (buf_len, speech)
 
-                    # Check RMS of the most recent chunk to detect speech/silence
-                    tail = bytes(buf[-bytes_per_tick:]) if buf_len >= bytes_per_tick else bytes(buf)
-                    rms = pcm_rms(tail)
-
                     gate = self._audio_gates.get(identity)
                     if gate is None:
                         gate = self._new_audio_gate()
                         self._audio_gates[identity] = gate
                     if not gate.ready:
-                        if not gate.calibrate(rms):
+                        if not gate.calibrate_pcm(pending):
                             continue
                         pending = bytes(buf)  # Classifier has not seen calibration audio yet.
                         logger.info(
@@ -1205,7 +1197,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
                     if pending:
                         speech = gate.is_speech(
-                            rms,
+                            pcm_rms(pending),
                             speaking=identity in self._speaking_participants,
                             frame_seconds=len(pending) / (SAMPLE_RATE * NUM_CHANNELS * 2),
                             pcm=pending,
