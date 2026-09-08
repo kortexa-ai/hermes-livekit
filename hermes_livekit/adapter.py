@@ -249,6 +249,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
         # Pause audio capture during TTS playback
         self._paused = False
+        # ponytail: client intent is independent of playback's echo pause.
+        self._client_paused = False
 
         # Throttle for presence-check failure warnings (see
         # _count_remote_participants).
@@ -952,6 +954,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             self._realtime_protocol = None
         self._audio_source = None
         self._local_track = None
+        # Client pause belongs to the departed session, not the next arrival.
+        self._client_paused = False
 
         if self._running and (self._presence_task is None or self._presence_task.done()):
             self._presence_task = asyncio.create_task(self._presence_watch_loop())
@@ -1114,7 +1118,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             self._audio_processed = getattr(self, "_audio_processed", {})
             self._audio_overflowed = getattr(self, "_audio_overflowed", set())
             async for event in stream:
-                if self._paused or identity in self._muted_inputs:
+                if self._paused or getattr(self, "_client_paused", False) or identity in self._muted_inputs:
                     continue
                 if identity not in self._audio_buffers:
                     break
@@ -1160,7 +1164,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                     await self._audio_ready.wait()
                     continue
                 await asyncio.sleep(POLL_INTERVAL)
-                if self._paused:
+                if self._paused or getattr(self, "_client_paused", False):
                     continue
 
                 for identity in list(self._audio_buffers.keys()):
@@ -1610,10 +1614,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         """Runtime control hooks from the client. Placeholder for now.
 
         Currently recognized actions:
-          - ``pause``  — stop sampling inbound audio (already used internally
-            during TTS playback); kept here as an explicit client-facing hook
-            for future "mute me" UX.
-          - ``resume`` — re-enable audio sampling.
+          - ``pause``  — stop sampling inbound audio until the client resumes.
+          - ``resume`` — allow audio sampling once TTS echo suppression ends.
           - ``end-of-turn`` — the client has finished speaking and says so, so
             transcribe what is buffered now instead of waiting for the silence
             detector to reach the same conclusion a second and a half later.
@@ -1627,10 +1629,10 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             else:
                 logger.debug("[%s] end-of-turn from %s with nothing buffered", self.name, identity)
         elif action == "pause":
-            self._paused = True
+            self._client_paused = True
             logger.info("[%s] paused by client %s", self.name, identity)
         elif action == "resume":
-            self._paused = False
+            self._client_paused = False
             logger.info("[%s] resumed by client %s", self.name, identity)
         else:
             logger.debug("[%s] unknown client:control action %r", self.name, action)
