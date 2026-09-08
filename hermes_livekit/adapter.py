@@ -954,6 +954,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             self._realtime_protocol = None
         self._audio_source = None
         self._local_track = None
+        # Client pause belongs to the departed session, not the next arrival.
+        self._client_paused = False
 
         if self._running and (self._presence_task is None or self._presence_task.done()):
             self._presence_task = asyncio.create_task(self._presence_watch_loop())

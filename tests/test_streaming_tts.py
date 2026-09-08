@@ -8,7 +8,7 @@ import os
 import struct
 import time
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -188,6 +188,98 @@ async def test_client_pause_survives_blocked_capture_and_stale_stream_cleanup(mo
         writing.cancel()
         await asyncio.gather(writing, return_exceptions=True)
         await adapter._abort_tts_for_chat("chat")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leave", [False, True], ids=["reconnect", "leave-rejoin"])
+async def test_client_pause_room_session_boundary(leave, monkeypatch):
+    adapter, _, _, sink, _ = voice_adapter("livekit")
+    assert isinstance(adapter, LiveKitAdapter)
+    room = SimpleNamespace(
+        on=Mock(), connect=AsyncMock(), disconnect=AsyncMock(),
+        local_participant=SimpleNamespace(publish_track=AsyncMock()),
+        remote_participants={},
+    )
+    adapter._room = room
+    adapter._room_generation = 1
+    adapter._api_key = adapter._api_secret = "fixture"
+    adapter._agent_name = "Hermes"
+    adapter._url = "wss://unused.invalid"
+    adapter.config = Mock(extra={"agent_name": "Hermes"})
+    adapter._running = False
+    adapter._last_audio_time = {}
+    adapter._audio_gates = {}
+    adapter._speaking_participants = set()
+    adapter._cleanup_all_client_tools = Mock()
+    adapter._fail_binary_generation = Mock()
+    adapter._resolve_avatar_url = Mock(return_value=None)
+    adapter._mark_connected = Mock()
+    adapter._new_realtime_protocol = Mock(return_value=AsyncMock())
+    monkeypatch.setattr("hermes_livekit.adapter.rtc.Room", lambda: room)
+    monkeypatch.setattr("hermes_livekit.adapter.rtc.AudioSource", lambda *args: sink)
+    monkeypatch.setattr("hermes_livekit.adapter.rtc.LocalAudioTrack.create_audio_track", Mock())
+    token = Mock()
+    token.with_identity.return_value = token
+    token.with_name.return_value = token
+    token.with_grants.return_value = token
+    token.to_jwt.return_value = "fixture-token"
+    monkeypatch.setattr("hermes_livekit.adapter.AccessToken", lambda **kwargs: token)
+
+    await adapter._handle_client_control({"action": "pause"}, "client")
+    await assert_livekit_capture(adapter, monkeypatch, paused=True)
+    if leave:
+        await adapter._leave_and_watch()
+        assert adapter._room is None
+    assert await adapter._join_room()
+    try:
+        room.disconnect.assert_awaited_once()
+        room.connect.assert_awaited_once()
+        # A new session must accept real microphone PCM without a resume command;
+        # replacing the transport in the same session must retain client intent.
+        await assert_livekit_capture(adapter, monkeypatch, paused=not leave)
+    finally:
+        await adapter._close_capture_streams()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["finish", "cancel", "decode-error"])
+async def test_client_pause_survives_whole_file_cleanup(outcome, monkeypatch):
+    adapter, _, _, sink, _ = voice_adapter("livekit")
+    assert isinstance(adapter, LiveKitAdapter)
+    adapter._publish_agent_event = AsyncMock()
+
+    async def decode(*args):
+        await adapter._handle_client_control({"action": "pause"}, "client")
+        await assert_livekit_capture(adapter, monkeypatch, paused=True)
+        await adapter._handle_client_control({"action": "resume"}, "client")
+        await assert_livekit_capture(adapter, monkeypatch, paused=True)
+        await adapter._handle_client_control({"action": "pause"}, "client")
+        if outcome == "decode-error":
+            raise RuntimeError("fixture decode failure")
+        return tone(rate=48000)
+
+    monkeypatch.setattr("hermes_livekit.adapter.asyncio.to_thread", decode)
+    sink.played.clear()
+    playing = asyncio.create_task(adapter.play_tts("chat", "unused.wav"))
+    try:
+        if outcome != "decode-error":
+            await asyncio.wait_for(sink.first.wait(), 2)
+        if outcome == "cancel":
+            playing.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await playing
+            assert sink.clears == 1
+        else:
+            sink.played.set()
+            result = await asyncio.wait_for(playing, 2)
+            assert result.success is (outcome == "finish")
+        assert not adapter._paused
+        await assert_livekit_capture(adapter, monkeypatch, paused=True)
+        await adapter._handle_client_control({"action": "resume"}, "client")
+        await assert_livekit_capture(adapter, monkeypatch, paused=False)
+    finally:
+        playing.cancel()
+        await asyncio.gather(playing, return_exceptions=True)
 
 
 @pytest.mark.asyncio
