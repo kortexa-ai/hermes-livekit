@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import partial
+import logging
 import math
+from pathlib import Path
 
 from .media import pcm_rms
+
+logger = logging.getLogger("gateway.platforms.livekit.vad")
+# The pinned Silero release ships with the package; see speech_detector.py.
+DEFAULT_SILERO_MODEL = Path(__file__).with_name("models") / "silero_vad_v6.2.onnx"
 
 
 # Permit calibration in louder rooms, but bound a bad calibration (e.g. a
@@ -26,20 +32,23 @@ PCM_FRAME_BYTES = 1920  # 20 ms of the transports' 48 kHz mono PCM16.
 
 def configured_vad_factory(extra: dict):
     """Resolve once at adapter startup; every input gets independent VAD state."""
-    backend = extra.get("vad_backend", "rms")
+    backend = extra.get("vad_backend", "silero")
     if backend == "rms":
+        logger.info("VAD backend: rms")
         return AdaptiveRmsGate
     if backend != "silero":
-        raise ValueError("vad_backend must be rms or silero")
+        raise ValueError("vad_backend must be silero or rms")
     threshold = extra.get("vad_threshold", 0.5)
     if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
             or not 0.2 <= threshold <= 0.9 or not math.isfinite(threshold)):
         raise ValueError("vad_threshold must be a finite number from 0.2 to 0.9")
-    path = extra.get("vad_model_path")
+    path = extra.get("vad_model_path", str(DEFAULT_SILERO_MODEL))
     if not isinstance(path, str) or not path.strip():
-        raise ValueError("silero requires vad_model_path; run tools/prepare_vad.py first")
+        raise ValueError("vad_model_path must name a verified copy of the pinned Silero model")
     from .speech_detector import SileroRmsGate, load_silero_model
-    return partial(SileroRmsGate, load_silero_model(path), float(threshold))
+    model = load_silero_model(path)
+    logger.info("VAD backend: silero (threshold=%.2f, model=%s)", threshold, path)
+    return partial(SileroRmsGate, model, float(threshold))
 
 
 def configured_silence_duration(extra: dict) -> float:

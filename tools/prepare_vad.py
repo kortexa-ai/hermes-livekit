@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Explicitly install the pinned CPU VAD model. Never downloads during capture."""
+"""Refresh a verified copy of the pinned CPU VAD model (the package ships one
+in hermes_livekit/models). Never downloads during capture."""
 
 import argparse
 import hashlib

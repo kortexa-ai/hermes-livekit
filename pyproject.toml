@@ -30,13 +30,13 @@ dependencies = [
   "aiohttp==3.14.3",
   "aiortc==1.15.0",
   "av==17.0.0",
-]
-
-[project.optional-dependencies]
-vad = [
+  # Silero VAD runs by default. The pinned model ships inside the package
+  # (hermes_livekit/models), so a plain install needs no download step.
   "onnxruntime==1.29.0",
   "numpy==2.4.3",
 ]
+
+[project.optional-dependencies]
 dev = [
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
@@ -50,6 +50,9 @@ livekit = "hermes_livekit"
 
 [tool.setuptools.packages.find]
 include = ["hermes_livekit*"]
+
+[tool.setuptools.package-data]
+hermes_livekit = ["models/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

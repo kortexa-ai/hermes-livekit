@@ -1,4 +1,4 @@
-"""Optional CPU-only Silero VAD. Model/session is shared; stream state is not."""
+"""Default CPU-only Silero VAD. Model/session is shared; stream state is not."""
 
 from functools import lru_cache
 import hashlib
@@ -22,14 +22,14 @@ def load_silero_model(path: str):
     """No download or GPU fallback on the startup/utterance path."""
     model = Path(path).expanduser()
     if model.stat().st_size != SILERO_MODEL_BYTES:
-        raise ValueError("Silero model has an unexpected size; run tools/prepare_vad.py")
+        raise ValueError("Silero model has an unexpected size; reinstall hermes-livekit or run tools/prepare_vad.py")
     content = model.read_bytes()
     if hashlib.sha256(content).hexdigest() != SILERO_SHA256:
-        raise ValueError("Silero model checksum mismatch; run tools/prepare_vad.py")
+        raise ValueError("Silero model checksum mismatch; reinstall hermes-livekit or run tools/prepare_vad.py")
     try:
         import onnxruntime as ort
     except ImportError as exc:
-        raise ValueError("Install hermes-livekit[vad] before selecting silero") from exc
+        raise ValueError("onnxruntime is missing; reinstall hermes-livekit") from exc
     options = ort.SessionOptions()
     options.inter_op_num_threads = options.intra_op_num_threads = 1
     return ort.InferenceSession(content, sess_options=options, providers=["CPUExecutionProvider"])

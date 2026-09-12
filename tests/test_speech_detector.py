@@ -40,7 +40,8 @@ def test_classifier_preserves_sample_sequence_across_frames_and_isolates_inputs(
 
 @pytest.mark.parametrize("extra", [
     {"vad_backend": "unknown"}, {"vad_backend": None},
-    {"vad_backend": "silero"},
+    {"vad_backend": "silero", "vad_model_path": ""},
+    {"vad_backend": "silero", "vad_model_path": None},
     *({"vad_backend": "silero", "vad_model_path": "/fixture/model", "vad_threshold": v}
       for v in (True, "0.5", 0, 1, float("nan"))),
 ])
@@ -49,17 +50,28 @@ def test_invalid_detector_settings_fail_before_accepting_audio(extra):
         configured_vad_factory(extra)
 
 
-def test_default_needs_no_model_and_configured_factories_keep_state_separate(monkeypatch):
-    assert isinstance(configured_vad_factory({})(), AdaptiveRmsGate)
+def test_default_is_bundled_silero_and_configured_factories_keep_state_separate(monkeypatch):
+    from hermes_livekit.vad import DEFAULT_SILERO_MODEL
+
+    assert isinstance(configured_vad_factory({"vad_backend": "rms"})(), AdaptiveRmsGate)
     session = RecordingSession()
     paths = []
     monkeypatch.setattr("hermes_livekit.speech_detector.load_silero_model",
                         lambda path: paths.append(path) or session)
+    assert isinstance(configured_vad_factory({})(), SileroRmsGate)
     factory = configured_vad_factory({"vad_backend": "silero", "vad_model_path": "/fixture/model"})
     first, second = factory(), factory()
     first._state.fill(3)
     assert not second._state.any()
-    assert paths == ["/fixture/model"]
+    assert paths == [str(DEFAULT_SILERO_MODEL), "/fixture/model"]
+
+
+def test_bundled_model_is_the_pinned_release():
+    from hermes_livekit.vad import DEFAULT_SILERO_MODEL
+
+    assert DEFAULT_SILERO_MODEL.with_suffix(".LICENSE").read_text().startswith("MIT License")
+    session = load_silero_model(str(DEFAULT_SILERO_MODEL))
+    assert {item.name for item in session.get_inputs()} == {"input", "state", "sr"}
 
 
 def test_bad_model_is_rejected_before_runtime_construction(tmp_path):

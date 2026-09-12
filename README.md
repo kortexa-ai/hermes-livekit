@@ -227,37 +227,31 @@ split thinking pauses. Validate with the actual room and microphone before
 lowering it further. Endpoint logs include observed silence, configured target,
 and learned noise RMS; they do not contain microphone recordings.
 
-For speech/noise discrimination, optionally install the `vad` extra in the
-gateway's Python environment and prepare the pinned Silero v6.2 model:
-
-```sh
-python -m pip install -e '.[vad]'
-python tools/prepare_vad.py /absolute/path/to/silero-v6.2.onnx
-```
-
-Set these keys under either platform's `extra` configuration, then restart
-only the affected gateway:
+Speech/noise discrimination uses the pinned Silero v6.2 model by default. The
+model and its license ship inside the package (`hermes_livekit/models`) and
+`onnxruntime` is a base dependency, so a plain install runs it with no extra
+step. Tune or switch it under either platform's `extra` configuration, then
+restart only the affected gateway:
 
 ```yaml
-vad_backend: silero
-vad_model_path: /absolute/path/to/silero-v6.2.onnx
-vad_threshold: 0.5
+vad_threshold: 0.5                      # 0.2–0.9; lower is more sensitive
+vad_backend: rms                        # energy gate only, for rooms without a working runtime
+vad_model_path: /path/to/silero.onnx    # a different verified copy of the pinned model
 ```
 
-The default backend remains `rms`, with no added runtime dependency. Silero
-uses only CPU, one inference thread and independent state per input. The
-model is shared between inputs, loaded at adapter startup and checked against
-a pinned SHA-256. Missing dependencies or an invalid model fail startup; there
-is no automatic download, GPU fallback or silent change back to energy VAD.
-The confidence threshold accepts 0.2–0.9; lower values are more sensitive.
+Silero uses only CPU, one inference thread and independent state per input.
+The model is shared between inputs, loaded at adapter startup and checked
+against a pinned SHA-256. A missing runtime or an invalid model fails startup;
+there is no automatic download, GPU fallback or silent change back to energy
+VAD. The startup log names the active backend.
 The existing silence timeout still applies: this is not semantic endpointing.
 The timer starts at the detector's last positive decision, which can occur
 after audible speech has ended. Equal timer values do not guarantee equal
 endpoint latency across backends. Measure total endpoint delay and test
 mid-sentence pauses before lowering the timer; a shorter timer can split turns.
 The [model and its license](https://github.com/snakers4/silero-vad/tree/be95df9152c0d7618fa1edfeb296fc3dae32376f)
-are MIT-licensed by the Silero Team; the installer saves the license beside
-the model. Keep both outside the repository.
+are MIT-licensed by the Silero Team. `tools/prepare_vad.py <destination>`
+fetches a verified copy when the bundled release is bumped.
 
 Both backends retain 500 ms of pre-roll to protect word onsets, without waiting
 longer to dispatch the utterance. Continuous

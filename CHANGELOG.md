@@ -14,6 +14,11 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Changed
 
+- Silero VAD is the default speech detector on both transports. The pinned
+  v6.2 model and its license ship inside the package, and `onnxruntime` and
+  `numpy` are base dependencies; the `vad` extra is gone. The energy gate
+  stays available as `vad_backend: rms`. In a noisy room the energy gate
+  turned bursts into hallucinated "Okay." turns.
 - The Direct Realtime adapter drops the gateway's first-turn `/sethome`
   onboarding notice instead of showing it as assistant text on every new call.
   A call's chat id is ephemeral, so a Realtime home channel could never receive
