@@ -190,6 +190,16 @@ def _parse_ice_servers(raw: Any) -> list[Any]:
     return servers
 
 
+def _is_home_channel_prompt(content: str) -> bool:
+    """Recognize the gateway's one-time ``/sethome`` onboarding notice.
+
+    A direct call's chat id is its ephemeral call id, so a Realtime home
+    channel could never receive cron results or cross-platform messages.
+    Dropping the prompt avoids forcing a home channel on every install.
+    """
+    return "No home channel is set for" in content and "/sethome" in content
+
+
 class QueuedAudioTrack(MediaStreamTrack):
     """Continuous 20 ms RTP clock, with bounded speech and silent idle frames."""
 
@@ -934,6 +944,9 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         call = self._calls.get(chat_id)
         if call is None:
             return SendResult(success=False, error="Realtime call is closed")
+        if _is_home_channel_prompt(content):
+            logger.info("[%s] dropped the gateway home-channel prompt", chat_id)
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
         await call.protocol.assistant_transcript(content)
         await call.protocol.text_delivery_complete()
         return SendResult(success=True, message_id=uuid.uuid4().hex[:12])

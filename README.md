@@ -137,6 +137,10 @@ call slot, peer, and tools. The current direct edge
 advertises host ICE candidates; deployments across NAT still need a TURN-aware
 front door before they are internet-ready.
 
+The gateway's first-turn `/sethome` onboarding notice is dropped on direct
+calls. A call's chat id is ephemeral, so a Realtime home channel could never
+receive cron results or cross-platform messages; no home channel is forced.
+
 Each listener is permanently bound to the Hermes profile of its gateway
 process. Trusted routers can discover that fixed binding from
 `GET /v1/realtime/discovery` with the same Bearer token:

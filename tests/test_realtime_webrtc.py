@@ -573,6 +573,34 @@ async def test_direct_send_completes_transcript_response() -> None:
     assert protocol.active_response_id is None
 
 
+@pytest.mark.asyncio
+async def test_direct_send_drops_home_channel_prompt() -> None:
+    from hermes_livekit.realtime_protocol import RealtimeProtocol
+
+    events = []
+
+    async def publish(event, recipient):
+        events.append(event)
+        return True
+
+    protocol = RealtimeProtocol(
+        session_id="standalone", model="test", voice="test", publish=publish,
+    )
+    adapter = object.__new__(RealtimeWebRTCAdapter)
+    adapter._calls = {"call": SimpleNamespace(protocol=protocol)}
+    prompt = (
+        "📬 No home channel is set for Realtime. A home channel is where Hermes "
+        "delivers cron job results and cross-platform messages.\n\n"
+        "Type /sethome to make this chat your home channel, or ignore to skip."
+    )
+
+    result = await adapter.send(chat_id="call", content=prompt)
+
+    assert result.success is True
+    assert events == []
+    assert protocol.active_response_id is None
+
+
 def test_direct_adapter_supports_async_completion_delivery() -> None:
     assert RealtimeWebRTCAdapter.supports_async_delivery is True
 

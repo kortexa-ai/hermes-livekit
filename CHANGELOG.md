@@ -14,6 +14,10 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Changed
 
+- The Direct Realtime adapter drops the gateway's first-turn `/sethome`
+  onboarding notice instead of showing it as assistant text on every new call.
+  A call's chat id is ephemeral, so a Realtime home channel could never receive
+  deliveries; no home channel is forced.
 - Replaced the legacy Hermes data topics with the shared Conference contract.
   Conversation events use `conference.events`; participant tool catalogs and
   acknowledgements use `conference.tools`; optional camera/runtime controls
