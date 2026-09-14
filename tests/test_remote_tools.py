@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import hermes_livekit
 from hermes_livekit.adapter import LiveKitAdapter
 from hermes_livekit.tool_safety import ToolAuditLog, ToolPolicy
 from tools.registry import registry
@@ -588,6 +589,58 @@ async def test_remote_tool_handler_cancellation_abandons_native_rpc_wait() -> No
 
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_loop_stop_cancels_only_its_cross_loop_native_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = {name: asyncio.Event() for name in ("a", "b")}
+    cancelled = {name: asyncio.Event() for name in ("a", "b")}
+
+    class BlockingParticipant(FakeLocalParticipant):
+        async def perform_rpc(self, **kwargs: object) -> str:
+            name = json.loads(str(kwargs["payload"]))["call"]
+            started[name].set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled[name].set()
+                raise
+
+    adapter = adapter_with_client(BlockingParticipant())
+    from hermes_livekit.adapter import _LIVE_ADAPTERS
+
+    monkeypatch.setattr(
+        adapter, "_tool_invocation_session_key", lambda session_id: session_id
+    )
+    _LIVE_ADAPTERS.add(adapter)
+    handler = adapter._build_tool_handler("client-1", "desktop_notify")
+    calls = {
+        name: asyncio.create_task(
+            asyncio.to_thread(
+                lambda name=name: asyncio.run(
+                    handler({"call": name}, session_id=f"session-{name}")
+                )
+            )
+        )
+        for name in ("a", "b")
+    }
+    try:
+        await asyncio.gather(*(event.wait() for event in started.values()))
+
+        hermes_livekit._on_agent_loop_stopped_hook(
+            session_key="session-a", platform="livekit"
+        )
+
+        await asyncio.wait_for(cancelled["a"].wait(), 1)
+        assert not cancelled["b"].is_set()
+        assert not calls["b"].done()
+    finally:
+        hermes_livekit._on_agent_loop_stopped_hook(
+            session_key="session-b", platform="livekit"
+        )
+        await asyncio.gather(*calls.values(), return_exceptions=True)
 
 
 def test_hand_rolled_call_result_state_is_gone() -> None:

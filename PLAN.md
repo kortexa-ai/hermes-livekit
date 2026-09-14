@@ -23,9 +23,10 @@ Operational state of the plugin and dependencies that don't show up in
 - Advertised method names use bounded case-sensitive dotted ASCII identifiers;
   policy and RPC keep the exact method while Hermes registry suffixes remain
   model-safe.
-- The former Hermes `/stop` hook dependency applied only to the removed custom
-  pending-call table. Cancelling the calling coroutine now abandons the native
-  RPC wait, so this plugin no longer needs session-reset hooks.
+- Hermes `/stop` and the running `/new` path cancel native RPC work through the
+  `agent_loop_stopped` hook. This remains necessary because Hermes dispatches
+  async tools on worker loops: abandoning the worker does not otherwise cancel
+  the RPC task scheduled back onto the gateway loop.
 
 ## Next phases
 

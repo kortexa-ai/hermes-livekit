@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -84,6 +85,7 @@ from .tool_result_protocol import (
     validate_completed_size,
     validate_stream_header,
 )
+from .direct_tools import resolve_gateway_session_key
 from .tool_model import (
     FunctionToolDefinition,
     ToolDefinitionError,
@@ -114,6 +116,9 @@ from .native_transcript import NativeTranscriptMixin
 # branch's core-resident version does, so the log output is
 # byte-identical whether the LiveKit platform lives in core or here.
 logger = logging.getLogger("gateway.platforms.livekit")
+
+
+_LIVE_ADAPTERS: "weakref.WeakSet[LiveKitAdapter]" = weakref.WeakSet()
 
 
 # Allow operators to dial verbosity without editing code:
@@ -280,6 +285,8 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         self._tool_methods: Dict[str, str] = {}  # registry name -> RPC method
         self._tool_policy = self._resolve_tool_policy()
         self._tool_audit = ToolAuditLog()
+        self._pending_native_rpc_tasks: dict[str, set[asyncio.Task[Any]]] = {}
+        _LIVE_ADAPTERS.add(self)
 
         # Binary RPC results use one reserved LiveKit topic per pending call.
         # State is also initialized lazily for contract tests that construct the
@@ -2232,7 +2239,9 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         except RuntimeError:
             owner_loop = None
 
-        async def invoke(args: Optional[Dict[str, Any]] = None) -> Any:
+        async def invoke(
+            args: dict[str, Any] | None, invocation_session_key: str
+        ) -> Any:
             import json as _json
 
             decision = self._tool_policy_decision(owner_identity, registered_name)
@@ -2241,6 +2250,10 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                     "invocation", owner_identity, registered_name, decision.tier, "denied"
                 )
                 raise RuntimeError("remote tool invocation denied by policy")
+            task = asyncio.current_task()
+            pending = self.__dict__.setdefault("_pending_native_rpc_tasks", {})
+            if task is not None and invocation_session_key:
+                pending.setdefault(invocation_session_key, set()).add(task)
             try:
                 arguments: Dict[str, Any] = dict(args or {})
                 if not self._room or owner_identity not in self._room.remote_participants:
@@ -2279,6 +2292,13 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
                     "invocation", owner_identity, registered_name, decision.tier, "error"
                 )
                 raise
+            finally:
+                if task is not None and invocation_session_key:
+                    tasks = pending.get(invocation_session_key)
+                    if tasks is not None:
+                        tasks.discard(task)
+                        if not tasks:
+                            pending.pop(invocation_session_key, None)
             self._audit_tool(
                 "invocation", owner_identity, registered_name, decision.tier, "success"
             )
@@ -2293,20 +2313,57 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             # supported dictionary result is the multimodal envelope above.
             return _json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
 
-        async def proxy(args: Optional[Dict[str, Any]] = None, **_kwargs: Any) -> Any:
+        async def proxy(args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
             # Hermes dispatches async tools from worker loops. Binary stream
             # callbacks and room cleanup run on the gateway loop; their futures
             # and transfer maps must have that same owner.
             nonlocal owner_loop
+            invocation_session_key = self._tool_invocation_session_key(
+                kwargs.get("session_id")
+            )
             running_loop = asyncio.get_running_loop()
             if owner_loop is None:
                 owner_loop = running_loop
             if running_loop is owner_loop:
-                return await invoke(args)
-            result = asyncio.run_coroutine_threadsafe(invoke(args), owner_loop)
+                return await invoke(args, invocation_session_key)
+            result = asyncio.run_coroutine_threadsafe(
+                invoke(args, invocation_session_key), owner_loop
+            )
             return await asyncio.wrap_future(result)
 
         return proxy
+
+    @staticmethod
+    def _tool_invocation_session_key(session_id: Any) -> str:
+        """Resolve Hermes's persisted session ID to the gateway routing key."""
+        if not isinstance(session_id, str) or not session_id:
+            return ""
+        return resolve_gateway_session_key(session_id) or session_id
+
+    def cancel_native_rpc_for_session(self, session_key: str) -> int:
+        """Cancel native RPC tasks owned by one interrupted Hermes session."""
+        tasks = list(
+            self.__dict__.setdefault("_pending_native_rpc_tasks", {}).get(
+                session_key, ()
+            )
+        )
+        cancelled = 0
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        for task in tasks:
+            if task.done():
+                continue
+            loop = task.get_loop()
+            if loop is running_loop:
+                task.cancel()
+            elif loop.is_running():
+                loop.call_soon_threadsafe(task.cancel)
+            else:
+                continue
+            cancelled += 1
+        return cancelled
 
     @staticmethod
     def _valid_tool_owner_identity(identity: str) -> bool:

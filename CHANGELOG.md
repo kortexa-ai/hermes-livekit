@@ -42,6 +42,9 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Fixed
 
+- Hermes `/stop` and running `/new` interruptions now cancel LiveKit native
+  RPC calls scheduled on the gateway loop instead of leaving them alive until
+  the SDK response timeout.
 - Kept Direct Realtime capture suppressed for a short playout guard after TTS
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.

@@ -24,6 +24,26 @@ class DirectToolError(ToolDefinitionError):
 DirectToolDefinition = FunctionToolDefinition
 
 
+def resolve_gateway_session_key(session_id: Any) -> str | None:
+    """Resolve Hermes's persisted session ID to its gateway routing key."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+
+        database = SessionDB(read_only=True)
+        try:
+            session = database.get_session(session_id)
+        finally:
+            database.close()
+    # A missing/corrupt session database must not block the remote tool call;
+    # the persisted ID remains a safe fallback for cancellation ownership.
+    except Exception:  # noqa: BLE001
+        return None
+    key = session.get("session_key") if isinstance(session, dict) else None
+    return key if isinstance(key, str) and key else None
+
+
 def parse_direct_tools(
     session: dict[str, Any],
 ) -> tuple[list[DirectToolDefinition], str | dict[str, str]]:
@@ -242,18 +262,7 @@ class DirectToolBridge:
     @staticmethod
     def _lookup_session_key(session_id: str) -> str | None:
         """Resolve Hermes's persisted session ID to its gateway routing key."""
-        try:
-            from hermes_state import SessionDB
-
-            database = SessionDB(read_only=True)
-            try:
-                session = database.get_session(session_id)
-            finally:
-                database.close()
-        except Exception:
-            return None
-        key = session.get("session_key") if isinstance(session, dict) else None
-        return key if isinstance(key, str) and key else None
+        return resolve_gateway_session_key(session_id)
 
     async def _request(self, name: str, arguments: dict[str, Any]) -> str:
         processing_turn = self.protocol.processing_turn_id

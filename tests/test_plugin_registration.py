@@ -118,7 +118,11 @@ def test_register_declares_late_bound_remote_toolset(
     assert TOOLSETS[TOOLSET_NAME]["tools"] == []
 
 
-def test_register_does_not_add_obsolete_remote_tool_cancellation_hooks() -> None:
+def test_register_adds_only_the_supported_remote_tool_cancellation_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import plugins as hermes_plugins
+
     hooks: list[tuple[str, object]] = []
 
     class Context:
@@ -128,6 +132,21 @@ def test_register_does_not_add_obsolete_remote_tool_cancellation_hooks() -> None
         def register_hook(self, name: str, callback: object) -> None:
             hooks.append((name, callback))
 
+    monkeypatch.setattr(
+        hermes_plugins,
+        "VALID_HOOKS",
+        hermes_plugins.VALID_HOOKS - {"agent_loop_stopped"},
+    )
+    hermes_livekit.register(Context())
+    assert hooks == []
+
+    monkeypatch.setattr(
+        hermes_plugins,
+        "VALID_HOOKS",
+        {*hermes_plugins.VALID_HOOKS, "agent_loop_stopped"},
+    )
     hermes_livekit.register(Context())
 
-    assert hooks == []
+    assert hooks == [
+        ("agent_loop_stopped", hermes_livekit._on_agent_loop_stopped_hook)
+    ]
