@@ -169,8 +169,11 @@ async def test_conference_bounds_capture_and_only_classifies_new_pcm(monkeypatch
     from hermes_livekit.adapter import LiveKitAdapter
     import hermes_livekit.adapter as conference
 
-    platform_registry.register(PlatformEntry(name="livekit", label="LiveKit",
-        adapter_factory=LiveKitAdapter, check_fn=lambda: True))
+    platform_registry.register(
+        PlatformEntry(name="livekit", label="LiveKit",
+                      adapter_factory=LiveKitAdapter, check_fn=lambda: True),
+        scope=platform_registry.current_scope_key(),
+    )
     request.addfinalizer(lambda: platform_registry.unregister("livekit"))
 
     clock = [0.0]

@@ -210,9 +210,9 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
     """
 
     def __init__(self, config: PlatformConfig):
-        # Use Platform("livekit") instead of Platform.LIVEKIT — the plugin
-        # registers the platform name dynamically and Platform._missing_
-        # creates a pseudo-member on first lookup.
+        # PluginContext registers the name before the factory runs, allowing
+        # Hermes to create its dynamic Platform member through the public
+        # platform registry contract.
         super().__init__(config, Platform("livekit"))
 
         extra = config.extra or {}

@@ -327,7 +327,10 @@ unchanged. This is conservative amplitude trimming, not speech recognition;
 disable it when exact leading timing or unusually faint output must be kept.
 The provider's output contract and whole-file fallback are unchanged.
 
-Run the transport tests with `uv run --no-sync pytest -q tests/test_streaming_tts.py`.
+Run the transport tests with
+`scripts/run_tests.sh -q tests/test_streaming_tts.py`. The mandatory first lane
+uses vanilla Hermes. When `.env.development.local` configures the verified
+adjacent Kortexa fork, the same command also runs the optimized pipeline cases.
 To test the configured TTS service through real local RTP peers, explicitly opt
 in with `HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml` and select
 `-k smarty-opt-in -s`. The canary prints timings, not credentials, and does not

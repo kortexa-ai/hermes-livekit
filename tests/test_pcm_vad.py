@@ -79,8 +79,11 @@ async def test_transport_preserves_early_speech_and_rejects_room_noise(
         finally:
             call.output_track.stop()
     else:
-        platform_registry.register(PlatformEntry(name="livekit", label="LiveKit",
-            adapter_factory=LiveKitAdapter, check_fn=lambda: True))
+        platform_registry.register(
+            PlatformEntry(name="livekit", label="LiveKit",
+                          adapter_factory=LiveKitAdapter, check_fn=lambda: True),
+            scope=platform_registry.current_scope_key(),
+        )
         try:
             # Energy-gate batching contract; the synthetic square wave is not speech to Silero.
             adapter = LiveKitAdapter(PlatformConfig(extra={"silence_duration": 0.7, "vad_backend": "rms"}))

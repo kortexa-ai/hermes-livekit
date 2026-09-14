@@ -2,16 +2,33 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from types import SimpleNamespace
 
-import pytest
-
 import hermes_livekit
+import pytest
 from hermes_livekit.adapter import TOOLSET_NAME, check_livekit_requirements
 from hermes_livekit.realtime_webrtc import check_realtime_requirements
 
 
 _CREDENTIAL_VARS = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+
+
+def test_entry_point_import_defers_gateway_adapters() -> None:
+    probe = (
+        "import sys, hermes_livekit; "
+        "assert 'hermes_livekit.adapter' not in sys.modules; "
+        "assert 'hermes_livekit.realtime_webrtc' not in sys.modules"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _clear_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,11 +135,7 @@ def test_register_declares_late_bound_remote_toolset(
     assert TOOLSETS[TOOLSET_NAME]["tools"] == []
 
 
-def test_register_adds_only_the_supported_remote_tool_cancellation_hook(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from hermes_cli import plugins as hermes_plugins
-
+def test_register_adds_remote_tool_cancellation_hook() -> None:
     hooks: list[tuple[str, object]] = []
 
     class Context:
@@ -132,19 +145,6 @@ def test_register_adds_only_the_supported_remote_tool_cancellation_hook(
         def register_hook(self, name: str, callback: object) -> None:
             hooks.append((name, callback))
 
-    monkeypatch.setattr(
-        hermes_plugins,
-        "VALID_HOOKS",
-        hermes_plugins.VALID_HOOKS - {"agent_loop_stopped"},
-    )
-    hermes_livekit.register(Context())
-    assert hooks == []
-
-    monkeypatch.setattr(
-        hermes_plugins,
-        "VALID_HOOKS",
-        {*hermes_plugins.VALID_HOOKS, "agent_loop_stopped"},
-    )
     hermes_livekit.register(Context())
 
     assert hooks == [

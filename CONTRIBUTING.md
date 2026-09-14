@@ -44,8 +44,18 @@ You'll need:
 
 ```bash
 python -m pip install -e '.[dev]'
-pytest
+scripts/run_tests.sh
 ```
+
+The first lane always runs against the vanilla Hermes installation in
+`.venv`. It fails before collection if Python resolves the adjacent Kortexa
+checkout by accident.
+
+Kortexa developers can copy `.env.development.example` to
+`.env.development.local`. The same command then runs a second lane against the
+adjacent `../hermes-agent` checkout after verifying its `origin` is
+`https://github.com/kortexa-ai/hermes-agent.git` and its checked-out branch is
+`kortexa-ai/main`. This lane includes the optimized realtime pipeline tests.
 
 `tests/test_adapter_contract.py` checks that every `LiveKitAdapter` override
 still accepts what the gateway passes to `BasePlatformAdapter`. That drift has

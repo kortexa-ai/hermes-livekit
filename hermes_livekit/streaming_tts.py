@@ -145,7 +145,10 @@ class StreamingTTSMixin:
                 handle.pending = None
             if not self._tts_current(handle):
                 return
-            if not handle.audible:
+            # Older Hermes consumers set ``audible`` after any provider chunk,
+            # even when the resampler buffered it. Track the sink event with
+            # our own timestamp so host behavior cannot skip this state.
+            if handle.first_queued_at is None:
                 handle.first_queued_at = time.monotonic()
                 trimmed_ms = handle.leading_silence.trimmed_frames * 20 if handle.leading_silence else 0
                 logger.info("[%s] streaming TTS first PCM: %.3fs from stream open; trimmed=%dms",

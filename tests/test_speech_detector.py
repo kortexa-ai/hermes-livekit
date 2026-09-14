@@ -157,7 +157,11 @@ async def test_adapter_config_reaches_negotiated_call_and_unmute(monkeypatch, re
     session = RecordingSession()
     monkeypatch.setattr("hermes_livekit.speech_detector.load_silero_model", lambda _: session)
     for name, factory in (("realtime", RealtimeWebRTCAdapter), ("livekit", LiveKitAdapter)):
-        platform_registry.register(PlatformEntry(name=name, label=name, adapter_factory=factory, check_fn=lambda: True))
+        platform_registry.register(
+            PlatformEntry(name=name, label=name, adapter_factory=factory,
+                          check_fn=lambda: True),
+            scope=platform_registry.current_scope_key(),
+        )
         request.addfinalizer(lambda key=name: platform_registry.unregister(key))
     extra = {"host": "127.0.0.1", "port": 0, "api_key": "fixture", "vad_backend": "silero",
              "vad_model_path": "/fixture/model", "vad_threshold": 0.6}

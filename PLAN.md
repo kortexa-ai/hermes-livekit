@@ -7,6 +7,10 @@ Operational state of the plugin and dependencies that don't show up in
 ## Where we are
 
 - **v0.4.0** is the latest tagged release.
+- `scripts/run_tests.sh` always validates the public plugin against vanilla
+  Hermes first. A local `.env.development.local` adds a second full run against
+  the adjacent `kortexa-ai/hermes-agent` fork on `kortexa-ai/main`, including
+  the optimized streaming completion and fallback contracts.
 - Conference clients register one portable catalog with
   `conference.tools.register` on `conference.tools`. Small Hermes tool calls
   use LiveKit native RPC; bounded binary results use byte streams after the

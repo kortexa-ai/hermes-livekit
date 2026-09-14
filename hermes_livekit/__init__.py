@@ -7,36 +7,47 @@ point uses an existing ``register_platform()`` hook.
 
 import logging
 import os
+from importlib import import_module
 from typing import Optional
-
-from .adapter import (
-    _LIVE_ADAPTERS,
-    TOOLSET_NAME,
-    LiveKitAdapter,
-    check_livekit_requirements,
-)
-from .direct_tools import install_direct_toolsets
-from .realtime_webrtc import (
-    RealtimeWebRTCAdapter,
-    check_realtime_requirements,
-)
-from .voice_metrics import register_voice_metrics
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
 __all__ = [
-    "register",
     "LiveKitAdapter",
     "RealtimeWebRTCAdapter",
     "check_livekit_requirements",
     "check_realtime_requirements",
+    "register",
 ]
+
+_LAZY_EXPORTS = {
+    "LiveKitAdapter": (".adapter", "LiveKitAdapter"),
+    "RealtimeWebRTCAdapter": (".realtime_webrtc", "RealtimeWebRTCAdapter"),
+    "check_livekit_requirements": (".adapter", "check_livekit_requirements"),
+    "check_realtime_requirements": (
+        ".realtime_webrtc",
+        "check_realtime_requirements",
+    ),
+}
+
+
+def __getattr__(name: str):
+    """Load adapter exports only after Hermes finishes importing its config."""
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    module_name, attribute = target
+    value = getattr(import_module(module_name, __name__), attribute)
+    globals()[name] = value
+    return value
 
 
 def _on_agent_loop_stopped_hook(*, session_key: str, platform: str, **_kwargs) -> None:
     """Cancel LiveKit RPC work that outlived its interrupted Hermes tool worker."""
     if platform != "livekit":
         return
+    from .adapter import _LIVE_ADAPTERS
+
     cancelled = sum(
         adapter.cancel_native_rpc_for_session(session_key)
         for adapter in list(_LIVE_ADAPTERS)
@@ -224,6 +235,14 @@ def register(ctx) -> None:
     auto-configures from ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
     ``LIVEKIT_API_SECRET`` env vars.
     """
+    from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
+    from .direct_tools import install_direct_toolsets
+    from .realtime_webrtc import (
+        RealtimeWebRTCAdapter,
+        check_realtime_requirements,
+    )
+    from .voice_metrics import register_voice_metrics
+
     register_voice_metrics(ctx)
     ctx.register_platform(
         name="livekit",
@@ -300,9 +319,4 @@ def register(ctx) -> None:
     # Hermes abandons interrupted tool workers after a bounded grace period.
     # The owner-loop RPC task needs the matching observer signal so it does not
     # remain live until the SDK timeout.
-    try:
-        from hermes_cli.plugins import VALID_HOOKS
-    except ImportError:
-        VALID_HOOKS = frozenset()
-    if "agent_loop_stopped" in VALID_HOOKS:
-        ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)
+    ctx.register_hook("agent_loop_stopped", _on_agent_loop_stopped_hook)

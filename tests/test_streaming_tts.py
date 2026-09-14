@@ -310,12 +310,15 @@ def test_onset_setting_is_opt_in_and_requires_a_boolean(adapter_type):
     from gateway.platform_registry import PlatformEntry, platform_registry
 
     name = "realtime" if adapter_type is RealtimeWebRTCAdapter else "livekit"
-    platform_registry.register(PlatformEntry(
-        # Register a test-owned factory, not the plugin class: earlier plugin
-        # discovery tests can bind that class to a different profile scope.
-        name=name, label=name, adapter_factory=lambda config: adapter_type(config),
-        check_fn=lambda: True,
-    ))
+    platform_registry.register(
+        PlatformEntry(
+            # Register a test-owned factory, not the plugin class: earlier plugin
+            # discovery tests can bind that class to a different profile scope.
+            name=name, label=name, adapter_factory=lambda config: adapter_type(config),
+            check_fn=lambda: True,
+        ),
+        scope=platform_registry.current_scope_key(),
+    )
     try:
         assert platform_registry.is_registered(name)
         assert not adapter_type(PlatformConfig())._tts_trim_leading_silence
@@ -444,6 +447,7 @@ async def test_onset_does_not_observe_failed_or_cancelled_writes(kind, failure, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.kortexa_hermes
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
 async def test_quiet_prefix_failure_still_allows_whole_file_fallback(kind, monkeypatch):
     adapter, owner, protocol, sink, events = voice_adapter(kind)
@@ -697,6 +701,7 @@ async def test_unsupported_format_or_destination_declines_before_output(kind):
 
 
 @pytest.mark.asyncio
+@pytest.mark.kortexa_hermes
 @pytest.mark.parametrize("kind", ["realtime", "livekit"])
 async def test_incomplete_first_sample_does_not_suppress_fallback(kind, monkeypatch):
     adapter, owner, protocol, sink, events = voice_adapter(kind)
@@ -720,6 +725,7 @@ async def test_incomplete_first_sample_does_not_suppress_fallback(kind, monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.kortexa_hermes
 async def test_gateway_finalizer_allows_a_long_reply_to_finish_playing(monkeypatch):
     from gateway.run_turn import GatewayTurnMixin
 

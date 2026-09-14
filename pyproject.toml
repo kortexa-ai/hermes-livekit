@@ -56,3 +56,7 @@ hermes_livekit = ["models/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = ["-m", "not kortexa_hermes"]
+markers = [
+  "kortexa_hermes: requires the adjacent kortexa-ai/hermes-agent checkout and its optimized pipeline fixes",
+]

@@ -42,6 +42,10 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Fixed
 
+- Rebuilt local and CI validation around vanilla Hermes while retaining an
+  explicit, origin- and branch-verified Kortexa pipeline lane. Plugin import no
+  longer eagerly loads gateway adapters during Hermes config initialization,
+  and native streaming tolerates the older vanilla audible-state behavior.
 - Hermes `/stop` and running `/new` interruptions now cancel LiveKit native
   RPC calls scheduled on the gateway loop instead of leaving them alive until
   the SDK response timeout.

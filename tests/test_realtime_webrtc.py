@@ -46,7 +46,7 @@ def realtime_platform() -> None:
         adapter_factory=lambda config: RealtimeWebRTCAdapter(config),
         check_fn=check_realtime_requirements,
     )
-    platform_registry.register(entry)
+    platform_registry.register(entry, scope=platform_registry.current_scope_key())
     try:
         yield
     finally:
