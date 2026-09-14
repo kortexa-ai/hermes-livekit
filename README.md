@@ -331,6 +331,22 @@ Run the transport tests with
 `scripts/run_tests.sh -q tests/test_streaming_tts.py`. The mandatory first lane
 uses vanilla Hermes. When `.env.development.local` configures the verified
 adjacent Kortexa fork, the same command also runs the optimized pipeline cases.
+Create or refresh the vanilla environment first with
+`scripts/bootstrap_tests.sh`. It keeps upstream Hermes in the ignored
+`.development/hermes-agent` checkout, verifies its origin, updates it to
+upstream `main`, and recreates `.venv` with the plugin's complete dependencies.
+
+Hermes releases before the session-owned toolset API proposed in
+[NousResearch/hermes-agent#110515](https://github.com/NousResearch/hermes-agent/issues/110515)
+have no public way to bind client-supplied Realtime tools to one conversation.
+On those versions, `hermes_livekit.direct_tools` deliberately uses a compatibility
+path that mutates `toolsets.TOOLSETS`, copies `toolsets._HERMES_CORE_TOOLS`,
+extends `tools.tool_search._DIRECT_SURFACE_TOOLSETS`, and registers scoped names
+through `tools.registry`. When `PluginContext.session_toolset` is available, the
+plugin feature-detects it and uses the public, session-isolated lifecycle instead.
+Issue [#77](https://github.com/kortexa-ai/hermes-livekit/issues/77) tracks removal
+of the compatibility path after the upstream API is released.
+
 To test the configured TTS service through real local RTP peers, explicitly opt
 in with `HERMES_TTS_CANARY_CONFIG=/path/to/profile/config.yaml` and select
 `-k smarty-opt-in -s`. The canary prints timings, not credentials, and does not

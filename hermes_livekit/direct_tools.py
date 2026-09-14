@@ -100,9 +100,13 @@ def install_direct_toolsets() -> None:
 class DirectToolBridge:
     """Register one call's tools and proxy invocations over its data channel."""
 
-    def __init__(self, *, session_id: str, protocol: Any) -> None:
+    def __init__(
+        self, *, session_id: str, protocol: Any, session_toolset_factory: Any = None,
+    ) -> None:
         self.session_id = session_id
         self.protocol = protocol
+        self._session_toolset_factory = session_toolset_factory
+        self._session_toolset = None
         self._registered: dict[str, tuple[str, Any, str | None]] = {}
         self._definitions: dict[str, DirectToolDefinition] = {}
         self._call_lock = asyncio.Lock()
@@ -114,6 +118,9 @@ class DirectToolBridge:
             self._owner_loop = None
 
     def register(self, tools: Iterable[DirectToolDefinition]) -> None:
+        if callable(self._session_toolset_factory):
+            self._register_public(tools)
+            return
         from tools.registry import registry
         from toolsets import TOOLSETS
 
@@ -146,8 +153,36 @@ class DirectToolBridge:
             self.close()
             raise
 
+    def _register_public(self, tools: Iterable[DirectToolDefinition]) -> None:
+        lease = self._session_toolset_factory(
+            self.session_id,
+            name=DIRECT_TOOLSET_NAME,
+            description="Tools offered by the active OpenAI Realtime client",
+            direct=True,
+        )
+        self._session_toolset = lease
+        try:
+            for tool in tools:
+                registry_name = lease.register_tool(
+                    tool.name,
+                    schema=tool.registry_schema(tool.name),
+                    handler=self._handler(tool.name),
+                    is_async=True,
+                    description=tool.description,
+                )
+                self._registered[registry_name] = (tool.name, None, None)
+                self._definitions[registry_name] = tool
+        except Exception:
+            self.close()
+            raise
+
     def set_tool_choice(self, tool_choice: str | dict[str, str]) -> None:
         """Expose only the registry entries allowed for the next Hermes turn."""
+        if self._session_toolset is not None:
+            # Public session toolsets are cache-stable after their first turn.
+            # The handler and prompt enforce tool_choice without rewriting the
+            # model's cached schema mid-conversation.
+            return
         from toolsets import TOOLSETS
 
         static_names = TOOLSETS[DIRECT_TOOLSET_NAME]["tools"]
@@ -162,6 +197,12 @@ class DirectToolBridge:
                 static_names.remove(registry_name)
 
     def close(self) -> None:
+        if self._session_toolset is not None:
+            self._session_toolset.dispose()
+            self._session_toolset = None
+            self._registered.clear()
+            self._definitions.clear()
+            return
         from tools.registry import registry
         from toolsets import TOOLSETS
 

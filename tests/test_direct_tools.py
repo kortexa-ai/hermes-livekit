@@ -313,3 +313,43 @@ def test_registered_direct_toolset_is_selected_for_realtime_platform() -> None:
         assert DIRECT_TOOLSET_NAME in _get_platform_tools({}, "realtime")
     finally:
         bridge.close()
+
+
+@pytest.mark.kortexa_hermes
+def test_patched_hermes_uses_public_session_toolset_api() -> None:
+    from hermes_cli.plugin_session_toolsets import session_toolset_names
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    session_key = "agent:main:realtime:dm:public-api"
+    manager = PluginManager(scope_key=registry.current_scope_key())
+    context = PluginContext(
+        PluginManifest(name="livekit-public-api", key="livekit-public-api"),
+        manager,
+    )
+    protocol = AsyncMock()
+    protocol.tool_choice = "auto"
+    protocol.processing_turn_id = object()
+    protocol.request_client_tool.return_value = "public-result"
+    tools, _choice = parse_direct_tools(direct_session())
+    bridge = DirectToolBridge(
+        session_id=session_key,
+        protocol=protocol,
+        session_toolset_factory=context.session_toolset,
+    )
+    bridge.register(tools)
+    registry_name = next(iter(bridge._registered))
+    toolset_name = bridge._session_toolset.name
+    try:
+        assert session_toolset_names(
+            session_key, scope=registry.current_scope_key()
+        ) == [toolset_name]
+        assert registry.dispatch(
+            registry_name, {}, gateway_session_key="another-session"
+        ).startswith('{"error"')
+        assert registry.dispatch(
+            registry_name, {"value": "ready"}, gateway_session_key=session_key,
+            session_id=session_key,
+        ) == "public-result"
+    finally:
+        bridge.close()
+    assert registry.get_entry(registry_name) is None

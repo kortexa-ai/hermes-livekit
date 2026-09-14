@@ -244,6 +244,8 @@ def register(ctx) -> None:
     from .voice_metrics import register_voice_metrics
 
     register_voice_metrics(ctx)
+    session_toolset_factory = getattr(ctx, "session_toolset", None)
+
     ctx.register_platform(
         name="livekit",
         label="LiveKit",
@@ -277,7 +279,9 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="realtime",
         label="Realtime WebRTC",
-        adapter_factory=lambda cfg: RealtimeWebRTCAdapter(cfg),
+        adapter_factory=lambda cfg: RealtimeWebRTCAdapter(
+            cfg, session_toolset_factory=session_toolset_factory,
+        ),
         check_fn=check_realtime_requirements,
         validate_config=_validate_realtime_config,
         is_connected=_validate_realtime_config,
@@ -293,24 +297,24 @@ def register(ctx) -> None:
         platform_hint=_LIVEKIT_PLATFORM_HINT.replace("LiveKit voice channel", "direct WebRTC voice call"),
     )
 
-    # Declare the platform bundles and late-bound remote-tool toolsets.
-    # Client tools are registered only after a participant connects, but the
-    # empty declaration keeps config validation truthful before that happens.
+    # Older Hermes releases need explicit platform and client-tool declarations.
+    # The public session-toolset API owns this lifecycle on patched/newer hosts.
     try:
-        from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
-        if "hermes-livekit" not in TOOLSETS:
-            TOOLSETS["hermes-livekit"] = {
-                "description": "LiveKit voice toolset — interact with Hermes via WebRTC voice",
-                "tools": _HERMES_CORE_TOOLS,
-                "includes": [],
-            }
-        if TOOLSET_NAME not in TOOLSETS:
-            TOOLSETS[TOOLSET_NAME] = {
-                "description": "Tools offered by connected LiveKit clients",
-                "tools": [],
-                "includes": [],
-            }
-        install_direct_toolsets()
+        if not callable(session_toolset_factory):
+            from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+            if "hermes-livekit" not in TOOLSETS:
+                TOOLSETS["hermes-livekit"] = {
+                    "description": "LiveKit voice toolset — interact with Hermes via WebRTC voice",
+                    "tools": _HERMES_CORE_TOOLS,
+                    "includes": [],
+                }
+            if TOOLSET_NAME not in TOOLSETS:
+                TOOLSETS[TOOLSET_NAME] = {
+                    "description": "Tools offered by connected LiveKit clients",
+                    "tools": [],
+                    "includes": [],
+                }
+            install_direct_toolsets()
     except Exception:
         # Toolset registration is best-effort; the adapter still works
         # without it (resolves through the gateway umbrella toolset).

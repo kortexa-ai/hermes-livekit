@@ -9,6 +9,7 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.development/
 
 # Env / credentials — never commit these
 .env

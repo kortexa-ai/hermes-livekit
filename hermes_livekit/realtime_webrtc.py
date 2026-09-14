@@ -512,8 +512,9 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
     # and TTS response over the existing peer connection.
     supports_async_delivery = True
 
-    def __init__(self, config: PlatformConfig):
+    def __init__(self, config: PlatformConfig, *, session_toolset_factory: Any = None):
         super().__init__(config, Platform("realtime"))
+        self._session_toolset_factory = session_toolset_factory
         extra = config.extra or {}
         self.config.extra = extra
         self._silence_duration = configured_silence_duration(extra)
@@ -787,6 +788,7 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
                 bridge = DirectToolBridge(
                     session_id=self._session_key_for_call(call),
                     protocol=protocol,
+                    session_toolset_factory=self._session_toolset_factory,
                 )
                 call.tool_bridge = bridge
                 bridge.register(tools)
