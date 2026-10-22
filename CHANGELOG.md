@@ -53,6 +53,16 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.
 
+## [0.4.2] — 2026-10-22
+
+### Fixed
+
+- Aligned both distribution and native-plugin dependencies with Hermes'
+  `aiohttp==3.14.5` pin. The previous `3.14.3` pin made the shared environment
+  unsatisfiable and caused Hermes updates to disable LiveKit. Reinstall this
+  version with `--enable --yes-deps` for each affected profile, then restart
+  the shared gateway.
+
 ## [0.4.0] — 2026-07-28
 
 ### Added
