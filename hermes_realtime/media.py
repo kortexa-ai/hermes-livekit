@@ -114,7 +114,7 @@ def transcribe_pcm(pcm: bytes, sample_rate: int, channels: int) -> str:
     """
     from tools.transcription_tools import transcribe_audio
 
-    directory = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+    directory = os.path.join(tempfile.gettempdir(), "hermes_realtime")
     os.makedirs(directory, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         suffix=".wav", prefix="utterance_", dir=directory, delete=False

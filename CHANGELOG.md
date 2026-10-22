@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **hermes-livekit** are documented here, in the format
+All notable changes to **hermes-realtime** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
@@ -10,7 +10,7 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 - Added authenticated `GET /v1/realtime/discovery` metadata so trusted routers
   can map a Hermes profile name to the fixed-profile Direct Realtime listener
-  without loading or switching profiles inside hermes-livekit.
+  without loading or switching profiles inside hermes-realtime.
 
 ### Changed
 
@@ -52,6 +52,21 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 - Kept Direct Realtime capture suppressed for a short playout guard after TTS
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.
+
+## [0.5.0] — 2026-10-22
+
+### Changed
+
+- Renamed the repository and distribution from `hermes-livekit` to
+  `hermes-realtime`, the Python package/native install path from
+  `hermes_livekit` to `hermes_realtime`, and the Hermes plugin/entry point
+  from `livekit` to `realtime`.
+- Renamed explicit plugin toolsets to `hermes-realtime` and
+  `hermes-realtime-tools`; updated installation, CI, imports and documentation.
+- Existing installs must remove the old plugin, migrate its settings and
+  reinstall under the new name. See the README upgrade and rollback steps.
+  LiveKit platform settings, transport protocols and SDK dependencies retain
+  their existing names and behavior.
 
 ## [0.4.4] — 2026-10-22
 
@@ -176,8 +191,8 @@ PR NousResearch/hermes-agent#3894.
   and matching outbound `agent:tool-*` events. Full design in
   `docs/remote-tools-design.md`.
 - Tools register into the hermes registry under the
-  `hermes-livekit-tools` toolset. **Operators must add
-  `hermes-livekit-tools` to the active toolsets in `~/.hermes/config.yaml`
+  `hermes-realtime-tools` toolset. **Operators must add
+  `hermes-realtime-tools` to the active toolsets in `~/.hermes/config.yaml`
   (`platform_toolsets.livekit`)** for the LLM to see client-registered
   tools. The plugin does not auto-activate.
 - `HERMES_LIVEKIT_TOOL_TIMEOUT_SEC` env override (default 30s) for the
@@ -206,7 +221,7 @@ PR NousResearch/hermes-agent#3894.
   core installs a component filter on the gateway log handler that only
   admits records from loggers whose name starts with one of the registered
   component prefixes (`gateway`, `agent`, `tools`, `cli`, `cron`). Our
-  `hermes_livekit.adapter` logger fell outside the allowlist and records
+  `hermes_realtime.adapter` logger fell outside the allowlist and records
   were dropped at the handler stage regardless of level. The logger is
   now created with the explicit name `gateway.platforms.livekit`,
   matching the convention every built-in platform adapter uses (and
@@ -288,10 +303,10 @@ PR NousResearch/hermes-agent#3894.
   plugin auto-enables the platform when env is present.
 - Hooks into hermes's `register_platform()` surface: `env_enablement_fn`,
   `is_connected`, `cron_deliver_env_var`, `allowed_users_env`,
-  `allow_all_env`, `platform_hint`, `setup_fn`, plus a `hermes-livekit`
+  `allow_all_env`, `platform_hint`, `setup_fn`, plus a `hermes-realtime`
   toolset registration. Zero core hermes-agent edits required to install.
 - Pinned dependencies: `livekit==1.1.7`, `livekit-api==1.1.0`.
 
-[0.2.1]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.2.1
-[0.2.0]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.2.0
-[0.1.0]: https://github.com/kortexa-ai/hermes-livekit/releases/tag/v0.1.0
+[0.2.1]: https://github.com/kortexa-ai/hermes-realtime/releases/tag/v0.2.1
+[0.2.0]: https://github.com/kortexa-ai/hermes-realtime/releases/tag/v0.2.0
+[0.1.0]: https://github.com/kortexa-ai/hermes-realtime/releases/tag/v0.1.0

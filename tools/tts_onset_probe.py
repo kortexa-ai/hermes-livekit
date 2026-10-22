@@ -20,7 +20,7 @@ from voice_latency_probe import converted_pcm, profile_credentials
 # This pure-PCM helper needs no installed Hermes host. Avoid importing the
 # plugin package, whose __init__ registers platform adapters in a Hermes env.
 spec = importlib.util.spec_from_file_location(
-    "audio_onset", Path(__file__).resolve().parents[1] / "hermes_livekit/audio_onset.py",
+    "audio_onset", Path(__file__).resolve().parents[1] / "hermes_realtime/audio_onset.py",
 )
 onset = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(onset)

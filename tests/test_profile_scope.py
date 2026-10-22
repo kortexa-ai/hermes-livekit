@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-import hermes_livekit
+import hermes_realtime
 from agent import secret_scope
 from gateway.config import PlatformConfig
 from gateway.platform_registry import PlatformEntry, platform_registry
-from hermes_livekit.adapter import LiveKitAdapter
-from hermes_livekit.realtime_webrtc import RealtimeWebRTCAdapter
+from hermes_realtime.adapter import LiveKitAdapter
+from hermes_realtime.realtime_webrtc import RealtimeWebRTCAdapter
 
 
 def profile_env(name, port):
@@ -44,8 +44,8 @@ def secondary_scope(request, monkeypatch):
 def test_platform_discovery_uses_only_the_owning_profile(secondary_scope):
     import os
 
-    livekit = hermes_livekit._env_enablement()
-    realtime = hermes_livekit._realtime_env_enablement()
+    livekit = hermes_realtime._env_enablement()
+    realtime = hermes_realtime._realtime_env_enablement()
     if secondary_scope:
         assert livekit["room"] == "hermes-mira"
         assert livekit["api_key"] == "mira-key"
@@ -57,8 +57,8 @@ def test_platform_discovery_uses_only_the_owning_profile(secondary_scope):
         assert realtime is None
     assert "LIVEKIT_HOME_CHANNEL" not in os.environ
     empty = SimpleNamespace(extra={})
-    assert hermes_livekit._validate_config(empty) is bool(secondary_scope)
-    assert hermes_livekit._validate_realtime_config(empty) is bool(secondary_scope)
+    assert hermes_realtime._validate_config(empty) is bool(secondary_scope)
+    assert hermes_realtime._validate_realtime_config(empty) is bool(secondary_scope)
 
 
 def test_adapter_fallbacks_do_not_borrow_launch_profile_values(secondary_scope):

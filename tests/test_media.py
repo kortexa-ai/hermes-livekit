@@ -9,7 +9,7 @@ import wave
 
 import pytest
 
-from hermes_livekit.media import transcribe_pcm
+from hermes_realtime.media import transcribe_pcm
 
 
 @pytest.mark.parametrize("fail", [False, True, "empty"])
@@ -26,7 +26,7 @@ def test_transcription_worker_owns_and_removes_wav(monkeypatch, tmp_path, fail):
             raise RuntimeError("synthetic transcription failure")
         return {"text": " hello "}
 
-    monkeypatch.setattr("hermes_livekit.media.tempfile.gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr("hermes_realtime.media.tempfile.gettempdir", lambda: str(tmp_path))
     monkeypatch.setitem(sys.modules, "tools.transcription_tools", SimpleNamespace(transcribe_audio=transcribe))
     if fail:
         with pytest.raises(RuntimeError, match="synthetic"):
@@ -62,7 +62,7 @@ async def test_cancelled_waiter_does_not_delete_a_running_workers_input(monkeypa
         finally:
             loop.call_soon_threadsafe(finished.set)
 
-    monkeypatch.setattr("hermes_livekit.media.tempfile.gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr("hermes_realtime.media.tempfile.gettempdir", lambda: str(tmp_path))
     monkeypatch.setitem(sys.modules, "tools.transcription_tools", SimpleNamespace(transcribe_audio=transcribe))
     task = asyncio.create_task(asyncio.to_thread(worker))
     try:
@@ -81,7 +81,7 @@ async def test_cancelled_waiter_does_not_delete_a_running_workers_input(monkeypa
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["quiet", "speech", "different_turn", "different_prefix", "trimmed_quiet"])
 async def test_early_transcription_reuses_only_the_same_speech(change):
-    from hermes_livekit.media import EarlyTranscription
+    from hermes_realtime.media import EarlyTranscription
 
     calls = []
     speech = b"\x00\x10" * 960
@@ -108,7 +108,7 @@ async def test_early_transcription_reuses_only_the_same_speech(change):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail", [False, True])
 async def test_early_worker_is_bounded_and_outlives_cancelled_waiter(fail):
-    from hermes_livekit.media import EarlyTranscription, transcribe_with_prefetch
+    from hermes_realtime.media import EarlyTranscription, transcribe_with_prefetch
 
     entered, finished = asyncio.Event(), asyncio.Event()
     release = threading.Event()
@@ -155,7 +155,7 @@ async def test_early_worker_is_bounded_and_outlives_cancelled_waiter(fail):
     (float("inf"), False), (0.05, False), (0.7, False), ("0.35", False),
 ])
 def test_prefetch_config_is_opt_in_and_precedes_endpoint(value, valid):
-    from hermes_livekit.media import configured_asr_prefetch
+    from hermes_realtime.media import configured_asr_prefetch
     assert configured_asr_prefetch({}, 0.7) == 0
     if valid:
         assert configured_asr_prefetch({"asr_prefetch_silence": value}, 0.7) == value

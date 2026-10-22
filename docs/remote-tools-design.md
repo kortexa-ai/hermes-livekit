@@ -48,7 +48,7 @@ The client first registers an RPC method, then sends:
 ```
 
 The adapter validates the participant identity, name, and object schema. It
-registers late-bound Hermes tools under `hermes-livekit-tools`, records the
+registers late-bound Hermes tools under `hermes-realtime-tools`, records the
 participant owner, and returns targeted `conference.tools.registered` or
 `conference.tools.rejected` acknowledgement.
 
@@ -148,7 +148,7 @@ registration or reconnect.
   separates non-empty identifier segments. The adapter does not trim,
   case-fold, Unicode-normalize, or otherwise alias them.
 - Input schemas must at least be objects with `type: object`.
-- Tool activation is explicit. Operators add `hermes-livekit-tools` to
+- Tool activation is explicit. Operators add `hermes-realtime-tools` to
   `platform_toolsets.livekit`.
 - Arguments and results are small JSON values. RPC payload limits are not a
   binary transport.
@@ -217,7 +217,7 @@ parameters and must match the protocol's bounded token grammar. The supported
 Hermes image types are JPEG, PNG, WebP, and GIF; other `image/*` types fail
 closed. `text_summary` is required, non-blank, and at most 1,024 characters.
 The complete executable definition is
-`hermes_livekit/tool_result_protocol.py`.
+`hermes_realtime/tool_result_protocol.py`.
 
 The two transports have no cross-channel ordering guarantee, so the sender must
 not open the stream when its RPC handler returns. After parsing the reference,

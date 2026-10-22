@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hermes-livekit interactive test client.
 
-Drives the hermes-livekit plugin and the agent behind it as if it were
+Drives the hermes-realtime plugin and the agent behind it as if it were
 a regular client. Useful for developing the plugin without depending
 on the voice/ASR path.
 
@@ -39,7 +39,7 @@ from typing import Any, Optional
 
 from livekit import api, rtc
 
-from hermes_livekit.tool_result_protocol import MAX_RESULT_BYTES, TOPIC_PREFIX
+from hermes_realtime.tool_result_protocol import MAX_RESULT_BYTES, TOPIC_PREFIX
 
 LOG = logging.getLogger("test-client")
 
@@ -620,7 +620,7 @@ class TestClient:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="hermes-livekit interactive test client"
+        description="hermes-realtime interactive test client"
     )
     parser.add_argument(
         "--room",

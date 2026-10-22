@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-from hermes_livekit.adapter import LiveKitAdapter
-from hermes_livekit.realtime_protocol import RealtimeProtocol
-from hermes_livekit.realtime_webrtc import RealtimeWebRTCAdapter
+from hermes_realtime.adapter import LiveKitAdapter
+from hermes_realtime.realtime_protocol import RealtimeProtocol
+from hermes_realtime.realtime_webrtc import RealtimeWebRTCAdapter
 
 
 def endpoint(kind):

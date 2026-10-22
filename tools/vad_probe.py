@@ -18,9 +18,9 @@ import wave
 import numpy as np
 from av import AudioFrame, AudioResampler
 
-import hermes_livekit.realtime_webrtc as realtime
-from hermes_livekit.realtime_webrtc import QueuedAudioTrack, RealtimeCall
-from hermes_livekit.vad import configured_vad_factory
+import hermes_realtime.realtime_webrtc as realtime
+from hermes_realtime.realtime_webrtc import QueuedAudioTrack, RealtimeCall
+from hermes_realtime.vad import configured_vad_factory
 
 
 def read_speech(path):

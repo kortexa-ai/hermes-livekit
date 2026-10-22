@@ -6,10 +6,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_livekit.vad import AdaptiveRmsGate, configured_silence_duration
-from hermes_livekit.realtime_webrtc import QueuedAudioTrack, RealtimeCall
-import hermes_livekit.realtime_webrtc as realtime
-import hermes_livekit.media as media
+from hermes_realtime.vad import AdaptiveRmsGate, configured_silence_duration
+from hermes_realtime.realtime_webrtc import QueuedAudioTrack, RealtimeCall
+import hermes_realtime.realtime_webrtc as realtime
+import hermes_realtime.media as media
 
 
 def calibrated(noise):
@@ -117,7 +117,7 @@ async def test_direct_endpoint_respects_timeout_and_mid_sentence_pause(duration,
 
 @pytest.mark.asyncio
 async def test_direct_overflow_discards_command_then_recovers_with_preroll(monkeypatch):
-    from hermes_livekit.realtime_protocol import RealtimeProtocol
+    from hermes_realtime.realtime_protocol import RealtimeProtocol
 
     clock = [0.0]
     monkeypatch.setattr(realtime, "time", SimpleNamespace(monotonic=lambda: clock[0]))
@@ -166,8 +166,8 @@ async def test_direct_overflow_discards_command_then_recovers_with_preroll(monke
 async def test_conference_bounds_capture_and_only_classifies_new_pcm(monkeypatch, request):
     from gateway.config import PlatformConfig
     from gateway.platform_registry import PlatformEntry, platform_registry
-    from hermes_livekit.adapter import LiveKitAdapter
-    import hermes_livekit.adapter as conference
+    from hermes_realtime.adapter import LiveKitAdapter
+    import hermes_realtime.adapter as conference
 
     platform_registry.register(
         PlatformEntry(name="livekit", label="LiveKit",

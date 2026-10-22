@@ -1,4 +1,4 @@
-# Contributing to hermes-livekit
+# Contributing to hermes-realtime
 
 Thanks for poking at this. The project is small, the maintenance bar is low,
 and we'd rather merge a working patch than gate on process.
@@ -6,8 +6,8 @@ and we'd rather merge a working patch than gate on process.
 ## Dev install
 
 ```bash
-git clone https://github.com/kortexa-ai/hermes-livekit
-cd hermes-livekit
+git clone https://github.com/kortexa-ai/hermes-realtime
+cd hermes-realtime
 
 # Build a separate Python 3.14 test environment through Hermes PM.
 scripts/bootstrap_tests.sh
@@ -20,13 +20,13 @@ absent. It fetches a clean vanilla Hermes checkout and asks PM to build a fresh
 stop its test processes and remove only those two disposable directories first.
 
 Keep runtime dependency pins in the distribution's `pyproject.toml` and the
-native `hermes_livekit/pyproject.toml` aligned. The native project is deliberately
+native `hermes_realtime/pyproject.toml` aligned. The native project is deliberately
 metadata-only so two Hermes profiles can share one PM environment.
 
 Install a reviewed commit in a gateway through the normal plugin command:
 
 ```bash
-hermes plugins install kortexa-ai/hermes-livekit/hermes_livekit \
+hermes plugins install kortexa-ai/hermes-realtime/hermes_realtime \
   --ref <full-commit-sha> --enable --yes-deps
 hermes gateway restart
 ```

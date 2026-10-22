@@ -14,10 +14,10 @@ import pytest
 
 from gateway.platforms.base import AudioFormat
 from gateway.streaming_tts_consumer import StreamingTTSConsumer
-from hermes_livekit.adapter import LiveKitAdapter
-from hermes_livekit.realtime_protocol import RealtimeProtocol
-from hermes_livekit.realtime_webrtc import QueuedAudioTrack, RealtimeWebRTCAdapter
-from hermes_livekit.streaming_tts import FRAME_BYTES, PcmFramer
+from hermes_realtime.adapter import LiveKitAdapter
+from hermes_realtime.realtime_protocol import RealtimeProtocol
+from hermes_realtime.realtime_webrtc import QueuedAudioTrack, RealtimeWebRTCAdapter
+from hermes_realtime.streaming_tts import FRAME_BYTES, PcmFramer
 
 
 @pytest.fixture(autouse=True)
@@ -108,7 +108,7 @@ async def assert_livekit_capture(adapter, monkeypatch, *, paused):
         adapter._running = False
 
     with monkeypatch.context() as patch:
-        patch.setattr("hermes_livekit.adapter.asyncio.sleep", one_tick)
+        patch.setattr("hermes_realtime.adapter.asyncio.sleep", one_tick)
         await adapter._check_silence_loop()
     assert gate.calibrate_pcm.called is not paused
 
@@ -215,15 +215,15 @@ async def test_client_pause_room_session_boundary(leave, monkeypatch):
     adapter._resolve_avatar_url = Mock(return_value=None)
     adapter._mark_connected = Mock()
     adapter._new_realtime_protocol = Mock(return_value=AsyncMock())
-    monkeypatch.setattr("hermes_livekit.adapter.rtc.Room", lambda: room)
-    monkeypatch.setattr("hermes_livekit.adapter.rtc.AudioSource", lambda *args: sink)
-    monkeypatch.setattr("hermes_livekit.adapter.rtc.LocalAudioTrack.create_audio_track", Mock())
+    monkeypatch.setattr("hermes_realtime.adapter.rtc.Room", lambda: room)
+    monkeypatch.setattr("hermes_realtime.adapter.rtc.AudioSource", lambda *args: sink)
+    monkeypatch.setattr("hermes_realtime.adapter.rtc.LocalAudioTrack.create_audio_track", Mock())
     token = Mock()
     token.with_identity.return_value = token
     token.with_name.return_value = token
     token.with_grants.return_value = token
     token.to_jwt.return_value = "fixture-token"
-    monkeypatch.setattr("hermes_livekit.adapter.AccessToken", lambda **kwargs: token)
+    monkeypatch.setattr("hermes_realtime.adapter.AccessToken", lambda **kwargs: token)
 
     await adapter._handle_client_control({"action": "pause"}, "client")
     await assert_livekit_capture(adapter, monkeypatch, paused=True)
@@ -258,7 +258,7 @@ async def test_client_pause_survives_whole_file_cleanup(outcome, monkeypatch):
             raise RuntimeError("fixture decode failure")
         return tone(rate=48000)
 
-    monkeypatch.setattr("hermes_livekit.adapter.asyncio.to_thread", decode)
+    monkeypatch.setattr("hermes_realtime.adapter.asyncio.to_thread", decode)
     sink.played.clear()
     playing = asyncio.create_task(adapter.play_tts("chat", "unused.wav"))
     try:
@@ -381,7 +381,7 @@ async def test_queued_pcm_onset_measures_retained_audio_only(kind, enabled, rate
     framer = PcmFramer(AudioFormat(sample_rate=rate))
     reference = list(framer.feed(source)) + list(framer.finish())
     if enabled:
-        from hermes_livekit.audio_onset import LeadingSilenceTrimmer
+        from hermes_realtime.audio_onset import LeadingSilenceTrimmer
         trimmer = LeadingSilenceTrimmer()
         reference = list(trimmer.feed(reference)) + list(trimmer.finish())
     assert queued == b"".join(reference)

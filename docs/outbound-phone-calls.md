@@ -1,7 +1,7 @@
 # Outbound phone calls through Twilio and LiveKit Cloud
 
 This guide describes how to configure an outbound telephone path and how to
-add that path to Hermes Agent through hermes-livekit. Twilio provides the
+add that path to Hermes Agent through hermes-realtime. Twilio provides the
 connection to the public switched telephone network (PSTN). LiveKit Cloud
 bridges telephone audio into a room. Hermes supplies the conversation, speech
 recognition, model, tools, and voice.
@@ -289,7 +289,7 @@ from the deployment environment without printing them.
 
 `SIP_TERMINATION_HOST`, `SIP_AUTH_USERNAME`, `SIP_AUTH_PASSWORD`, and
 `PHONE_CALLER_ID` below are inputs to this example, not implemented
-hermes-livekit configuration variables.
+hermes-realtime configuration variables.
 
 ```python
 import asyncio
@@ -464,10 +464,10 @@ audio that was successfully exchanged.
 ## Existing Hermes behavior and integration gaps
 
 The relevant implementation is in
-[`adapter.py`](../hermes_livekit/adapter.py),
-[`__init__.py`](../hermes_livekit/__init__.py),
-[`streaming_tts.py`](../hermes_livekit/streaming_tts.py), and
-[`realtime_webrtc.py`](../hermes_livekit/realtime_webrtc.py).
+[`adapter.py`](../hermes_realtime/adapter.py),
+[`__init__.py`](../hermes_realtime/__init__.py),
+[`streaming_tts.py`](../hermes_realtime/streaming_tts.py), and
+[`realtime_webrtc.py`](../hermes_realtime/realtime_webrtc.py).
 
 | Area | Existing behavior | Needed for outbound phone support |
 | --- | --- | --- |

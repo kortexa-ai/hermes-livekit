@@ -6,7 +6,8 @@ Operational state of the plugin and dependencies that don't show up in
 
 ## Where we are
 
-- **v0.4.0** is the latest tagged release.
+- The project is **hermes-realtime**; its native Hermes plugin is `realtime`.
+  Direct WebRTC and LiveKit Conference remain its two transports.
 - `scripts/run_tests.sh` always validates the public plugin against vanilla
   Hermes first. A local `.env.development.local` adds a second full run against
   the adjacent `kortexa-ai/hermes-agent` fork on `kortexa-ai/main`, including
@@ -56,7 +57,7 @@ The goal is to turn this project into a dual-transport realtime gateway for
 Hermes without changing `hermes-agent`. The gateway will support the OpenAI
 Realtime wire contract over direct WebRTC and the matching Kortexa Realtime
 Conference contract over LiveKit. The umbrella tracker is
-[#17](https://github.com/kortexa-ai/hermes-livekit/issues/17).
+[#17](https://github.com/kortexa-ai/hermes-realtime/issues/17).
 
 ### Four-backend client matrix
 
@@ -150,7 +151,7 @@ New work units created from this stricter definition:
   OpenAI Realtime WebRTC wire parity and real-API differential fixtures.
 - [`api.server#44`](https://github.com/kortexa-ai/api.server/issues/44) — make
   Conference a transport adapter of the shared Realtime contract (completed).
-- [#28](https://github.com/kortexa-ai/hermes-livekit/issues/28) — match the
+- [#28](https://github.com/kortexa-ai/hermes-realtime/issues/28) — match the
   `api.server` Conference setup and portable base protocol.
 - [`confcall.desktop#8`](https://github.com/kortexa-ai/confcall.desktop/issues/8)
   — reduce four backend choices to one direct client and one Conference client.
@@ -160,7 +161,7 @@ New work units created from this stricter definition:
 - [`api.server#47`](https://github.com/kortexa-ai/api.server/issues/47) — stable
   authenticated Conference participant identity for exact tool policy
   (completed).
-- [#29](https://github.com/kortexa-ai/hermes-livekit/issues/29) — preserve the
+- [#29](https://github.com/kortexa-ai/hermes-realtime/issues/29) — preserve the
   Hermes room and portable session across LiveKit full reconnects (completed).
 
 ### Architecture
@@ -256,26 +257,26 @@ audit rules.
 
 ### Migration and work units
 
-There are no third-party `hermes-livekit` clients to preserve. The breaking
+There are no third-party `hermes-realtime` clients to preserve. The breaking
 replacement of client-facing `client:*`, `hermes-chat`, and `hermes-control`
 topics is complete; applications use the shared Conference topics. Internal
 `agent:*` bridge events are implementation details. A neutral project rename
 can follow after the new interfaces stabilize.
 
-- [#18](https://github.com/kortexa-ai/hermes-livekit/issues/18) — shared
+- [#18](https://github.com/kortexa-ai/hermes-realtime/issues/18) — shared
   Realtime protocol and session core.
-- [#19](https://github.com/kortexa-ai/hermes-livekit/issues/19) — Hermes bridge
+- [#19](https://github.com/kortexa-ai/hermes-realtime/issues/19) — Hermes bridge
   implemented only through public adapter hooks.
-- [#20](https://github.com/kortexa-ai/hermes-livekit/issues/20) — direct OpenAI
+- [#20](https://github.com/kortexa-ai/hermes-realtime/issues/20) — direct OpenAI
   Realtime-compatible WebRTC service.
-- [#21](https://github.com/kortexa-ai/hermes-livekit/issues/21) — Kortexa
+- [#21](https://github.com/kortexa-ai/hermes-realtime/issues/21) — Kortexa
   Realtime Conference-compatible LiveKit service.
-- [#22](https://github.com/kortexa-ai/hermes-livekit/issues/22) — shared
+- [#22](https://github.com/kortexa-ai/hermes-realtime/issues/22) — shared
   function tools plus bounded Conference extensions (completed).
-- [#23](https://github.com/kortexa-ai/hermes-livekit/issues/23) — four-backend
+- [#23](https://github.com/kortexa-ai/hermes-realtime/issues/23) — four-backend
   conformance tests, examples, migration notes, and release documentation.
-- [#24](https://github.com/kortexa-ai/hermes-livekit/issues/24) — neutral rename
-  after the dual-transport gateway stabilizes.
+- [#24](https://github.com/kortexa-ai/hermes-realtime/issues/24) — transport-neutral repository,
+  package and plugin naming; upgrade steps are in the README.
 
 ## Deferred indefinitely
 

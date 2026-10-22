@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from hermes_livekit import voice_metrics as metrics
+from hermes_realtime import voice_metrics as metrics
 
 
 def records(caplog):
@@ -109,17 +109,17 @@ def test_real_hermes_profile_config_and_registration(tmp_path, monkeypatch, capl
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(json.dumps({"plugins": {"entries": {
-        "livekit": {"settings": {"voice_latency_metrics": setting}},
+        "realtime": {"settings": {"voice_latency_metrics": setting}},
     }}}))
     manager = PluginManager()
-    ctx = PluginContext(PluginManifest(name="livekit"), manager)
+    ctx = PluginContext(PluginManifest(name="realtime"), manager)
     metrics.register_voice_metrics(ctx)
     callbacks = manager.iter_hook_callbacks("on_stream_delta")
     assert bool(callbacks) is (setting is True)
     assert bool(manager.iter_hook_callbacks("post_api_request")) is (setting is True)
     if setting is True:
         callbacks[0](session_id="session", turn_id="turn", iteration=1,
-                     surface="livekit", delta="private reply")
+                     surface="realtime", delta="private reply")
         assert records(caplog)[0]["event"] == "first_text_observed"
 
 
@@ -136,11 +136,11 @@ def test_older_hermes_context_does_not_enable_metrics():
 def test_native_plugin_discovers_and_receives_real_async_hook(tmp_path):
     # PM installs the native directory plugin; a clean checkout has no legacy
     # pip entry point. Supply that real installation inside the temporary home.
-    shutil.copytree(Path(metrics.__file__).parent, tmp_path / "plugins" / "livekit",
+    shutil.copytree(Path(metrics.__file__).parent, tmp_path / "plugins" / "realtime",
                     ignore=shutil.ignore_patterns("__pycache__"))
     (tmp_path / "config.yaml").write_text(json.dumps({"plugins": {
-        "enabled": ["livekit"], "entries": {
-            "livekit": {"settings": {"voice_latency_metrics": True}},
+        "enabled": ["realtime"], "entries": {
+            "realtime": {"settings": {"voice_latency_metrics": True}},
         },
     }}))
     program = """

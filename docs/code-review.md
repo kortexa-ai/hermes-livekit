@@ -1,6 +1,6 @@
 # Realtime code review — 2026-09-06
 
-Scope: `hermes-livekit` only. The review used the plugin, its tests, the local
+Scope: `hermes-realtime` only. The review used the plugin, its tests, the local
 Hermes adapter contract, and installed LiveKit/aiortc source. `vision.server`
 was excluded at Franci's request and was not changed.
 
@@ -9,7 +9,7 @@ delivery before the streaming-TTS work. The complete existing-environment
 suite passed: 241 tests. One test fixture was corrected to cover stale events
 both before receipt and after task scheduling. No runtime behavior was
 weakened. This review does not claim measured latency or memory gains.
-Tracking: [#39](https://github.com/kortexa-ai/hermes-livekit/issues/39).
+Tracking: [#39](https://github.com/kortexa-ai/hermes-realtime/issues/39).
 
 ## Changes
 

@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from gateway.platforms.base import BasePlatformAdapter
-from hermes_livekit.adapter import LiveKitAdapter
+from hermes_realtime.adapter import LiveKitAdapter
 
 _VARIADIC = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
 
@@ -110,7 +110,7 @@ async def test_livekit_send_voice_uses_native_audio_track():
 
 @pytest.mark.asyncio
 async def test_livekit_send_completes_transcript_response():
-    from hermes_livekit.realtime_protocol import RealtimeProtocol
+    from hermes_realtime.realtime_protocol import RealtimeProtocol
 
     events = []
 
@@ -155,8 +155,8 @@ async def test_livekit_internal_wake_waits_for_silence() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume_before_poll", [False, True])
 async def test_livekit_prefetch_waits_for_endpoint_and_checks_unpolled_audio(monkeypatch, resume_before_poll):
-    import hermes_livekit.adapter as adapter_module
-    from hermes_livekit.vad import AdaptiveRmsGate
+    import hermes_realtime.adapter as adapter_module
+    from hermes_realtime.vad import AdaptiveRmsGate
 
     adapter = object.__new__(LiveKitAdapter)
     adapter.platform = SimpleNamespace(value="livekit")

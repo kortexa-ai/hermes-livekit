@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_livekit.adapter import LiveKitAdapter
-from hermes_livekit.tool_safety import (
+from hermes_realtime.adapter import LiveKitAdapter
+from hermes_realtime.tool_safety import (
     MAX_AUDIT_RECORDS,
     MAX_POLICY_BYTES,
     ToolAuditLog,

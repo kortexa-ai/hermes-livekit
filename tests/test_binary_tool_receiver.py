@@ -10,13 +10,13 @@ from typing import Any
 
 import pytest
 
-import hermes_livekit.adapter as adapter_module
-from hermes_livekit.adapter import (
+import hermes_realtime.adapter as adapter_module
+from hermes_realtime.adapter import (
     MAX_IGNORED_BINARY_DRAINS,
     MAX_PENDING_BINARY_RESULTS,
     LiveKitAdapter,
 )
-from hermes_livekit.tool_safety import ToolAuditLog, ToolPolicy
+from hermes_realtime.tool_safety import ToolAuditLog, ToolPolicy
 
 
 STREAM_ID = "0123456789abcdef0123456789abcdef"

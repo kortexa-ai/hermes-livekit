@@ -18,7 +18,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
 from gateway.platform_registry import PlatformEntry, platform_registry
-from hermes_livekit.realtime_webrtc import (
+from hermes_realtime.realtime_webrtc import (
     AdaptiveRmsGate,
     CLIENT_IDENTITY,
     OUTPUT_ECHO_GUARD_SECONDS,
@@ -35,7 +35,7 @@ from hermes_livekit.realtime_webrtc import (
     check_realtime_requirements,
 )
 from tools.registry import registry
-import hermes_livekit.realtime_webrtc as webrtc_module
+import hermes_realtime.realtime_webrtc as webrtc_module
 
 
 @pytest.fixture
@@ -526,11 +526,11 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
 
     with (
         patch(
-            "hermes_livekit.adapter.LiveKitAdapter._decode_audio_to_pcm",
+            "hermes_realtime.adapter.LiveKitAdapter._decode_audio_to_pcm",
             return_value=b"\x00\x00" * 320,
         ),
         patch(
-            "hermes_livekit.realtime_webrtc.asyncio.sleep",
+            "hermes_realtime.realtime_webrtc.asyncio.sleep",
             side_effect=guarded_sleep,
         ) as sleep,
     ):
@@ -548,7 +548,7 @@ async def test_direct_play_tts_keeps_capture_paused_for_output_echo_tail() -> No
 
 @pytest.mark.asyncio
 async def test_direct_send_completes_transcript_response() -> None:
-    from hermes_livekit.realtime_protocol import RealtimeProtocol
+    from hermes_realtime.realtime_protocol import RealtimeProtocol
 
     events = []
 
@@ -575,7 +575,7 @@ async def test_direct_send_completes_transcript_response() -> None:
 
 @pytest.mark.asyncio
 async def test_direct_send_drops_home_channel_prompt() -> None:
-    from hermes_livekit.realtime_protocol import RealtimeProtocol
+    from hermes_realtime.realtime_protocol import RealtimeProtocol
 
     events = []
 
@@ -712,7 +712,7 @@ async def test_cancelled_tts_clears_queued_audio():
     call = SimpleNamespace(protocol=AsyncMock(), output_track=track, paused=False, closed=False)
     adapter = object.__new__(RealtimeWebRTCAdapter)
     adapter._calls = {"call": call}
-    with patch("hermes_livekit.adapter.LiveKitAdapter._decode_audio_to_pcm", return_value=b"\x00\x00" * 960):
+    with patch("hermes_realtime.adapter.LiveKitAdapter._decode_audio_to_pcm", return_value=b"\x00\x00" * 960):
         with pytest.raises(asyncio.CancelledError):
             await adapter.play_tts("call", "unused.wav")
     track.clear.assert_called_once()
@@ -831,7 +831,7 @@ async def test_queued_transcription_does_not_start_after_call_close(monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("resume", [False, True])
 async def test_early_asr_waits_for_endpoint_and_discards_resumed_speech(monkeypatch, resume):
-    from hermes_livekit.media import EarlyTranscription
+    from hermes_realtime.media import EarlyTranscription
 
     clock = [1.0]
     monkeypatch.setattr(webrtc_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))

@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import hermes_livekit.adapter as adapter_module
-from hermes_livekit.adapter import LiveKitAdapter
+import hermes_realtime.adapter as adapter_module
+from hermes_realtime.adapter import LiveKitAdapter
 
 
 class _FakeRoom:

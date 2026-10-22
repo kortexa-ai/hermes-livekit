@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from hermes_livekit.audio_onset import (
+from hermes_realtime.audio_onset import (
     FRAME_BYTES, LEAD_IN_FRAMES, MAX_SCAN_FRAMES, LeadingSilenceTrimmer,
     PCM_ONSET_MAX_SAMPLES, PcmOnsetObserver,
 )
@@ -95,7 +95,7 @@ def test_observer_bounds_scan_and_keeps_no_pcm(monkeypatch):
         sizes.append(len(pcm))
         return unpack(fmt, pcm)
 
-    monkeypatch.setattr("hermes_livekit.audio_onset.struct.iter_unpack", count)
+    monkeypatch.setattr("hermes_realtime.audio_onset.struct.iter_unpack", count)
     # Even an oversized input must not scan beyond one second.
     assert observer.feed(b"\0\0" * PCM_ONSET_MAX_SAMPLES + frame(1000)) is None
     assert observer.scanned_samples == PCM_ONSET_MAX_SAMPLES

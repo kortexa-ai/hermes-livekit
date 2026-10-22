@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_livekit.tool_result_protocol import (
+from hermes_realtime.tool_result_protocol import (
     DRAIN_TIMEOUT_SEC,
     LIFECYCLE_FAILURE_CODES,
     BinaryResultProtocolError,

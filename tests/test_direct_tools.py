@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_livekit.direct_tools import (
+from hermes_realtime.direct_tools import (
     DIRECT_TOOLSET_NAME,
     DirectToolBridge,
     DirectToolError,
@@ -156,7 +156,7 @@ async def test_scoped_handler_checks_hermes_session_before_proxying(monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replace", [False, True])
 async def test_queued_tools_cannot_resume_after_their_turn_is_cancelled(replace):
-    from hermes_livekit.realtime_protocol import RealtimeProtocol
+    from hermes_realtime.realtime_protocol import RealtimeProtocol
 
     events, sealed = [], asyncio.Event()
     async def publish(event, recipient):

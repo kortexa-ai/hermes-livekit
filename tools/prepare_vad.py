@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Refresh a verified copy of the pinned CPU VAD model (the package ships one
-in hermes_livekit/models). Never downloads during capture."""
+in hermes_realtime/models). Never downloads during capture."""
 
 import argparse
 import hashlib
@@ -9,7 +9,7 @@ from pathlib import Path
 import tempfile
 from urllib.request import urlopen
 
-from hermes_livekit.speech_detector import (
+from hermes_realtime.speech_detector import (
     SILERO_MODEL_BYTES, SILERO_MODEL_URL, SILERO_SHA256, SILERO_LICENSE_SHA256, SILERO_LICENSE_URL,
 )
 

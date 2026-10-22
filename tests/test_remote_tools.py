@@ -11,15 +11,15 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-import hermes_livekit
-from hermes_livekit.adapter import LiveKitAdapter
-from hermes_livekit.tool_safety import ToolAuditLog, ToolPolicy
+import hermes_realtime
+from hermes_realtime.adapter import LiveKitAdapter
+from hermes_realtime.tool_safety import ToolAuditLog, ToolPolicy
 from tools.registry import registry
 
 
 _EXAMPLE_PATH = Path(__file__).parents[1] / "examples" / "test_client.py"
 _EXAMPLE_SPEC = importlib.util.spec_from_file_location(
-    "hermes_livekit_test_client", _EXAMPLE_PATH
+    "hermes_realtime_test_client", _EXAMPLE_PATH
 )
 assert _EXAMPLE_SPEC is not None and _EXAMPLE_SPEC.loader is not None
 example_client = importlib.util.module_from_spec(_EXAMPLE_SPEC)
@@ -609,7 +609,7 @@ async def test_loop_stop_cancels_only_its_cross_loop_native_rpc(
                 raise
 
     adapter = adapter_with_client(BlockingParticipant())
-    from hermes_livekit.adapter import _LIVE_ADAPTERS
+    from hermes_realtime.adapter import _LIVE_ADAPTERS
 
     monkeypatch.setattr(
         adapter, "_tool_invocation_session_key", lambda session_id: session_id
@@ -629,7 +629,7 @@ async def test_loop_stop_cancels_only_its_cross_loop_native_rpc(
     try:
         await asyncio.gather(*(event.wait() for event in started.values()))
 
-        hermes_livekit._on_agent_loop_stopped_hook(
+        hermes_realtime._on_agent_loop_stopped_hook(
             session_key="session-a", platform="livekit"
         )
 
@@ -637,7 +637,7 @@ async def test_loop_stop_cancels_only_its_cross_loop_native_rpc(
         assert not cancelled["b"].is_set()
         assert not calls["b"].done()
     finally:
-        hermes_livekit._on_agent_loop_stopped_hook(
+        hermes_realtime._on_agent_loop_stopped_hook(
             session_key="session-b", platform="livekit"
         )
         await asyncio.gather(*calls.values(), return_exceptions=True)

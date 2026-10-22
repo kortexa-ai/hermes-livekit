@@ -53,7 +53,7 @@ if destination.exists() or workspace.exists():
     raise SystemExit("Test environment or build inputs already exist; remove the disposable outputs before rebuilding")
 # Match production's core + native-plugin dependency union. Hermes now supports
 # editable source installs only; building a Hermes wheel is intentionally refused.
-_generate_pyproject([repo / "hermes_livekit"], workspace, source=hermes)
+_generate_pyproject([repo / "hermes_realtime"], workspace, source=hermes)
 shutil.copy2(hermes / "uv.lock", workspace / "uv.lock")
 python = pm.build_environment(
     source=workspace, out=destination, python=Path(sys.executable),

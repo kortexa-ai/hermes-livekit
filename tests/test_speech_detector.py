@@ -3,8 +3,8 @@
 import numpy as np
 import pytest
 
-from hermes_livekit.speech_detector import SileroRmsGate, load_silero_model
-from hermes_livekit.vad import AdaptiveRmsGate, configured_vad_factory
+from hermes_realtime.speech_detector import SileroRmsGate, load_silero_model
+from hermes_realtime.vad import AdaptiveRmsGate, configured_vad_factory
 
 
 class RecordingSession:
@@ -51,12 +51,12 @@ def test_invalid_detector_settings_fail_before_accepting_audio(extra):
 
 
 def test_default_is_bundled_silero_and_configured_factories_keep_state_separate(monkeypatch):
-    from hermes_livekit.vad import DEFAULT_SILERO_MODEL
+    from hermes_realtime.vad import DEFAULT_SILERO_MODEL
 
     assert isinstance(configured_vad_factory({"vad_backend": "rms"})(), AdaptiveRmsGate)
     session = RecordingSession()
     paths = []
-    monkeypatch.setattr("hermes_livekit.speech_detector.load_silero_model",
+    monkeypatch.setattr("hermes_realtime.speech_detector.load_silero_model",
                         lambda path: paths.append(path) or session)
     assert isinstance(configured_vad_factory({})(), SileroRmsGate)
     factory = configured_vad_factory({"vad_backend": "silero", "vad_model_path": "/fixture/model"})
@@ -67,7 +67,7 @@ def test_default_is_bundled_silero_and_configured_factories_keep_state_separate(
 
 
 def test_bundled_model_is_the_pinned_release():
-    from hermes_livekit.vad import DEFAULT_SILERO_MODEL
+    from hermes_realtime.vad import DEFAULT_SILERO_MODEL
 
     assert DEFAULT_SILERO_MODEL.with_suffix(".LICENSE").read_text().startswith("MIT License")
     session = load_silero_model(str(DEFAULT_SILERO_MODEL))
@@ -83,7 +83,7 @@ def test_bad_model_is_rejected_before_runtime_construction(tmp_path):
 
 
 def test_model_checksum_is_checked_even_when_size_matches(tmp_path, monkeypatch):
-    import hermes_livekit.speech_detector as detector
+    import hermes_realtime.speech_detector as detector
 
     model = tmp_path / "model.onnx"
     model.write_bytes(b"wrong")
@@ -151,11 +151,11 @@ async def test_adapter_config_reaches_negotiated_call_and_unmute(monkeypatch, re
     from aiortc import RTCPeerConnection
     from gateway.config import PlatformConfig
     from gateway.platform_registry import PlatformEntry, platform_registry
-    from hermes_livekit.realtime_webrtc import RealtimeWebRTCAdapter
-    from hermes_livekit.adapter import LiveKitAdapter
+    from hermes_realtime.realtime_webrtc import RealtimeWebRTCAdapter
+    from hermes_realtime.adapter import LiveKitAdapter
 
     session = RecordingSession()
-    monkeypatch.setattr("hermes_livekit.speech_detector.load_silero_model", lambda _: session)
+    monkeypatch.setattr("hermes_realtime.speech_detector.load_silero_model", lambda _: session)
     for name, factory in (("realtime", RealtimeWebRTCAdapter), ("livekit", LiveKitAdapter)):
         platform_registry.register(
             PlatformEntry(name=name, label=name, adapter_factory=factory,

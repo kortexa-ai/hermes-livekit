@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from hermes_livekit.media import pcm_rms
-from hermes_livekit.vad import AdaptiveRmsGate
+from hermes_realtime.media import pcm_rms
+from hermes_realtime.vad import AdaptiveRmsGate
 
 
 def frame(level):
@@ -53,10 +53,10 @@ async def test_transport_preserves_early_speech_and_rejects_room_noise(
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     from gateway.config import PlatformConfig
     from gateway.platform_registry import PlatformEntry, platform_registry
-    from hermes_livekit.adapter import LiveKitAdapter
-    from hermes_livekit.realtime_webrtc import QueuedAudioTrack, RealtimeCall
-    import hermes_livekit.adapter as conference
-    import hermes_livekit.realtime_webrtc as realtime
+    from hermes_realtime.adapter import LiveKitAdapter
+    from hermes_realtime.realtime_webrtc import QueuedAudioTrack, RealtimeCall
+    import hermes_realtime.adapter as conference
+    import hermes_realtime.realtime_webrtc as realtime
 
     quiet, speech = frame(50), frame(800)
     frames = ([quiet] * 20 if warm else []) + [quiet] * 5

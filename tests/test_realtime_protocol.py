@@ -5,7 +5,7 @@ import asyncio
 
 import pytest
 
-from hermes_livekit.realtime_protocol import RealtimeProtocol
+from hermes_realtime.realtime_protocol import RealtimeProtocol
 
 
 def protocol_fixture(**callbacks):

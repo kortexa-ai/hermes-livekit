@@ -3,9 +3,9 @@ requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hermes-livekit"
-version = "0.4.4"
-description = "LiveKit WebRTC voice gateway plugin for hermes-agent"
+name = "hermes-realtime"
+version = "0.5.0"
+description = "Direct WebRTC and LiveKit Conference voice gateways for hermes-agent"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
 authors = [{ name = "kortexa.ai", email = "info@kortexa.ai" }]
@@ -33,7 +33,7 @@ dependencies = [
   "aiortc==1.15.0",
   "av==17.0.0",
   # Silero VAD runs by default. The pinned model ships inside the package
-  # (hermes_livekit/models), so a plain install needs no download step.
+  # (hermes_realtime/models), so a plain install needs no download step.
   "onnxruntime==1.29.0",
   "numpy==2.4.3",
 ]
@@ -48,13 +48,13 @@ dev = [
 # Point to the package, not the function — the hermes-agent plugin loader
 # does ep.load() and then getattr(module, "register"), so the target must
 # resolve to the module itself.
-livekit = "hermes_livekit"
+realtime = "hermes_realtime"
 
 [tool.setuptools.packages.find]
-include = ["hermes_livekit*"]
+include = ["hermes_realtime*"]
 
 [tool.setuptools.package-data]
-hermes_livekit = ["models/*", "plugin.yaml", "pyproject.toml"]
+hermes_realtime = ["models/*", "plugin.yaml", "pyproject.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

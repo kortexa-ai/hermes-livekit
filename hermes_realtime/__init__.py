@@ -1,4 +1,4 @@
-"""hermes-livekit — LiveKit voice gateway plugin for hermes-agent.
+"""hermes-realtime — direct WebRTC and LiveKit voice gateways for hermes-agent.
 
 Registers platforms as a native directory plugin or through the legacy
 ``hermes_agent.plugins`` entry point. No core hermes-agent edits are required — every integration touch
@@ -11,7 +11,7 @@ from typing import Optional
 
 logger = logging.getLogger("gateway.platforms.livekit")
 
-TOOLSET_NAME = "hermes-livekit-tools"
+TOOLSET_NAME = "hermes-realtime-tools"
 
 __all__ = [
     "LiveKitAdapter",
@@ -259,7 +259,7 @@ def register(ctx) -> None:
         validate_config=_validate_config,
         is_connected=_is_connected,
         required_env=["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],
-        install_hint="hermes plugins install kortexa-ai/hermes-livekit/hermes_livekit --enable --yes-deps",
+        install_hint="hermes plugins install kortexa-ai/hermes-realtime/hermes_realtime --enable --yes-deps",
         setup_fn=_interactive_setup,
         # Env-driven auto-config: seeds PlatformConfig.extra + home_channel
         # from LIVEKIT_* env vars, so env-only setups show up in
@@ -291,7 +291,7 @@ def register(ctx) -> None:
         validate_config=_validate_realtime_config,
         is_connected=_validate_realtime_config,
         required_env=[],
-        install_hint="hermes plugins install kortexa-ai/hermes-livekit/hermes_livekit --enable --yes-deps",
+        install_hint="hermes plugins install kortexa-ai/hermes-realtime/hermes_realtime --enable --yes-deps",
         env_enablement_fn=_realtime_env_enablement,
         apply_yaml_config_fn=_apply_realtime_yaml_config,
         allowed_users_env="HERMES_REALTIME_ALLOWED_USERS",
@@ -307,8 +307,8 @@ def register(ctx) -> None:
     try:
         if not callable(session_toolset_factory):
             from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
-            if "hermes-livekit" not in TOOLSETS:
-                TOOLSETS["hermes-livekit"] = {
+            if "hermes-realtime" not in TOOLSETS:
+                TOOLSETS["hermes-realtime"] = {
                     "description": "LiveKit voice toolset — interact with Hermes via WebRTC voice",
                     "tools": _HERMES_CORE_TOOLS,
                     "includes": [],

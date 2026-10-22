@@ -13,7 +13,7 @@ from pm.workspace import _workspace_member
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NATIVE = ROOT / "hermes_livekit"
+NATIVE = ROOT / "hermes_realtime"
 
 
 def test_native_dependencies_admit_the_current_python_and_match_pip():
@@ -32,7 +32,7 @@ def test_two_profile_copies_have_distinct_pm_members(tmp_path):
     workspace = tmp_path / "workspace"
     members = []
     for profile in ("default", "mira"):
-        source = tmp_path / profile / "plugins" / "livekit"
+        source = tmp_path / profile / "plugins" / "realtime"
         shutil.copytree(NATIVE, source, ignore=shutil.ignore_patterns("__pycache__"))
         member = _workspace_member(source, workspace, identity=source)
         members.append(tomllib.loads((member / "pyproject.toml").read_text()))
@@ -43,7 +43,7 @@ def test_two_profile_copies_have_distinct_pm_members(tmp_path):
 
 
 def test_directory_install_registers_both_platforms_without_pip_entrypoint(tmp_path):
-    plugin = tmp_path / "plugins" / "livekit"
+    plugin = tmp_path / "plugins" / "realtime"
     shutil.copytree(NATIVE, plugin, ignore=shutil.ignore_patterns("__pycache__"))
     probe = """
 from pathlib import Path
@@ -54,13 +54,13 @@ from gateway.platform_registry import platform_registry
 
 home = Path(os.environ['HERMES_HOME'])
 manifests = scan_directory(home / 'plugins', 'user')
-assert len(manifests) == 1 and manifests[0].name == 'livekit'
+assert len(manifests) == 1 and manifests[0].name == 'realtime'
 manager = PluginManager()
 try:
     manager._load_plugin(manifests[0])
-    loaded = manager._plugins['livekit']
+    loaded = manager._plugins['realtime']
     assert loaded.error is None, loaded.error
-    assert loaded.module.__file__ == str(home / 'plugins/livekit/__init__.py')
+    assert loaded.module.__file__ == str(home / 'plugins/realtime/__init__.py')
     for name in ('livekit', 'realtime'):
         entry = platform_registry.get(name)
         assert entry is not None, name

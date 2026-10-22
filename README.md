@@ -1,4 +1,4 @@
-# hermes-livekit
+# hermes-realtime
 
 <p align="center">
   <img src="docs/assets/hermes-gateway.png" width="220" alt="Hermes realtime gateway mark">
@@ -9,8 +9,7 @@ Realtime voice gateway plugin for [hermes-agent](https://github.com/NousResearch
 It serves an OpenAI-compatible direct WebRTC endpoint and can join a LiveKit
 room as a Realtime Conference agent. Both transports transcribe speech through
 Hermes, run the same agent loop, return TTS audio, and share one conversation
-event contract. The name is now historically accurate in only one direction;
-the rename raccoon remains on the roadmap.
+event contract.
 
 For telephone integration, see the [outbound phone configuration and design
 guide](docs/outbound-phone-calls.md). It covers Twilio Elastic SIP Trunking,
@@ -38,7 +37,7 @@ original artwork was generated with OpenAI's built-in image generation tool on
 For current Hermes, install the native plugin through its dependency manager:
 
 ```bash
-hermes plugins install kortexa-ai/hermes-livekit/hermes_livekit --enable --yes-deps
+hermes plugins install kortexa-ai/hermes-realtime/hermes_realtime --enable --yes-deps
 ```
 
 The subdirectory is intentional: it contains the native manifest, loader and
@@ -49,7 +48,7 @@ its dependencies survive `hermes update`. Python 3.14 is supported.
 Install separately for each profile that uses voice:
 
 ```bash
-hermes --profile mira plugins install kortexa-ai/hermes-livekit/hermes_livekit --enable --yes-deps
+hermes --profile mira plugins install kortexa-ai/hermes-realtime/hermes_realtime --enable --yes-deps
 ```
 
 Each profile retains its own settings and plugin registration. The native
@@ -64,15 +63,49 @@ or `hermes --profile mira gateway restart`. Use `hermes plugins list` to check
 discovery. Existing pip-only installs must migrate to this native install:
 packages added manually to a previous environment are not an enabled PM member.
 
+### Upgrade from hermes-livekit
+
+Version 0.5.0 renames the distribution to `hermes-realtime`, the Python package
+and native install subdirectory to `hermes_realtime`, and the plugin name from
+`livekit` to `realtime`. GitHub redirects the old repository URL, but an existing
+installation must be replaced because its plugin name and subdirectory changed.
+
+For each affected profile, back up its configuration. Move any
+`plugins.entries.livekit` settings to `plugins.entries.realtime`, and replace
+explicit `hermes-livekit` / `hermes-livekit-tools` toolset selections with
+`hermes-realtime` / `hermes-realtime-tools`. Then run:
+
+```bash
+hermes plugins remove livekit
+hermes plugins install kortexa-ai/hermes-realtime/hermes_realtime --enable --yes-deps
+```
+
+Repeat with `hermes --profile <name>` for each additional profile, then restart
+the shared gateway once and check `hermes plugins list --plain --no-bundled`.
+Remove the old plugin before enabling its replacement so both copies cannot
+register the same transports. `platforms.livekit`, `platforms.realtime`,
+`LIVEKIT_*`, `HERMES_LIVEKIT_*`, and `HERMES_REALTIME_*` keep their existing
+names and values. LiveKit remains the Conference transport and SDK.
+
+For legacy pip installs, uninstall `hermes-livekit` from that independently
+managed environment before installing `hermes-realtime`; update imports from
+`hermes_livekit` to `hermes_realtime`. There is no old-name import alias or
+second plugin entry point.
+
+To roll back, remove `realtime`, install the previous reviewed commit from
+`kortexa-ai/hermes-realtime/hermes_livekit` with `--ref <old-full-commit-sha>`,
+restore the saved plugin settings and toolset selections, and restart the
+gateway. Old commits retain their original subdirectory.
+
 ### Legacy pip / editable install
 
 For an independently managed Python environment, the pip entry point remains
 available. Use the interpreter from that environment:
 
 ```bash
-python -m pip install git+https://github.com/kortexa-ai/hermes-livekit.git
+python -m pip install git+https://github.com/kortexa-ai/hermes-realtime.git
 # Or, for a local checkout:
-python -m pip install -e ~/src/hermes-livekit
+python -m pip install -e ~/src/hermes-realtime
 ```
 
 Use the native install above for a PM-managed Hermes environment. Re-run the
@@ -83,13 +116,13 @@ Hermes must already be installed; the plugin never installs or upgrades its host
 
 ## Enable
 
-After install, add `livekit` to the enabled-plugins list:
+After install, add `realtime` to the enabled-plugins list:
 
 ```bash
-hermes plugins enable livekit
+hermes plugins enable realtime
 ```
 
-(Or edit `~/.hermes/config.yaml` and add `livekit` to `plugins.enabled`.)
+(Or edit `~/.hermes/config.yaml` and add `realtime` to `plugins.enabled`.)
 
 Then enable either or both platforms in the same config:
 
@@ -101,7 +134,7 @@ platforms:
     enabled: true
 plugins:
   enabled:
-    - livekit
+    - realtime
 ```
 
 ## Configure
@@ -234,7 +267,7 @@ lowering it further. Endpoint logs include observed silence, configured target,
 and learned noise RMS; they do not contain microphone recordings.
 
 Speech/noise discrimination uses the pinned Silero v6.2 model by default. The
-model and its license ship inside the package (`hermes_livekit/models`) and
+model and its license ship inside the package (`hermes_realtime/models`) and
 `onnxruntime` is a base dependency, so a plain install runs it with no extra
 step. Tune or switch it under either platform's `extra` configuration, then
 restart only the affected gateway:
@@ -320,7 +353,7 @@ Streaming requires a Hermes Agent consumer that preserves adapter-owned
 `handle.audible` and supports `tts.streaming.completion_timeout` (default 120
 seconds, accepted range 1–600). This bounds the wait for a long reply to finish;
 it does not delay the start of playback. The companion fixes are tracked in
-[the streaming integration issue](https://github.com/kortexa-ai/hermes-livekit/issues/40).
+[the streaming integration issue](https://github.com/kortexa-ai/hermes-realtime/issues/40).
 
 Generated PCM can itself start with a long near-silent prefix. To shorten that
 pause, set `platforms.realtime.extra.tts_trim_leading_silence: true` (or the
@@ -345,12 +378,12 @@ upstream `main`, and recreates `.venv` with the plugin's complete dependencies.
 Hermes releases before the session-owned toolset API proposed in
 [NousResearch/hermes-agent#110515](https://github.com/NousResearch/hermes-agent/issues/110515)
 have no public way to bind client-supplied Realtime tools to one conversation.
-On those versions, `hermes_livekit.direct_tools` deliberately uses a compatibility
+On those versions, `hermes_realtime.direct_tools` deliberately uses a compatibility
 path that mutates `toolsets.TOOLSETS`, copies `toolsets._HERMES_CORE_TOOLS`,
 extends `tools.tool_search._DIRECT_SURFACE_TOOLSETS`, and registers scoped names
 through `tools.registry`. When `PluginContext.session_toolset` is available, the
 plugin feature-detects it and uses the public, session-isolated lifecycle instead.
-Issue [#77](https://github.com/kortexa-ai/hermes-livekit/issues/77) tracks removal
+Issue [#77](https://github.com/kortexa-ai/hermes-realtime/issues/77) tracks removal
 of the compatibility path after the upstream API is released.
 
 To test the configured TTS service through real local RTP peers, explicitly opt
@@ -438,7 +471,7 @@ Do not infer general agent quality from these bounded tool fixtures or change
 the production model based only on faster canned answers.
 
 For local model timing logs, set
-`plugins.entries.livekit.settings.voice_latency_metrics: true` in the Hermes
+`plugins.entries.realtime.settings.voice_latency_metrics: true` in the Hermes
 profile and restart its gateway. It defaults to off and uses existing plugin
 hooks; it does not rewrite requests or change model configuration. Hermes
 treats stream observers as stream consumers, so enabling this in a mixed-channel
@@ -668,7 +701,7 @@ tested without camera hardware. A real client can replace those fixture bytes
 after applying the same 12 MiB bound. The stream header, chunks, and reference
 target only the agent participant whose RPC invocation requested the snapshot.
 
-For tools to be visible to the LLM, add `hermes-livekit-tools` to the
+For tools to be visible to the LLM, add `hermes-realtime-tools` to the
 livekit toolset list in `~/.hermes/config.yaml`
 (`platform_toolsets.livekit`). The plugin does not auto-activate the
 toolset.

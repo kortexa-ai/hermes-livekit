@@ -8,7 +8,7 @@ Carved out of hermes-agent's kortexa/gateway-livekit branch so it can be
 installed as a pip plugin on top of upstream main without core patches.
 
 Requires:
-    pip install hermes-livekit
+    pip install hermes-realtime
     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET env vars
 """
 
@@ -274,7 +274,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         # Frames captured-but-not-yet-dispatched. Drained into the next
         # MessageEvent built by _process_voice_input or _handle_client_message.
         # Each entry is a (path, mime_type) tuple. Paths are temp files written
-        # under <tempdir>/hermes_livekit/; cleanup happens on disconnect (the
+        # under <tempdir>/hermes_realtime/; cleanup happens on disconnect (the
         # agent loop reads the file after handle_message returns, so we can't
         # unlink at dispatch time).
         self._pending_captures: list[tuple[str, str]] = []
@@ -411,10 +411,10 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         accepted and ignored.
         """
         if not LIVEKIT_AVAILABLE:
-            logger.warning("[%s] livekit SDK not installed. Run: pip install hermes-livekit", self.name)
+            logger.warning("[%s] livekit SDK not installed. Run: pip install hermes-realtime", self.name)
             return False
         if not LIVEKIT_API_AVAILABLE:
-            logger.warning("[%s] livekit-api not installed. Run: pip install hermes-livekit", self.name)
+            logger.warning("[%s] livekit-api not installed. Run: pip install hermes-realtime", self.name)
             return False
         if not self._url or not self._api_key or not self._api_secret:
             logger.warning("[%s] LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET required", self.name)
@@ -1532,7 +1532,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
         if room is not self._room or self._video_streams.get(identity) is not stream:
             return
-        tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_livekit")
+        tmp_dir = os.path.join(tempfile.gettempdir(), "hermes_realtime")
         os.makedirs(tmp_dir, exist_ok=True)
         path = os.path.join(tmp_dir, f"frame_{uuid.uuid4().hex[:12]}.jpg")
         with open(path, "wb") as f:
@@ -2488,7 +2488,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
         Temp files are NOT unlinked here — the hermes agent loop reads them
         after handle_message returns (the dispatch is fire-and-forget). The
-        files live under <tempdir>/hermes_livekit/ and are cleaned up on
+        files live under <tempdir>/hermes_realtime/ and are cleaned up on
         disconnect; OS tempdir housekeeping handles anything we miss.
         """
         urls: list[str] = []

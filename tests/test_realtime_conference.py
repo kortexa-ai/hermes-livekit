@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from hermes_livekit.adapter import LiveKitAdapter
-import hermes_livekit.adapter as adapter_module
+from hermes_realtime.adapter import LiveKitAdapter
+import hermes_realtime.adapter as adapter_module
 from gateway.platforms.base import ProcessingOutcome
 
 
@@ -317,7 +317,7 @@ async def test_idle_silence_detector_wakes_when_audio_subscribes(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_conference_endpoint_uses_configured_timeout_and_keeps_word_tail(monkeypatch):
-    from hermes_livekit.vad import AdaptiveRmsGate
+    from hermes_realtime.vad import AdaptiveRmsGate
 
     adapter, _ = conference_adapter()
     adapter._silence_duration = 0.7
