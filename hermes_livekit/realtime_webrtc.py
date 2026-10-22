@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import build_session_key
+from gateway.platforms._shared import get_scoped_secret
 
 from .adapter import (
     MIN_SPEECH_DURATION,
@@ -521,26 +522,26 @@ class RealtimeWebRTCAdapter(NativeTranscriptMixin, RealtimeStreamingTTSMixin, Ba
         self._asr_prefetch_silence = configured_asr_prefetch(extra, self._silence_duration)
         self._vad_factory = configured_vad_factory(extra)
         self.config.extra["group_sessions_per_user"] = False
-        self._host = str(extra.get("host") or os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"))
+        self._host = str(extra.get("host") or get_scoped_secret("HERMES_REALTIME_HOST", "127.0.0.1"))
         self._port = _configured_int(
-            extra.get("port", os.getenv("HERMES_REALTIME_PORT", "8091")),
+            extra.get("port", get_scoped_secret("HERMES_REALTIME_PORT", "8091")),
             8091,
             minimum=0,
         )
-        self._api_key = str(extra.get("api_key") or os.getenv("HERMES_REALTIME_API_KEY", ""))
+        self._api_key = str(extra.get("api_key") or get_scoped_secret("HERMES_REALTIME_API_KEY", ""))
         self._proxy_signing_key = str(
             extra.get("proxy_signing_key")
-            or os.getenv("HERMES_REALTIME_PROXY_SIGNING_KEY", "")
+            or get_scoped_secret("HERMES_REALTIME_PROXY_SIGNING_KEY", "")
         )
         self._ice_servers = _parse_ice_servers(
-            extra.get("ice_servers", os.getenv("HERMES_REALTIME_ICE_SERVERS", ""))
+            extra.get("ice_servers", get_scoped_secret("HERMES_REALTIME_ICE_SERVERS", ""))
         )
         self._max_calls = _configured_int(
-            extra.get("max_calls", os.getenv("HERMES_REALTIME_MAX_CALLS")),
+            extra.get("max_calls", get_scoped_secret("HERMES_REALTIME_MAX_CALLS")),
             DEFAULT_MAX_CALLS,
         )
         self._max_call_seconds = _configured_int(
-            extra.get("max_call_seconds", os.getenv("HERMES_REALTIME_MAX_CALL_SECONDS")),
+            extra.get("max_call_seconds", get_scoped_secret("HERMES_REALTIME_MAX_CALL_SECONDS")),
             DEFAULT_MAX_CALL_SECONDS,
         )
         self._profile_name = _gateway_profile_name()

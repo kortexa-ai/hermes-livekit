@@ -31,6 +31,25 @@ def test_entry_point_import_defers_gateway_adapters() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_registration_defers_media_imports_until_transport_use() -> None:
+    probe = """
+import sys
+import hermes_livekit
+
+class Context:
+    def register_platform(self, **kwargs):
+        pass
+    def register_hook(self, *args, **kwargs):
+        pass
+
+hermes_livekit.register(Context())
+assert 'hermes_livekit.adapter' not in sys.modules
+assert 'hermes_livekit.realtime_webrtc' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 def _clear_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _CREDENTIAL_VARS:
         monkeypatch.delenv(name, raising=False)
@@ -87,13 +106,13 @@ def test_register_exposes_current_platform_callbacks() -> None:
     hermes_livekit.register(Context())
 
     livekit = observed["livekit"]
-    assert livekit["check_fn"] is check_livekit_requirements
+    assert livekit["check_fn"]() is True
     assert livekit["validate_config"] is hermes_livekit._validate_config
     assert livekit["is_connected"] is hermes_livekit._is_connected
     assert livekit["apply_yaml_config_fn"] is hermes_livekit._apply_yaml_config
 
     realtime = observed["realtime"]
-    assert realtime["check_fn"] is check_realtime_requirements
+    assert realtime["check_fn"]() is True
     assert realtime["validate_config"] is hermes_livekit._validate_realtime_config
     assert realtime["is_connected"] is hermes_livekit._validate_realtime_config
     assert realtime["apply_yaml_config_fn"] is hermes_livekit._apply_realtime_yaml_config

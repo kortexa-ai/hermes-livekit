@@ -4,7 +4,7 @@
 # Keep runtime pins aligned with the pip distribution in ../pyproject.toml.
 [project]
 name = "hermes-livekit-native"
-version = "0.4.2"
+version = "0.4.3"
 requires-python = ">=3.11,<3.15"
 dependencies = [
   "livekit==1.1.14",

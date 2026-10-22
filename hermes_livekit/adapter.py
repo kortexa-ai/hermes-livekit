@@ -64,6 +64,9 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.session import build_session_key
+from gateway.platforms._shared import get_scoped_secret
+
+from . import TOOLSET_NAME
 
 from .realtime_protocol import (
     HERMES_INPUT_AUDIO_STATE,
@@ -174,7 +177,6 @@ PRESENCE_POLL_INTERVAL_LOCAL = 5.0
 # small JSON results and bounded byte-stream results.
 SCOPED_TOOL_PREFIX = "lk_"
 TOOL_CALL_TIMEOUT_DEFAULT = 30.0
-TOOLSET_NAME = "hermes-livekit-tools"
 MAX_PENDING_BINARY_RESULTS = 8
 MAX_IGNORED_BINARY_DRAINS = 4
 
@@ -225,12 +227,12 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         # identity remains available on MessageEvent for attribution and tool
         # ownership, but it must not split the Hermes conversation history.
         self.config.extra["group_sessions_per_user"] = False
-        self._url: str = extra.get("url") or os.getenv("LIVEKIT_URL", "")
-        self._api_key: str = extra.get("api_key") or os.getenv("LIVEKIT_API_KEY", "")
-        self._api_secret: str = extra.get("api_secret") or os.getenv("LIVEKIT_API_SECRET", "")
-        self._room_name: str = extra.get("room") or os.getenv("LIVEKIT_ROOM", "hermes")
-        self._agent_name: str = extra.get("agent_name") or os.getenv("LIVEKIT_AGENT_NAME", "Hermes")
-        self._agent_avatar: str = extra.get("agent_avatar") or os.getenv("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
+        self._url: str = extra.get("url") or get_scoped_secret("LIVEKIT_URL", "")
+        self._api_key: str = extra.get("api_key") or get_scoped_secret("LIVEKIT_API_KEY", "")
+        self._api_secret: str = extra.get("api_secret") or get_scoped_secret("LIVEKIT_API_SECRET", "")
+        self._room_name: str = extra.get("room") or get_scoped_secret("LIVEKIT_ROOM", "hermes")
+        self._agent_name: str = extra.get("agent_name") or get_scoped_secret("LIVEKIT_AGENT_NAME", "Hermes")
+        self._agent_avatar: str = extra.get("agent_avatar") or get_scoped_secret("LIVEKIT_AGENT_AVATAR", "") or self._find_default_avatar()
 
         self._room: Optional["rtc.Room"] = None
         self._realtime_protocol: Optional[RealtimeProtocol] = None
@@ -318,7 +320,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
         LiveKit Cloud hosts on ``*.livekit.cloud``; anything else is treated
         as a self-hosted deployment and gets the faster default.
         """
-        override = os.getenv("LIVEKIT_PRESENCE_POLL_INTERVAL", "").strip()
+        override = get_scoped_secret("LIVEKIT_PRESENCE_POLL_INTERVAL", "").strip()
         if override:
             try:
                 parsed = float(override)
@@ -335,7 +337,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
     def _resolve_tool_call_timeout(self) -> float:
         """Per-call timeout for remote tools. HERMES_LIVEKIT_TOOL_TIMEOUT_SEC overrides."""
-        raw = os.getenv("HERMES_LIVEKIT_TOOL_TIMEOUT_SEC", "").strip()
+        raw = get_scoped_secret("HERMES_LIVEKIT_TOOL_TIMEOUT_SEC", "").strip()
         if raw:
             try:
                 parsed = float(raw)
@@ -347,7 +349,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
 
     def _resolve_tool_policy(self) -> ToolPolicy:
         """Load the closed operator policy; malformed input denies every tool."""
-        raw = os.getenv("HERMES_LIVEKIT_REMOTE_TOOL_POLICY", "")
+        raw = get_scoped_secret("HERMES_LIVEKIT_REMOTE_TOOL_POLICY", "")
         try:
             return ToolPolicy.parse(raw)
         except ToolPolicyError:
@@ -587,7 +589,7 @@ class LiveKitAdapter(NativeTranscriptMixin, LiveKitStreamingTTSMixin, BasePlatfo
             logger.info("[%s] Connected to room '%s' at %s", self.name, self._room_name, self._url)
 
             # If no explicit agent name was configured, ask the LLM and reconnect
-            if not os.getenv("LIVEKIT_AGENT_NAME") and not (self.config.extra or {}).get("agent_name"):
+            if not get_scoped_secret("LIVEKIT_AGENT_NAME") and not (self.config.extra or {}).get("agent_name"):
                 asyncio.create_task(self._resolve_agent_name())
 
             return True

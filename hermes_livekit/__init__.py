@@ -6,11 +6,12 @@ point uses an existing ``register_platform()`` hook.
 """
 
 import logging
-import os
 from importlib import import_module
 from typing import Optional
 
 logger = logging.getLogger("gateway.platforms.livekit")
+
+TOOLSET_NAME = "hermes-livekit-tools"
 
 __all__ = [
     "LiveKitAdapter",
@@ -76,43 +77,46 @@ def _env_enablement() -> Optional[dict]:
     instantiating the LiveKit SDK. Returns ``None`` when LiveKit isn't
     minimally configured; the caller skips auto-enabling.
     """
-    url = (os.getenv("LIVEKIT_URL") or "").strip()
-    api_key = (os.getenv("LIVEKIT_API_KEY") or "").strip()
-    api_secret = (os.getenv("LIVEKIT_API_SECRET") or "").strip()
+    from gateway.platforms._shared import get_scoped_secret
+
+    url = (get_scoped_secret("LIVEKIT_URL") or "").strip()
+    api_key = (get_scoped_secret("LIVEKIT_API_KEY") or "").strip()
+    api_secret = (get_scoped_secret("LIVEKIT_API_SECRET") or "").strip()
     if not (url and api_key and api_secret):
         return None
 
-    room = os.getenv("LIVEKIT_ROOM", "hermes")
+    room = get_scoped_secret("LIVEKIT_ROOM", "hermes")
     seed: dict = {
         "url": url,
         "api_key": api_key,
         "api_secret": api_secret,
         "room": room,
-        "agent_name": os.getenv("LIVEKIT_AGENT_NAME", "Hermes"),
-        "agent_avatar": os.getenv("LIVEKIT_AGENT_AVATAR", ""),
+        "agent_name": get_scoped_secret("LIVEKIT_AGENT_NAME", "Hermes"),
+        "agent_avatar": get_scoped_secret("LIVEKIT_AGENT_AVATAR", ""),
     }
 
     # LiveKit's adapter only ever joins one room, so the room IS the home
     # channel by definition. Default LIVEKIT_HOME_CHANNEL to LIVEKIT_ROOM
     # unless explicitly overridden — keeps cron / cross-platform delivery
     # sensible without requiring the user to duplicate the value.
-    home = (os.getenv("LIVEKIT_HOME_CHANNEL") or room).strip()
+    home = (get_scoped_secret("LIVEKIT_HOME_CHANNEL") or room).strip()
     if home:
-        os.environ.setdefault("LIVEKIT_HOME_CHANNEL", home)
         seed["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("LIVEKIT_HOME_CHANNEL_NAME", "Home"),
+            "name": get_scoped_secret("LIVEKIT_HOME_CHANNEL_NAME", "Home"),
         }
     return seed
 
 
 def _configured_value(cfg, key: str, env_name: str) -> str:
     """Read a platform extra with the matching environment variable fallback."""
+    from gateway.platforms._shared import get_scoped_secret
+
     try:
         value = (cfg.extra or {}).get(key)
     except Exception:
         value = None
-    return str(value or os.getenv(env_name) or "").strip()
+    return str(value or get_scoped_secret(env_name) or "").strip()
 
 
 def _validate_config(cfg) -> bool:
@@ -151,13 +155,15 @@ def _apply_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
 
 def _realtime_env_enablement() -> Optional[dict]:
     """Enable the direct listener only when the operator opts in."""
-    enabled = os.getenv("HERMES_REALTIME_ENABLED", "").strip().lower()
+    from gateway.platforms._shared import get_scoped_secret
+
+    enabled = get_scoped_secret("HERMES_REALTIME_ENABLED", "").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
         return None
-    token = os.getenv("HERMES_REALTIME_API_KEY", "").strip()
+    token = get_scoped_secret("HERMES_REALTIME_API_KEY", "").strip()
     if not token:
         return None
-    raw_port = os.getenv("HERMES_REALTIME_PORT", "8091")
+    raw_port = get_scoped_secret("HERMES_REALTIME_PORT", "8091")
     try:
         port = int(raw_port)
     except ValueError:
@@ -165,7 +171,7 @@ def _realtime_env_enablement() -> Optional[dict]:
     if not 0 < port < 65536:
         return None
     return {
-        "host": os.getenv("HERMES_REALTIME_HOST", "127.0.0.1"),
+        "host": get_scoped_secret("HERMES_REALTIME_HOST", "127.0.0.1"),
         "port": port,
         "api_key": token,
     }
@@ -184,10 +190,12 @@ def _apply_realtime_yaml_config(_yaml_cfg: dict, platform_cfg: dict) -> Optional
 
 
 def _validate_realtime_config(cfg) -> bool:
+    from gateway.platforms._shared import get_scoped_secret
+
     try:
         extra = cfg.extra or {}
-        token = str(extra.get("api_key") or os.getenv("HERMES_REALTIME_API_KEY", ""))
-        port = int(extra.get("port") or os.getenv("HERMES_REALTIME_PORT", "8091"))
+        token = str(extra.get("api_key") or get_scoped_secret("HERMES_REALTIME_API_KEY", ""))
+        port = int(extra.get("port") or get_scoped_secret("HERMES_REALTIME_PORT", "8091"))
         return 0 < port < 65536 and bool(token)
     except (TypeError, ValueError):
         return False
@@ -235,22 +243,19 @@ def register(ctx) -> None:
     auto-configures from ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
     ``LIVEKIT_API_SECRET`` env vars.
     """
-    from .adapter import TOOLSET_NAME, LiveKitAdapter, check_livekit_requirements
     from .direct_tools import install_direct_toolsets
-    from .realtime_webrtc import (
-        RealtimeWebRTCAdapter,
-        check_realtime_requirements,
-    )
     from .voice_metrics import register_voice_metrics
 
     register_voice_metrics(ctx)
     session_toolset_factory = getattr(ctx, "session_toolset", None)
 
+    # Registration has a host deadline. Import media SDKs only when the
+    # gateway probes or constructs a configured transport after discovery.
     ctx.register_platform(
         name="livekit",
         label="LiveKit",
-        adapter_factory=lambda cfg: LiveKitAdapter(cfg),
-        check_fn=check_livekit_requirements,
+        adapter_factory=lambda cfg: import_module(".adapter", __name__).LiveKitAdapter(cfg),
+        check_fn=lambda: import_module(".adapter", __name__).check_livekit_requirements(),
         validate_config=_validate_config,
         is_connected=_is_connected,
         required_env=["LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"],
@@ -279,10 +284,10 @@ def register(ctx) -> None:
     ctx.register_platform(
         name="realtime",
         label="Realtime WebRTC",
-        adapter_factory=lambda cfg: RealtimeWebRTCAdapter(
+        adapter_factory=lambda cfg: import_module(".realtime_webrtc", __name__).RealtimeWebRTCAdapter(
             cfg, session_toolset_factory=session_toolset_factory,
         ),
-        check_fn=check_realtime_requirements,
+        check_fn=lambda: import_module(".realtime_webrtc", __name__).check_realtime_requirements(),
         validate_config=_validate_realtime_config,
         is_connected=_validate_realtime_config,
         required_env=[],

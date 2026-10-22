@@ -1,5 +1,5 @@
 name: livekit
-version: 0.4.2
+version: 0.4.3
 description: LiveKit Conference and direct WebRTC voice gateways for Hermes
 author: kortexa.ai
 kind: platform

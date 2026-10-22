@@ -53,6 +53,16 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.
 
+## [0.4.3] — 2026-10-22
+
+### Fixed
+
+- Read connection settings from the owning Hermes profile when several
+  profiles share one gateway. LiveKit rooms, direct Realtime listeners,
+  and credential checks now use Hermes' scoped configuration reader.
+- Defer media SDK imports until a configured transport is probed or
+  created, keeping plugin registration within Hermes' startup deadline.
+
 ## [0.4.2] — 2026-10-22
 
 ### Fixed
