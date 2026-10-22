@@ -2,6 +2,8 @@
 
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -131,7 +133,11 @@ def test_older_hermes_context_does_not_enable_metrics():
     metrics.register_voice_metrics(object())
 
 
-def test_installed_entrypoint_discovers_and_receives_real_async_hook(tmp_path):
+def test_native_plugin_discovers_and_receives_real_async_hook(tmp_path):
+    # PM installs the native directory plugin; a clean checkout has no legacy
+    # pip entry point. Supply that real installation inside the temporary home.
+    shutil.copytree(Path(metrics.__file__).parent, tmp_path / "plugins" / "livekit",
+                    ignore=shutil.ignore_patterns("__pycache__"))
     (tmp_path / "config.yaml").write_text(json.dumps({"plugins": {
         "enabled": ["livekit"], "entries": {
             "livekit": {"settings": {"voice_latency_metrics": True}},

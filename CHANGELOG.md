@@ -53,6 +53,15 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.
 
+## [0.4.4] — 2026-10-22
+
+### Fixed
+
+- Make the voice-observer integration fixture install a native plugin in its
+  temporary Hermes home. Clean CI checkouts now test actual plugin discovery
+  and async hook delivery without relying on leftover pip entry-point metadata.
+  Runtime behavior is unchanged from 0.4.3.
+
 ## [0.4.3] — 2026-10-22
 
 ### Fixed
