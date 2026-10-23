@@ -41,8 +41,12 @@ HOME="$repo_root/.venv/pm-home" \
   PYTHONPATH="$hermes_checkout" \
   "$pm_python" - "$repo_root" "$hermes_checkout" "$venv" <<'PY'
 from pathlib import Path
+import platform
 import shutil
 import sys
+import tomllib
+
+import tomli_w
 
 import pm
 from pm.workspace import _generate_pyproject
@@ -54,6 +58,18 @@ if destination.exists() or workspace.exists():
 # Match production's core + native-plugin dependency union. Hermes now supports
 # editable source installs only; building a Hermes wheel is intentionally refused.
 _generate_pyproject([repo / "hermes_realtime"], workspace, source=hermes)
+# This disposable environment runs only on this host. Preserve Hermes' Python
+# constraints without resolving unsupported targets such as Android, where the
+# plugin's native dependencies have no wheels.
+manifest = workspace / "pyproject.toml"
+document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+uv = document.setdefault("tool", {}).setdefault("uv", {})
+environments = uv.get("environments", [])
+if isinstance(environments, str):
+    environments = [environments]
+host = f"sys_platform == {sys.platform!r} and platform_machine == {platform.machine()!r}"
+uv["environments"] = [f"({marker}) and {host}" for marker in environments] or [host]
+manifest.write_text(tomli_w.dumps(document), encoding="utf-8")
 shutil.copy2(hermes / "uv.lock", workspace / "uv.lock")
 python = pm.build_environment(
     source=workspace, out=destination, python=Path(sys.executable),

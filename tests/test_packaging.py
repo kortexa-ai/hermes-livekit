@@ -23,7 +23,7 @@ def test_native_dependencies_admit_the_current_python_and_match_pip():
     manifest = YAML(typ="safe").load((NATIVE / "plugin.yaml").read_text())
 
     assert distribution["version"] == native["version"] == manifest["version"]
-    assert declaration.is_member
+    assert declaration.installs_packages
     assert declaration.python_error("3.14.7") is None
     assert set(declaration.install_requirements) == set(distribution["dependencies"])
 

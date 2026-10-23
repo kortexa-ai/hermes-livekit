@@ -4,7 +4,7 @@ All notable changes to **hermes-realtime** are documented here, in the format
 of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] — 2026-10-22
 
 ### Added
 
@@ -14,6 +14,16 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Changed
 
+- Renamed the repository and distribution from `hermes-livekit` to
+  `hermes-realtime`, the Python package/native install path from
+  `hermes_livekit` to `hermes_realtime`, and the Hermes plugin/entry point
+  from `livekit` to `realtime`.
+- Renamed explicit plugin toolsets to `hermes-realtime` and
+  `hermes-realtime-tools`; updated installation, CI, imports and documentation.
+- Existing installs must remove the old plugin, migrate its settings and
+  reinstall under the new name. See the README upgrade and rollback steps.
+  LiveKit platform settings, transport protocols and SDK dependencies retain
+  their existing names and behavior.
 - Silero VAD is the default speech detector on both transports. The pinned
   v6.2 model and its license ship inside the package, and `onnxruntime` and
   `numpy` are base dependencies; the `vad` extra is gone. The energy gate
@@ -42,6 +52,11 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 
 ### Fixed
 
+- Limited disposable test-workspace resolution to the host OS and architecture,
+  retaining Hermes' Python constraints. CI no longer tries to resolve Android
+  dependencies that have no compatible native wheels.
+- Updated the packaging contract test to use Hermes' current
+  `installs_packages` property after upstream removed `is_member`.
 - Rebuilt local and CI validation around vanilla Hermes while retaining an
   explicit, origin- and branch-verified Kortexa pipeline lane. Plugin import no
   longer eagerly loads gateway adapters during Hermes config initialization,
@@ -52,21 +67,6 @@ of [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follow
 - Kept Direct Realtime capture suppressed for a short playout guard after TTS
   leaves the server RTP queue, preventing the remote speaker/jitter-buffer tail
   from being transcribed as a second user turn.
-
-## [0.5.0] — 2026-10-22
-
-### Changed
-
-- Renamed the repository and distribution from `hermes-livekit` to
-  `hermes-realtime`, the Python package/native install path from
-  `hermes_livekit` to `hermes_realtime`, and the Hermes plugin/entry point
-  from `livekit` to `realtime`.
-- Renamed explicit plugin toolsets to `hermes-realtime` and
-  `hermes-realtime-tools`; updated installation, CI, imports and documentation.
-- Existing installs must remove the old plugin, migrate its settings and
-  reinstall under the new name. See the README upgrade and rollback steps.
-  LiveKit platform settings, transport protocols and SDK dependencies retain
-  their existing names and behavior.
 
 ## [0.4.4] — 2026-10-22
 

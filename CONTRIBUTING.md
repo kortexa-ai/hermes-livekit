@@ -18,6 +18,9 @@ absent. It fetches a clean vanilla Hermes checkout and asks PM to build a fresh
 `.venv/tests314` environment from a core-plus-plugin workspace under
 `.venv/test-project314`. It never clears an existing environment. For a rebuild,
 stop its test processes and remove only those two disposable directories first.
+The generated workspace resolves dependencies for the host OS and architecture,
+while retaining Hermes' Python constraints. It does not produce a cross-platform
+lockfile or change the source manifests.
 
 Keep runtime dependency pins in the distribution's `pyproject.toml` and the
 native `hermes_realtime/pyproject.toml` aligned. The native project is deliberately
