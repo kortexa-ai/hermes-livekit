@@ -734,10 +734,3 @@ turn (the agent loop is fire-and-forget after `handle_message`).
 
 For source-review findings and deferred verification, see
 [`docs/code-review.md`](docs/code-review.md).
-
-## Status
-
-Experimental. Carved out of the `kortexa/gateway-livekit` branch on the
-[kortexa-ai/hermes-agent](https://github.com/kortexa-ai/hermes-agent) fork
-(PR [NousResearch/hermes-agent#3894](https://github.com/NousResearch/hermes-agent/pull/3894))
-so it can be installed on top of upstream `main` without patching core.
